@@ -5,7 +5,7 @@ import org.ergoplatform.appkit._
 import org.ergoplatform.sdk.ErgoId
 import scorex.crypto.hash.Blake2b256
 import sigma.ast.{Constant, ErgoTree, SType}
-import sigma.data.{ProveDlog, RType}
+import sigma.data.RType
 import sigma.{Coll, Colls, VersionContext}
 
 import scala.io.Source
@@ -13,14 +13,6 @@ import scala.io.Source
 object ScriptGenerator {
   private final val BASE_PATH = "contracts/"
   private final val EXT = ".ergo"
-
-  private final val BOND_PREFIX = "BondContract"
-  private final val ORD_PREFIX = "OpenOrder"
-  private final val OFF_PREFIX = "OpenOffer"
-
-
-  private final val FIX_HEIGHT = "FixedHeight"
-  private final val ON_CLOSE = "OnClose"
 
   private final val ERG = "ERG"
   private final val TOKEN = "Token"
@@ -46,102 +38,6 @@ object ScriptGenerator {
         idStr
       ).getBytes
     )
-  }
-
-  def mkBondContract(ctx: BlockchainContext, optTokenId: Option[String]): ErgoContract = {
-    optTokenId match {
-      case Some(id) =>
-        val script = mkScript(BOND_PREFIX + TOKEN)
-        val constants = ConstantsBuilder
-          .create()
-          .item("_tokenId", idFromStr(id))
-          .build()
-
-        ctx.compileContract(constants, script)
-      case None =>
-        val script = mkScript(BOND_PREFIX + ERG)
-        val constants = ConstantsBuilder.empty()
-
-        ctx.compileContract(constants, script)
-    }
-  }
-
-  def mkOrderContract(ctx: BlockchainContext, isFixed: Boolean, optTokenId: Option[String],
-                      devPK: ProveDlog = Address.create("9hgm8enrcPL3UUVHFpmLXxpSNCxWs5LxGBV6YS8Xy8KSoTtPPhE").getPublicKey): ErgoContract = {
-    val bondContractHash = {
-      val bondContract = mkBondContract(ctx, optTokenId)
-      Blake2b256.hash(
-        bondContract.getErgoTree.bytes
-      )
-    }
-
-    val orderType = {
-      if (isFixed)
-        FIX_HEIGHT
-      else
-        ON_CLOSE
-    }
-
-    optTokenId match {
-      case Some(id) =>
-        val script = mkScript(ORD_PREFIX + orderType + TOKEN)
-        val constants = ConstantsBuilder
-          .create()
-          .item("_tokenId", idFromStr(id))
-          .item("_devPK", devPK)
-          .item("_bondContractHash", Colls.fromArray(bondContractHash))
-          .build()
-
-        ctx.compileContract(constants, script)
-      case None =>
-        val script = mkScript(ORD_PREFIX + orderType + ERG)
-        val constants = ConstantsBuilder
-          .create()
-          .item("_devPK", devPK)
-          .item("_bondContractHash", Colls.fromArray(bondContractHash))
-          .build()
-
-        ctx.compileContract(constants, script)
-    }
-  }
-
-  def mkOfferContract(ctx: BlockchainContext, isFixed: Boolean, optTokenId: Option[String],
-                      devPK: ProveDlog = Address.create("9hgm8enrcPL3UUVHFpmLXxpSNCxWs5LxGBV6YS8Xy8KSoTtPPhE").getPublicKey): ErgoContract = {
-    val bondContractHash = {
-      val bondContract = mkBondContract(ctx, optTokenId)
-      Blake2b256.hash(
-        bondContract.getErgoTree.bytes
-      )
-    }
-
-    val orderType = {
-      if (isFixed)
-        FIX_HEIGHT
-      else
-        ON_CLOSE
-    }
-
-    optTokenId match {
-      case Some(id) =>
-        val script = mkScript(OFF_PREFIX + orderType + TOKEN)
-        val constants = ConstantsBuilder
-          .create()
-          .item("_tokenId", idFromStr(id))
-          .item("_devPK", devPK)
-          .item("_bondContractHash", Colls.fromArray(bondContractHash))
-          .build()
-
-        ctx.compileContract(constants, script)
-      case None =>
-        val script = mkScript(OFF_PREFIX + orderType + ERG)
-        val constants = ConstantsBuilder
-          .create()
-          .item("_devPK", devPK)
-          .item("_bondContractHash", Colls.fromArray(bondContractHash))
-          .build()
-
-        ctx.compileContract(constants, script)
-    }
   }
 
   // Zero-coupon bonds with liquidation and a bond asset
