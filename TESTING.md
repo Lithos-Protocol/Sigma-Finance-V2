@@ -20,7 +20,7 @@ shared with c-bonds; anything in this file or the repository takes precedence ov
 | `src/main/scala/mutations/NodeWallet.scala` | the miner-reward-delay constant the above needs |
 | `src/test/scala/specs/harness/` | `ContractSpecBase`, `HarnessProbeSpec` |
 | `src/test/scala/specs/<product>/` | one `<Product>SpecBase` plus one suite per contract |
-| `src/test/scala/specs/bonds/` | `BondSpecBase`; suites for the ZC bonds, offer, order, `MaturityLiquidation`, `BondAssetVault`, `BondNFT_Generator` |
+| `src/test/scala/specs/bonds/` | `BondSpecBase`; suites for the ZC bonds, offer, order, `MaturityLiquidation`, `BondAssetVault`, `BondNFT_Generator`, and template verification |
 
 The mutations package keeps its Lithos name rather than the `org.lithosprotocol.sigmafi` prefix so
 it can be re-synced with Lithos and c-bonds by copying. `BoxLoader`, `UTXOSelector` and

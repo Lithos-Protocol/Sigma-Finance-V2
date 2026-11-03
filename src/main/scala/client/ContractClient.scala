@@ -28,8 +28,8 @@ object ContractClient extends App {
 
 /**
  * What a UI needs to find SigmaFi V2 boxes: fixed addresses for the single-instance contracts, script
- * hashes for the ones offers commit to, and the offer's template hash with the constant index of each
- * term, since every offer is one template with different constants.
+ * hashes for the ones offers commit to, and each offer and order template's hash with the constant index
+ * of each term. A template hash only finds candidates: verify one with `ContractTemplate.matches`.
  */
 object BondsV2Report {
 
@@ -50,7 +50,7 @@ object BondsV2Report {
     Seq("SigmaFi V2 zero-coupon bonds",
       s"Bond Asset Generator: ${generator.toAddress}",
       s"Bond Asset Vault:     ${vault.toAddress}",
-      s"  hash (offer CONST_LENDER_HASH for tradeable bonds): ${hashHex(vault)}") ++
+      s"  hash (CONST_VAULT_HASH, every bond's R8): ${hashHex(vault)}") ++
       bonds.flatMap { case (name, bond) =>
         Seq(s"ZC Bond ($name): ${bond.toAddress}", s"  hash (offer CONST_BOND_HASH): ${hashHex(bond)}")
       } ++

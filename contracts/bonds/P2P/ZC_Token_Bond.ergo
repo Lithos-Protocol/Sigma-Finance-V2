@@ -9,8 +9,8 @@
     // R6: Coll[Long] - amounts: Idx 0 is the repayment amount in tokens, Idx 1 is the nanoERG batching fee,
     //                  the most an executor may keep for itself when it liquidates this bond
     // R7: Int        - Bond Maturity Height. Repayment is open strictly below it.
-    // R8: Coll[Byte] - lenderHash: blake2b256 of the lender's ErgoTree bytes. For a tradeable bond this
-    //                  is the hash of the one generic BondAssetVault.
+    // R8: Coll[Byte] - lenderHash: blake2b256 of the lender's ErgoTree bytes. Offers and orders always set
+    //                  it to the BondAssetVault, so the bond asset claims what the bond pays.
     // R9: Coll[Byte] - liqScriptHash: blake2b256 of the serialized liquidation EXPRESSION, i.e. the exact
     //                  bytes executeFromVar runs. Not an ErgoTree, so not a propositionBytes hash.
     //                  UIs may filter bonds by known liquidation hashes.

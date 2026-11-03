@@ -343,7 +343,6 @@ trait BondSpecBase extends ContractSpecBase {
                            collateralValue: Long = collateralErg): OfferTerms =
     OfferTerms(
       bondHash = hashOf(bondContract(ctx, kind)),
-      lenderHash = hashOf(vault(ctx)),
       repayment = repaymentOf(kind),
       batchingFee = fee,
       maturity = maturityOf(ctx),

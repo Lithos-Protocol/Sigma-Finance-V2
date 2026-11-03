@@ -89,9 +89,11 @@ object ScriptGenerator {
     def constants: Seq[(String, Any)]
   }
 
-  /** A lender's terms, which become the constants of one zero-coupon offer. */
+  /**
+   * A lender's terms, which become the constants of one zero-coupon offer. There is no lender term: the
+   * bond always pays the vault, and the lender is whoever holds the bond asset.
+   */
   case class OfferTerms(bondHash: Array[Byte],
-                        lenderHash: Array[Byte],
                         repayment: Long,
                         batchingFee: Long,
                         maturity: Int,
@@ -101,7 +103,6 @@ object ScriptGenerator {
 
     def constants: Seq[(String, Any)] = Seq(
       "CONST_BOND_HASH" -> Colls.fromArray(bondHash),
-      "CONST_LENDER_HASH" -> Colls.fromArray(lenderHash),
       "CONST_REPAYMENT" -> repayment,
       "CONST_BATCHING_FEE" -> batchingFee,
       "CONST_MATURITY" -> maturity,
@@ -188,7 +189,6 @@ object ScriptGenerator {
 
   private val OfferSentinels = OfferTerms(
     bondHash = Array.fill(32)(0x51.toByte),
-    lenderHash = Array.fill(32)(0x52.toByte),
     repayment = 7777777771L,
     batchingFee = 7777777772L,
     maturity = 777773,
@@ -202,7 +202,24 @@ object ScriptGenerator {
    */
   case class ContractTemplate(tree: ErgoTree, positions: Map[String, Int]) {
 
+    /** What indexers group boxes by. Finds candidates; it does not verify them: see `matches`. */
     def templateHash: Array[Byte] = Blake2b256.hash(tree.template)
+
+    /**
+     * Whether `candidate` is this template stamped with some terms. A template hash leaves out EVERY
+     * constant, so a tree can share it while changing a literal such as an order's mint amount, or the
+     * vault hash. Only the terms may differ, and only in value, never in type.
+     */
+    def matches(candidate: ErgoTree): Boolean = {
+      val terms = positions.values.toSet
+      candidate.header == tree.header &&
+        candidate.template.sameElements(tree.template) &&
+        candidate.constants.size == tree.constants.size &&
+        tree.constants.indices.forall { i =>
+          if (terms.contains(i)) candidate.constants(i).tpe == tree.constants(i).tpe
+          else candidate.constants(i) == tree.constants(i)
+        }
+    }
 
     /** Stamp out one instance by replacing constants, so its template is this one byte for byte. */
     def withTerms(terms: ContractTerms): ErgoTree = {
@@ -216,8 +233,15 @@ object ScriptGenerator {
     }
   }
 
+  /** blake2b256 of BondAssetVault, which every offer and order pins as its bonds' R8. */
+  def vaultHash(ctx: BlockchainContext): Array[Byte] = Blake2b256.hash(mkBondAssetVault(ctx).getErgoTree.bytes)
+
+  /** Compile-time values every template shares; they are not terms, and `matches` holds them fixed. */
+  private def fixedConstants(ctx: BlockchainContext): Seq[(String, Any)] =
+    Seq("CONST_VAULT_HASH" -> Colls.fromArray(vaultHash(ctx)))
+
   private def mkTemplate(ctx: BlockchainContext, name: String, sentinels: ContractTerms): ContractTemplate = {
-    val constants = sentinels.constants.foldLeft(ConstantsBuilder.create()) {
+    val constants = (fixedConstants(ctx) ++ sentinels.constants).foldLeft(ConstantsBuilder.create()) {
       case (b, (term, value)) => b.item(term, value)
     }.build()
     val tree = ctx.compileContract(constants, mkScript(name)).getErgoTree

@@ -22,14 +22,23 @@ from entities they deem to be "trusted". Borrower identities can be verified via
 Each bond asset is minted with a supply of exactly 2. One unit sits inside the bond box as its
 singleton, and is burned when the bond is repaid or liquidated. The other unit goes to the lender.
 
-When a bond names the `BondAssetVault` as its lender, repayment or liquidated collateral is paid into
-the vault, and whoever holds the lender's unit claims it by burning that unit. The position on the bond
-is then simply the token: lenders may trade it, and buyers may speculate on the value of the bond.
+Every bond made by an offer or an order pays its repayment, or its liquidated collateral, into the
+`BondAssetVault`, and whoever holds the lender's unit claims it by burning that unit. Each bond asset
+therefore unlocks exactly what its bond pays out. The position on the bond is simply the token: lenders
+may trade it, and buyers may speculate on the value of the bond. The cost is one more transaction for
+the lender: being paid means claiming from the vault ([Tx 7](#tx-7-claim-from-the-vault)).
 
 A bond asset is only worth anything if its supply really is 2. Verify one by its genesis box: the token
-id is the id of the box that minted it, and that box must have run one of the minting contracts below
-(`BondNFT_Generator` by address, or an order by template hash). **Never trust a bond asset by its
-name.** The name is chosen by the lender and proves nothing.
+id is the id of the box that minted it, and that box must be one of:
+- a `BondNFT_Generator` box: compare its whole ErgoTree. Then check that the mint transaction's second
+  output, where the other unit went, is a genuine `ZC_Offer`.
+- a `ZC_Order` or `ZC_OrderOnClose` instance.
+
+Check offers and orders with `ScriptGenerator.ContractTemplate.matches`, never by template hash alone.
+A template hash leaves out every constant, not just the terms, so a forged order can share the genuine
+template hash while minting 3 units, or an offer while paying another vault. `matches` allows only the
+terms to differ. **Never trust a bond asset by its name.** The name is chosen by the lender and proves
+nothing.
 
 ## Fees
 SigmaBonds V2 takes no protocol fees. The only fees pay whoever executes a transaction for someone else:
@@ -67,7 +76,8 @@ Offers and orders keep their terms as compiled-in constants rather than register
 same ErgoTree template with different constants, and likewise for each order type, so UIs find them by
 template hash and read the terms from the constants. Clients must build an offer or order by replacing
 the constants of the compiled template (`ScriptGenerator.ContractTemplate.withTerms`), never by
-recompiling the script.
+recompiling the script, and must verify one found by template hash with `ContractTemplate.matches`.
+Every template also carries one fixed constant, `CONST_VAULT_HASH`, which pins each bond's R8 to the vault.
 
 Hashes of contracts and wallets are always `blake2b256` of the full ErgoTree bytes.
 
@@ -79,7 +89,8 @@ Hashes of contracts and wallets are always `blake2b256` of the full ErgoTree byt
 - R5: `Coll[Byte]` borrower hash: receives the collateral back on repayment
 - R6: `Coll[Long]` (repayment, batching fee). Repayment is in nanoERG, or in `CONST_TOKEN_ID` for a token bond.
 - R7: `Int` maturity height. Repayment is open strictly below it.
-- R8: `Coll[Byte]` lender hash: receives repayment or collateral. The `BondAssetVault` for a tradeable bond.
+- R8: `Coll[Byte]` lender hash: receives repayment or collateral. Always the `BondAssetVault` for bonds
+  made by offers and orders.
 - R9: `Coll[Byte]` liquidation script hash. See [Liquidation Scripts](#liquidation-scripts).
 
 ## Lender Side: Offers
@@ -111,8 +122,8 @@ A borrower takes the principal by creating the exact bond the lender asked for. 
 collateral is the borrower, so the principal may go wherever they send it. One offer closes per transaction.
 - `OUTPUTS(0)`: the bond, under `CONST_BOND_HASH`, carrying the offer's unit at tokens(0), exactly
   `CONST_COLLATERAL_TOKENS` after it, and at least `CONST_COLLATERAL_ERG`. R4 is the offer's box id,
-  R5 is the borrower's hash, and R6 to R9 are the offer's terms (`CONST_REPAYMENT`, `CONST_BATCHING_FEE`,
-  `CONST_MATURITY`, `CONST_LENDER_HASH`, `CONST_LIQ_SCRIPT_HASH`).
+  R5 is the borrower's hash, R6, R7 and R9 are the offer's terms (`CONST_REPAYMENT`,
+  `CONST_BATCHING_FEE`, `CONST_MATURITY`, `CONST_LIQ_SCRIPT_HASH`), and R8 is the vault.
 
 ### Tx 4A: Cancel an Offer
 The holder of the lender's unit spends it alongside the offer, and both units are burned. The principal
@@ -137,7 +148,7 @@ asset, with the order's box id as its id. One order fills per transaction.
   asset's EIP-4 metadata, which is the lender's own choice here.
 - `OUTPUTS(1)`: the bond, under `CONST_BOND_HASH`: (asset, 1), then the order's tokens unchanged, and at
   least the order's value. R4 is the order's box id, R5 is `CONST_BORROWER_HASH`, R6 and R9 are the
-  order's terms, and R8 is the lender's choice of where repayment goes.
+  order's terms, and R8 is the vault.
 - `OUTPUTS(2)`: the principal, to the borrower.
 
 Maturity (bond R7) depends on the order type:
@@ -197,7 +208,7 @@ at once, so orders and offers name their script as a term, and both sides must c
 ## Changes from V1
 | | V1 | V2 |
 |---|---|---|
-| Lender | A public key in R8 | A hash of any ErgoTree in R8, normally the vault |
+| Lender | A public key in R8 | Whoever holds the bond asset; R8 is always the vault |
 | Lender's position | Not transferable | A bond asset, tradeable and claimed through the vault |
 | Repayment | Signed by the borrower | Anyone may pay it |
 | Liquidation | From maturity on, by anyone, collateral in full | Set by a liquidation script; `MaturityLiquidation` is V1's rule, less at most the batching fee |

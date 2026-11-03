@@ -4,15 +4,22 @@
     // everything else in the box is the principal. A borrower closes the offer by creating the exact bond
     // the lender asked for, carrying the singleton and the collateral, and keeps the principal.
     // One contract serves ERG and token loans: CONST_BOND_HASH says which bond, the box holds the principal.
+    // The bond always pays the BondAssetVault, so the bond asset always unlocks the repayment or collateral.
     //
-    // CONSTANTS (the lender's terms)
+    // CONSTANTS
     // Every offer is this one ErgoTree template with different constants, so UIs find offers by template
     // hash and read the terms from the constants. Clients stamp offers out of the template by replacing
     // constants rather than recompiling: replacement keeps the template byte for byte by construction,
     // while a recompile keeps it only as long as the compiler lays the constants out the same way.
+    // A template hash leaves every constant out, not only the terms, so verifying an offer means also
+    // checking that each constant that is not a term (CONST_VAULT_HASH among them) is the template's own.
+    //
+    // Fixed, the same in every offer:
+    // CONST_VAULT_HASH:        Coll[Byte] - blake2b256 of BondAssetVault. Bond R8.
+    //
+    // The lender's terms:
     // CONST_BOND_HASH:         Coll[Byte] - blake2b256 of the bond ErgoTree: ZC_ERG_Bond, or ZC_Token_Bond
     //                                       compiled for the repayment token
-    // CONST_LENDER_HASH:       Coll[Byte] - bond R8. The generic BondAssetVault, for a tradeable bond.
     // CONST_REPAYMENT:         Long       - bond R6(0)
     // CONST_BATCHING_FEE:      Long       - bond R6(1)
     // CONST_MATURITY:          Int        - bond R7, an absolute height
@@ -85,7 +92,7 @@
             bondAmounts(0) == CONST_REPAYMENT &&
             bondAmounts(1) == CONST_BATCHING_FEE &&
             bondBox.R7[Int].get == CONST_MATURITY &&
-            bondBox.R8[Coll[Byte]].get == CONST_LENDER_HASH &&
+            bondBox.R8[Coll[Byte]].get == CONST_VAULT_HASH &&
             bondBox.R9[Coll[Byte]].get == CONST_LIQ_SCRIPT_HASH
 
         // The bond trusts its creator to have bounded the fee. Read off the bond, not the constant, so the

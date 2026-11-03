@@ -22,8 +22,8 @@ class ZcOfferSpec extends AnyPropSpec with BondSpecBase {
   property("template: every term sits at its own constant position") {
     withCtx { ctx =>
       val positions = offerTemplate(ctx).positions
-      positions.keySet.size shouldBe 8
-      positions.values.toSet.size shouldBe 8
+      positions.keySet.size shouldBe 7
+      positions.values.toSet.size shouldBe 7
     }
   }
 
@@ -131,7 +131,7 @@ class ZcOfferSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
-    property(s"$kind close: rejects repayment directed away from the lender") {
+    property(s"$kind close: rejects repayment directed away from the vault") {
       withCtx { ctx =>
         val c = closeScenario(ctx, kind)
         rejectsAtSigning(c.prover, closeTx(c)(bondOut = c.bondOut.withRegNum(8, bytesValue(hashOf(borrowerTree(ctx))))))

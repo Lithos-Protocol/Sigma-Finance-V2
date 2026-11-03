@@ -123,12 +123,17 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
-    property(s"$name fill: the lender chooses where repayment goes and where its unit goes") {
+    property(s"$name fill: the lender chooses where its unit goes") {
       withCtx { ctx =>
         val f = fillScenario(ctx, kind, style = style)
-        accepts(f.prover, fillTx(f)(
-          bondOut = f.bondOut.withRegNum(8, bytesValue(hashOf(lenderTree(ctx)))),
-          unitOut = f.unitOut.setContract(otherTree(ctx))))
+        accepts(f.prover, fillTx(f)(unitOut = f.unitOut.setContract(otherTree(ctx))))
+      }
+    }
+
+    property(s"$name fill: rejects repayment directed away from the vault, even to the lender's own wallet") {
+      withCtx { ctx =>
+        val f = fillScenario(ctx, kind, style = style)
+        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(8, bytesValue(hashOf(lenderTree(ctx))))))
       }
     }
 
