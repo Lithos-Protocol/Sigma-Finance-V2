@@ -3,14 +3,16 @@ package specs.bonds
 
 import ksingh.sigmabonds.client.ScriptGenerator
 import org.ergoplatform.appkit._
+import org.ergoplatform.sdk.ErgoId
 import org.scalatest.propspec.AnyPropSpec
 import scorex.crypto.hash.Blake2b256
 import sigma.serialization.ErgoTreeSerializer
-import work.lithos.mutations.{Token, UTXO}
+import work.lithos.mutations.{InputUTXO, Token, UTXO}
 
+import scala.collection.JavaConverters._
 import scala.util.Try
 
-/** ZC_Offer, and the whole lender-side chain it joins: mint, offer, bond, vault, claim. */
+/** ZC_Offer, and the whole lender-side chain it starts: offer, close (mint), bond, vault, claim. */
 class ZcOfferSpec extends AnyPropSpec with BondSpecBase {
 
   import BondSpecBase._
@@ -22,8 +24,8 @@ class ZcOfferSpec extends AnyPropSpec with BondSpecBase {
   property("template: every term sits at its own constant position") {
     withCtx { ctx =>
       val positions = offerTemplate(ctx).positions
-      positions.keySet.size shouldBe 7
-      positions.values.toSet.size shouldBe 7
+      positions.keySet.size shouldBe 10
+      positions.values.toSet.size shouldBe 10
     }
   }
 
@@ -31,7 +33,8 @@ class ZcOfferSpec extends AnyPropSpec with BondSpecBase {
     withCtx { ctx =>
       val t = offerTemplate(ctx)
       val erg = t.withTerms(offerTerms(ctx, ErgBond))
-      val token = t.withTerms(offerTerms(ctx, TokenBond, collateral = Seq.empty[Token], fee = 0L))
+      val token = t.withTerms(offerTerms(ctx, TokenBond, collateral = Seq.empty[Token], fee = 0L,
+        lenderScript = otherTree(ctx)).copy(assetName = Array.emptyByteArray))
       erg should not equal token
       Seq(erg, token).foreach { tree =>
         Blake2b256.hash(tree.template).toSeq shouldBe t.templateHash.toSeq
@@ -49,7 +52,7 @@ class ZcOfferSpec extends AnyPropSpec with BondSpecBase {
     withCtx { ctx =>
       val t = offerTemplate(ctx)
       val colliding = offerTerms(ctx, ErgBond, fee = 1000000L, collateralValue = 1000000L)
-        .copy(repayment = 1000000L)
+        .copy(repayment = 1000000L, assetDescription = tokenName.getBytes("UTF-8"))
       Blake2b256.hash(t.withTerms(colliding).template).toSeq shouldBe t.templateHash.toSeq
 
       // What a recompile does with the same values. Informational only: stamping does not depend on it.
@@ -66,10 +69,22 @@ class ZcOfferSpec extends AnyPropSpec with BondSpecBase {
 
     // ═══ CLOSE ══════════════════════════════════════════════════════════════
 
-    property(s"$kind close: a borrower posts the collateral, creates the bond and keeps the principal") {
+    property(s"$kind close: a borrower posts the collateral, the lender gets the one unit, the borrower the principal") {
       withCtx { ctx =>
         val c = closeScenario(ctx, kind)
-        accepts(c.prover, closeTx(c)())
+        val outs = accepts(c.prover, closeTx(c)()).getOutputsToSpend.asScala
+        outs.flatMap(_.getTokens.asScala).filter(_.getId == c.asset).map(_.getValue.longValue).sum shouldBe 1L
+        outs.head.getErgoTree shouldBe lenderTree(ctx).ergoTree
+      }
+    }
+
+    property(s"$kind close: eip-4 metadata is the lender's, on the first output carrying the asset") {
+      withCtx { ctx =>
+        val c = closeScenario(ctx, kind)
+        val outs = accepts(c.prover, closeTx(c)()).getOutputsToSpend.asScala
+        outs.indexWhere(_.getTokens.asScala.exists(_.getId == c.asset)) shouldBe 0
+        def reg(i: Int) = new String(outs.head.getRegisters.get(i).getValue.asInstanceOf[sigma.Coll[Byte]].toArray, "UTF-8")
+        (reg(0), reg(1), reg(2)) shouldBe ((tokenName, tokenDescription, "0"))
       }
     }
 
@@ -87,6 +102,64 @@ class ZcOfferSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
+    // ─── the lender's unit ──────────────────────────────────────────────────
+
+    property(s"$kind close: rejects the unit going to anyone but the lender") {
+      withCtx { ctx =>
+        // the borrower builds the close, so this would let it keep the claim on its own bond
+        val c = closeScenario(ctx, kind)
+        rejectsAtSigning(c.prover, closeTx(c)(unitOut = c.unitOut.setContract(borrowerTree(ctx))))
+      }
+    }
+
+    property(s"$kind close: rejects a unit box under 0.001 ERG") {
+      withCtx { ctx =>
+        val c = closeScenario(ctx, kind)
+        rejectsAtSigning(c.prover, closeTx(c)(unitOut = c.unitOut.setValue(minBox - 1)))
+      }
+    }
+
+    property(s"$kind close: rejects a second unit (verifiedMint)") {
+      withCtx { ctx =>
+        val c = closeScenario(ctx, kind)
+        val second = UTXO(borrowerTree(ctx), minBox, Seq(Token(c.asset, 1L)))
+        rejectsAtSigning(c.prover, closeTx(c)(outputs = Seq(c.unitOut, c.bondOut, c.principalOut, second)))
+        rejectsAtSigning(c.prover, closeTx(c)(unitOut = c.unitOut.setTokens(Token(c.asset, 2L))))
+      }
+    }
+
+    property(s"$kind close: rejects the unit anywhere but OUTPUTS(0)") {
+      withCtx { ctx =>
+        val c = closeScenario(ctx, kind)
+        rejectsAtSigning(c.prover, closeTx(c)(outputs = Seq(c.bondOut, c.unitOut, c.principalOut)))
+      }
+    }
+
+    property(s"$kind close: rejects metadata other than the lender's") {
+      withCtx { ctx =>
+        val c = closeScenario(ctx, kind)
+        Seq(eip4(name = "Bond of Nothing"), eip4(description = "worthless"), eip4(decimals = "2"),
+          eip4() :+ utf8("an image link"), eip4().take(2)).foreach { regs =>
+          rejectsAtSigning(c.prover, closeTx(c)(unitOut = c.unitOut.setRegs(regs: _*)))
+        }
+      }
+    }
+
+    property(s"$kind close: an offer that is not INPUTS(0) cannot mint, and falls to the lender-only cancel") {
+      withCtx { ctx =>
+        val c = closeScenario(ctx, kind)
+        val first = funding(ctx, c.prover, 0, slack, defaultCollateral)
+        val offerSecond = inputAt(c.offer, ctx, 1)
+        val wrongAsset = first.id
+        rejectsAtSigning(c.prover, closeTx(c)(
+          inputs = Seq(first, offerSecond),
+          unitOut = c.unitOut.setTokens(Token(wrongAsset, 1L)),
+          bondOut = bondUTXO(ctx, kind, asset = wrongAsset)))
+      }
+    }
+
+    // ─── the bond ───────────────────────────────────────────────────────────
+
     property(s"$kind close: rejects a bond under another contract") {
       withCtx { ctx =>
         val c = closeScenario(ctx, kind)
@@ -94,10 +167,11 @@ class ZcOfferSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
-    property(s"$kind close: rejects a bond that does not name this offer in R4") {
+    property(s"$kind close: rejects a bond that does not name this offer's asset in R4") {
       withCtx { ctx =>
+        // the bond would settle into the vault under an asset the borrower holds, and the borrower would claim it
         val c = closeScenario(ctx, kind)
-        rejectsAtSigning(c.prover, closeTx(c)(bondOut = c.bondOut.withRegNum(4, bytesValue(originOrderId))))
+        rejectsAtSigning(c.prover, closeTx(c)(bondOut = c.bondOut.withRegNum(4, bytesValue(otherBondAsset.getBytes))))
       }
     }
 
@@ -131,18 +205,11 @@ class ZcOfferSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
-    property(s"$kind close: rejects repayment directed away from the vault") {
-      withCtx { ctx =>
-        val c = closeScenario(ctx, kind)
-        rejectsAtSigning(c.prover, closeTx(c)(bondOut = c.bondOut.withRegNum(8, bytesValue(hashOf(borrowerTree(ctx))))))
-      }
-    }
-
     property(s"$kind close: rejects a liquidation script the lender did not offer") {
       withCtx { ctx =>
         val c = closeScenario(ctx, kind)
         rejectsAtSigning(c.prover, closeTx(c)(bondOut =
-          c.bondOut.withRegNum(9, bytesValue(neverTrue(ctx).hashedValueBytes))))
+          c.bondOut.withRegNum(8, bytesValue(neverTrue(ctx).hashedValueBytes))))
       }
     }
 
@@ -156,7 +223,7 @@ class ZcOfferSpec extends AnyPropSpec with BondSpecBase {
     property(s"$kind close: rejects one collateral token short") {
       withCtx { ctx =>
         val c = closeScenario(ctx, kind)
-        rejectsAtSigning(c.prover, closeTx(c)(bondOut = c.bondOut.setTokens(Token(bondAsset, 1L), Token(collateralToken, 99L))))
+        rejectsAtSigning(c.prover, closeTx(c)(bondOut = c.bondOut.setTokens(Token(collateralToken, 99L))))
       }
     }
 
@@ -166,32 +233,6 @@ class ZcOfferSpec extends AnyPropSpec with BondSpecBase {
         val richer = funding(ctx, c.prover, 1, slack, defaultCollateral :+ Token(secondCollateral, 1L))
         rejectsAtSigning(c.prover, closeTx(c)(bondOut = c.bondOut.addToken(Token(secondCollateral, 1L)),
           inputs = Seq(c.offerIn, richer)))
-      }
-    }
-
-    property(s"$kind close: rejects keeping the offer's unit out of the bond") {
-      withCtx { ctx =>
-        val c = closeScenario(ctx, kind)
-        rejectsAtSigning(c.prover, closeTx(c)(bondOut = c.bondOut.setTokens(defaultCollateral: _*)))
-      }
-    }
-
-    property(s"$kind close: rejects a bond carrying another token in place of the offer's unit") {
-      withCtx { ctx =>
-        // the bond would settle into the vault under the borrower's own token, and the borrower would claim it
-        val c = closeScenario(ctx, kind)
-        val withFake = funding(ctx, c.prover, 1, slack, defaultCollateral :+ Token(otherBondAsset, 1L))
-        rejectsAtSigning(c.prover, closeTx(c)(
-          bondOut = c.bondOut.setTokens(Token(otherBondAsset, 1L) +: defaultCollateral: _*),
-          inputs = Seq(c.offerIn, withFake)))
-      }
-    }
-
-    property(s"$kind close: rejects burning the offer's unit without the lender's") {
-      withCtx { ctx =>
-        val c = closeScenario(ctx, kind)
-        rejectsAtSigning(c.prover, closeTx(c)(bondOut = c.bondOut.setTokens(defaultCollateral: _*),
-          burn = Seq(Token(bondAsset, 1L))))
       }
     }
 
@@ -206,71 +247,59 @@ class ZcOfferSpec extends AnyPropSpec with BondSpecBase {
 
     // ═══ CANCEL ═════════════════════════════════════════════════════════════
 
-    property(s"$kind cancel: the holder of the lender's unit burns both units and takes the principal") {
+    property(s"$kind cancel: the lender takes the principal back") {
       withCtx { ctx =>
         val c = closeScenario(ctx, kind)
         val l = lender(ctx)
-        val unit = funding(ctx, l, 1, Parameters.OneErg, Seq(Token(bondAsset, 1L)))
-        accepts(l, build(ctx, Seq(c.offerIn, unit), Seq(c.principalOut.setContract(lenderTree(ctx))), l.getAddress,
-          burn = Seq(Token(bondAsset, 2L))))
+        accepts(l, build(ctx, Seq(c.offerIn, funding(ctx, l, 1)),
+          Seq(UTXO(lenderTree(ctx), c.offer.value, c.offer.tokens)), l.getAddress))
       }
     }
 
-    property(s"$kind cancel: rejected without the lender's unit") {
+    property(s"$kind cancel: rejected without the lender (lenderAuth)") {
       withCtx { ctx =>
         val c = closeScenario(ctx, kind)
         val o = other(ctx)
-        rejectsAtSigning(o, build(ctx, Seq(c.offerIn, funding(ctx, o, 1)), Seq(c.principalOut.setContract(otherTree(ctx))),
-          o.getAddress, burn = Seq(Token(bondAsset, 1L))))
+        rejectsAtSigning(o, build(ctx, Seq(c.offerIn, funding(ctx, o, 1)),
+          Seq(UTXO(otherTree(ctx), c.offer.value, c.offer.tokens)), o.getAddress))
       }
     }
 
     // ═══ THE WHOLE CHAIN ════════════════════════════════════════════════════
 
-    /** Generator -> executor mint -> offer -> borrower closes. Returns the lender's unit and the live bond. */
-    def mintAndClose(ctx: BlockchainContext) = {
-      val terms = offerTerms(ctx, kind)
-      val offerScript = offerContract(ctx, terms)
-      val (offerValue, principal) = principalOf(kind)
-      val m = mintScenario(ctx, genTokens = principal, orderScript = offerScript, principal = offerValue)
-      val minted = accepts(m.prover, mintTx(m)())
-      val lenderUnit = minted.getOutputsToSpend.get(0)
-      val offerIn = spendOutput(minted, 1)
-
-      val b = borrower(ctx)
-      val bondOut = bondUTXO(ctx, kind, asset = m.asset, origin = offerIn.id.getBytes)
-      val closed = accepts(b, build(ctx, Seq(offerIn, funding(ctx, b, 1, slack, defaultCollateral)),
-        Seq(bondOut, UTXO(borrowerTree(ctx), offerIn.value, offerIn.tokens.drop(1))), b.getAddress))
-      (m.asset, work.lithos.mutations.InputUTXO(lenderUnit), spendOutput(closed, 0))
+    /** Offer -> borrower closes. Returns the asset, the lender's unit and the live bond. */
+    def close(ctx: BlockchainContext): (ErgoId, InputUTXO, InputUTXO) = {
+      val c = closeScenario(ctx, kind)
+      val closed = accepts(c.prover, closeTx(c)())
+      (c.asset, spendOutput(closed, 0), spendOutput(closed, 1))
     }
 
-    def claim(ctx: BlockchainContext, asset: org.ergoplatform.sdk.ErgoId,
-              lenderUnit: work.lithos.mutations.InputUTXO, settled: work.lithos.mutations.InputUTXO) = {
+    def claim(ctx: BlockchainContext, asset: ErgoId, lenderUnit: InputUTXO, settled: InputUTXO) = {
       val holder = lender(ctx)
       accepts(holder, build(ctx, Seq(settled, lenderUnit, funding(ctx, holder, 2)),
         Seq(UTXO(lenderTree(ctx), settled.value, settled.tokens)), holder.getAddress, burn = Seq(Token(asset, 1L))))
     }
 
-    property(s"$kind chain: mint, offer, close, repay, and the lender's unit claims the repayment") {
+    property(s"$kind chain: offer, close, repay, and the lender's unit claims the repayment") {
       withCtx { ctx =>
-        val (asset, lenderUnit, bondIn) = mintAndClose(ctx)
+        val (asset, lenderUnit, bondIn) = close(ctx)
         val b = borrower(ctx)
         val repaid = accepts(b, build(ctx, Seq(bondIn, funding(ctx, b, 1, slack, repaymentFunds(kind))),
           Seq(repaymentBox(kind, vault(ctx), bondIn.id, asset),
             tagged(borrowerTree(ctx), bondIn.value, bondIn.id, defaultCollateral)),
-          b.getAddress, burn = Seq(Token(asset, 1L))))
+          b.getAddress))
         claim(ctx, asset, lenderUnit, spendOutput(repaid, 0))
       }
     }
 
-    property(s"$kind chain: mint, offer, close, an executor liquidates, and the lender's unit claims the collateral") {
+    property(s"$kind chain: offer, close, an executor liquidates, and the lender's unit claims the collateral") {
       withCtx { ctx =>
-        val (asset, lenderUnit, bond) = mintAndClose(ctx)
+        val (asset, lenderUnit, bond) = close(ctx)
         val bondIn = bond.withCtxVar(0.toByte, liqVar(matured(ctx)))
         val ex = executor(ctx)
         val liquidated = accepts(ex, buildAt(ctx, maturityOf(ctx), Seq(bondIn),
           Seq(settlement(vault(ctx), bondIn.value - batchingFee, bondIn.id, asset, defaultCollateral)),
-          ex.getAddress, burn = Seq(Token(asset, 1L))))
+          ex.getAddress))
         claim(ctx, asset, lenderUnit, spendOutput(liquidated, 0))
       }
     }

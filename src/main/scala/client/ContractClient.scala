@@ -38,7 +38,6 @@ object BondsV2Report {
 
   def lines(ctx: BlockchainContext, tokenIds: Seq[String]): Seq[String] = {
     val vault = ScriptGenerator.mkBondAssetVault(ctx)
-    val generator = ScriptGenerator.mkBondAssetGenerator(ctx)
     val offer = ScriptGenerator.mkOfferTemplate(ctx)
     val order = ScriptGenerator.mkOrderTemplate(ctx)
     val onCloseOrder = ScriptGenerator.mkOnCloseOrderTemplate(ctx)
@@ -48,13 +47,12 @@ object BondsV2Report {
     val liquidations = ScriptGenerator.LIQUIDATION_SCRIPTS.map(ScriptGenerator.mkLiquidationScript(ctx, _))
 
     Seq("SigmaFi V2 zero-coupon bonds",
-      s"Bond Asset Generator: ${generator.toAddress}",
       s"Bond Asset Vault:     ${vault.toAddress}",
-      s"  hash (CONST_VAULT_HASH, every bond's R8): ${hashHex(vault)}") ++
+      s"  hash (every bond's CONST_VAULT_HASH): ${hashHex(vault)}") ++
       bonds.flatMap { case (name, bond) =>
-        Seq(s"ZC Bond ($name): ${bond.toAddress}", s"  hash (offer CONST_BOND_HASH): ${hashHex(bond)}")
+        Seq(s"ZC Bond ($name): ${bond.toAddress}", s"  hash (offer and order CONST_BOND_HASH): ${hashHex(bond)}")
       } ++
-      Seq("Liquidation scripts (hash: bond R9 and offer CONST_LIQ_SCRIPT_HASH; bytes: executor's context var 0)") ++
+      Seq("Liquidation scripts (hash: bond R8 and CONST_LIQ_SCRIPT_HASH; bytes: executor's context var 0)") ++
       liquidations.flatMap { l =>
         Seq(s"  ${l.name}", s"    hash:  ${Base16.encode(l.hash)}", s"    bytes: ${Base16.encode(l.bytes)}")
       } ++

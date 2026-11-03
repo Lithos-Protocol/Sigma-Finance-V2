@@ -109,7 +109,7 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
         val f = fillScenario(ctx, kind, style = style)
         val signed = accepts(f.prover, fillTx(f)())
         signed.getOutputsToSpend.asScala.flatMap(_.getTokens.asScala).filter(_.getId == f.asset)
-          .map(_.getValue.longValue).sum shouldBe 2L
+          .map(_.getValue.longValue).sum shouldBe 1L
       }
     }
 
@@ -130,13 +130,6 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
-    property(s"$name fill: rejects repayment directed away from the vault, even to the lender's own wallet") {
-      withCtx { ctx =>
-        val f = fillScenario(ctx, kind, style = style)
-        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(8, bytesValue(hashOf(lenderTree(ctx))))))
-      }
-    }
-
     property(s"$name fill: rejects a bond under another contract") {
       withCtx { ctx =>
         val f = fillScenario(ctx, kind, style = style)
@@ -144,10 +137,11 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
-    property(s"$name fill: rejects a bond that does not name this order in R4") {
+    property(s"$name fill: rejects a bond that does not name this order's asset in R4") {
       withCtx { ctx =>
+        // the vault would open the bond's payout for some other asset's holder, not the lender's unit
         val f = fillScenario(ctx, kind, style = style)
-        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(4, bytesValue(originOrderId))))
+        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(4, bytesValue(otherBondAsset.getBytes))))
       }
     }
 
@@ -172,17 +166,10 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
-    property(s"$name fill: rejects a lender address the bond could not read") {
-      withCtx { ctx =>
-        val f = fillScenario(ctx, kind, style = style)
-        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(8, ErgoValue.of(5L))))
-      }
-    }
-
     property(s"$name fill: rejects a liquidation script the borrower did not ask for") {
       withCtx { ctx =>
         val f = fillScenario(ctx, kind, style = style)
-        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(9, bytesValue(alwaysTrue(ctx).hashedValueBytes))))
+        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(8, bytesValue(alwaysTrue(ctx).hashedValueBytes))))
       }
     }
 
@@ -196,7 +183,7 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
     property(s"$name fill: rejects keeping one collateral token") {
       withCtx { ctx =>
         val f = fillScenario(ctx, kind, style = style)
-        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.setTokens(Token(f.asset, 1L), Token(collateralToken, 99L))))
+        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.setTokens(Token(collateralToken, 99L))))
       }
     }
 
@@ -214,19 +201,20 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
-    property(s"$name fill: rejects a third unit (verifiedMint)") {
+    property(s"$name fill: rejects a second unit (verifiedMint)") {
       withCtx { ctx =>
         val f = fillScenario(ctx, kind, style = style)
-        val third = UTXO(lenderTree(ctx), minBox, Seq(Token(f.asset, 1L)))
-        rejectsAtSigning(f.prover, fillTx(f)(outputs = Seq(f.unitOut, f.bondOut, f.principalOut, third)))
+        val second = UTXO(lenderTree(ctx), minBox, Seq(Token(f.asset, 1L)))
+        rejectsAtSigning(f.prover, fillTx(f)(outputs = Seq(f.unitOut, f.bondOut, f.principalOut, second)))
+        rejectsAtSigning(f.prover, fillTx(f)(unitOut = f.unitOut.setTokens(Token(f.asset, 2L))))
       }
     }
 
-    property(s"$name fill: rejects both units in the bond and none for the lender") {
+    property(s"$name fill: rejects the unit in the bond and none for the lender") {
       withCtx { ctx =>
         val f = fillScenario(ctx, kind, style = style)
         rejectsAtSigning(f.prover, fillTx(f)(unitOut = f.unitOut.setTokens(),
-          bondOut = f.bondOut.setTokens(Token(f.asset, 2L) +: defaultCollateral: _*)))
+          bondOut = f.bondOut.setTokens(Token(f.asset, 1L) +: defaultCollateral: _*)))
       }
     }
 
@@ -246,7 +234,7 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
         rejectsAtSigning(f.prover, fillTx(f)(
           inputs = Seq(first, orderSecond),
           unitOut = f.unitOut.setTokens(Token(wrongAsset, 1L)),
-          bondOut = f.bondOut.setTokens(Token(wrongAsset, 1L) +: defaultCollateral: _*)))
+          bondOut = f.bondOut.withRegNum(4, bytesValue(wrongAsset.getBytes))))
       }
     }
 
@@ -290,7 +278,7 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
         val repaid = accepts(b, buildAt(ctx, f.maturity - 1, Seq(bondIn, funding(ctx, b, 1, slack, repaymentFunds(kind))),
           Seq(repaymentBox(kind, vault(ctx), bondIn.id, f.asset),
             tagged(borrowerTree(ctx), bondIn.value, bondIn.id, defaultCollateral)),
-          b.getAddress, burn = Seq(Token(f.asset, 1L))))
+          b.getAddress))
         claim(ctx, f.asset, lenderUnit, spendOutput(repaid, 0))
       }
     }
@@ -301,10 +289,8 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
         val bondIn = bond.withCtxVar(0.toByte, liqVar(matured(ctx)))
         val batcher = executor(ctx)
         val settle = settlement(vault(ctx), bondIn.value - batchingFee, bondIn.id, f.asset, defaultCollateral)
-        rejectsAtSigning(batcher, buildAt(ctx, f.maturity - 1, Seq(bondIn), Seq(settle), batcher.getAddress,
-          burn = Seq(Token(f.asset, 1L))))
-        val liquidated = accepts(batcher, buildAt(ctx, f.maturity, Seq(bondIn), Seq(settle), batcher.getAddress,
-          burn = Seq(Token(f.asset, 1L))))
+        rejectsAtSigning(batcher, buildAt(ctx, f.maturity - 1, Seq(bondIn), Seq(settle), batcher.getAddress))
+        val liquidated = accepts(batcher, buildAt(ctx, f.maturity, Seq(bondIn), Seq(settle), batcher.getAddress))
         liquidated.getOutputsToSpend.asScala.filter(_.getErgoTree == contractOf(batcher).ergoTree)
           .map(_.getValue.longValue).sum shouldBe batchingFee - Parameters.MinFee
         claim(ctx, f.asset, lenderUnit, spendOutput(liquidated, 0))

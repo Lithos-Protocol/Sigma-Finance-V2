@@ -44,10 +44,10 @@ case class Prepared(title: String, tx: UnsignedTransaction, notes: Seq[String])
  * positions their contracts read and wallet boxes after them, and returns it unsigned. `submit` has the node
  * wallet sign it, has the node check it, and sends it only when the settings say to.
  *
- * Some commitments are hashes only: an order's borrower, a generator's lender and offer. Their ErgoTrees are
- * found by `treeFor`, from this wallet, a hint register, or the transaction that created the box. Boxes this
- * client creates carry the hint: an order's R4 holds the borrower's tree, a generator's R9 the offer's and
- * the lender's. No contract reads either register.
+ * Some commitments are hashes only: an order's borrower and an offer's lender. Their ErgoTrees are found by
+ * `treeFor`, from this wallet, a hint register, or the transaction that created the box. Boxes this client
+ * creates carry the hint: an order's R4 holds the borrower's tree, and an offer's R4 the lender's. No
+ * contract reads either register.
  */
 class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, out: String => Unit = println,
                  compiled: Option[Protocol] = None) {
@@ -143,9 +143,6 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
     (decoded(node.unspentByErgoTree(protocol.ergBond.ergoTreeHex)) ++
       decoded(node.unspentByTemplateHash(Base16.encode(protocol.tokenBondTemplateHash)))).flatMap(protocol.asBond)
 
-  def generators(): Seq[GeneratorInfo] =
-    decoded(node.unspentByErgoTree(protocol.generator.ergoTreeHex)).flatMap(protocol.asGenerator)
-
   /** Every vault box, keyed by the bond asset that claims it. */
   def vaultBoxes(): Map[ErgoId, Seq[InputUTXO]] =
     decoded(node.unspentByErgoTree(protocol.vault.ergoTreeHex))
@@ -153,40 +150,36 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
       .groupBy(_._1).map { case (asset, boxes) => asset -> boxes.map(_._2) }
 
   /**
-   * Whether an offer's bond asset is genuine: its genesis box must be a BondNFT_Generator, and the offer must
-   * be the second output of the transaction that spent it. An unspent offer can only be that box, since
-   * closing or cancelling consumes it.
+   * Whether a bond is the one its bond asset's mint created. R4 names the asset, whose genesis box (the box
+   * with the asset's id) must be a genuine order or offer, spent by the transaction that created this bond,
+   * with the bond as its second output. Anyone can build a bond naming any asset in R4, which only ever pays
+   * that asset's holder; this is what tells the real one apart, for anyone pricing the asset.
    */
-  def verifyOffer(offer: OfferInfo): Either[String, Unit] =
+  def verifyBond(bond: BondInfo): Either[String, Unit] =
     for {
-      json <- node.boxById(offer.asset.toString).toRight("the index has no genesis box for its bond asset")
+      json <- node.boxById(bond.asset.toString).toRight("the index has no genesis box for its bond asset")
       genesis <- Try(NodeJson.box(json)).toOption.toRight("its genesis box does not decode")
-      _ <- Either.cond(sameTree(genesis.input.getErgoTree, protocol.generator.ergoTree), (),
-        "its bond asset was not minted by a BondNFT_Generator")
-      _ <- Either.cond(NodeJson.spentBy(json).contains(offer.box.input.getTransactionId), (),
-        "it is not the box its bond asset's mint created")
-      _ <- Either.cond(offer.box.input.getTransactionIndex == 1, (), "it is not its mint's second output")
+      _ <- Either.cond(protocol.isMinter(genesis.input.getErgoTree), (),
+        "its bond asset was not minted by a SigmaFi order or offer")
+      _ <- Either.cond(NodeJson.spentBy(json).contains(bond.box.input.getTransactionId), (),
+        "it is not the bond its asset's mint created")
+      _ <- Either.cond(bond.box.input.getTransactionIndex == 1, (), "it is not its mint's second output")
     } yield ()
-
-  /** The offer and lender trees a generator's R9 hint resolves, if it carries a valid one. */
-  def generatorTrees(gen: GeneratorInfo): Option[(ErgoTree, ErgoTree)] =
-    for {
-      offer <- gen.hints.find(t => hashOf(t).sameElements(gen.offerHash)) if protocol.offerTemplate.matches(offer)
-      lender <- gen.hints.find(t => hashOf(t).sameElements(gen.lenderHash))
-    } yield (offer, lender)
 
   // ═══ LENDER ═══════════════════════════════════════════════════════════════
 
   /**
-   * Tx 1A: the principal, the lender unit's box and the executor fee, into a generator. R4 commits to the
-   * offer's ErgoTree and R5 to this wallet's; R9 carries both trees so any executor can mint the offer.
+   * Tx 1A: the principal, plus the lender unit's box, under an offer stamped from its template. Its terms
+   * name this wallet as the lender, and the bond asset's name and description. R4 hints this wallet's tree.
    */
-  def createOffer(loan: Loan, maturity: Int, executorFee: Long, name: String, description: String): Prepared = {
+  def createOffer(loan: Loan, maturity: Int, name: String, description: String): Prepared = {
     checkLoan(loan)
     checkMaturity(maturity)
-    if (executorFee < 0) fail("the executor fee cannot be negative")
     val liq = protocol.liquidation(loan.liquidation)
     val terms = OfferTerms(
+      lenderHash = hashOf(myTree),
+      assetName = name.getBytes("UTF-8"),
+      assetDescription = description.getBytes("UTF-8"),
       bondHash = protocol.bondContract(loan.repayToken).hashedPropBytes,
       repayment = loan.repayment,
       batchingFee = loan.batchingFee,
@@ -194,40 +187,28 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
       liqScriptHash = liq.hash,
       collateralErg = loan.collateralErg,
       collateralTokens = loan.collateralTokens.map(t => t.id.getBytes -> t.amount))
-    val offerTree = protocol.offerTemplate.withTerms(terms)
-    val generator = UTXO(protocol.generator, loan.principalErg + MinBox + executorFee, loan.principalToken.toSeq,
-      Seq(bytesValue(hashOf(offerTree)), bytesValue(hashOf(myTree)), longValue(executorFee),
-        utf8Value(name), utf8Value(description), treesValue(offerTree, myTree)))
+    val offer = UTXO(Contract(protocol.offerTemplate.withTerms(terms)), loan.principalErg + MinBox,
+      loan.principalToken.toSeq, Seq(treesValue(myTree)))
 
     val notes = describeLoan(loan) ++ Seq(
       s"maturity: height $maturity (${maturity - height} blocks from now)",
-      s"executor fee: ${Fmt.erg(executorFee)}; bond asset name: '$name'",
-      "Output 0 is the generator. Mint it yourself with `mint <its box id>`, or leave it to an executor.") ++
-      (if (executorFee <= Parameters.MinFee) Seq("Warning: an executor fee at or below the miner fee pays no " +
-        "one to mint; you will likely have to mint it yourself.") else Seq.empty)
-    prepare("Create offer: fund a bond asset generator", plan(Seq.empty, Seq(generator)), notes)
+      s"bond asset name: '$name'. The borrower who closes the offer sends it to this wallet.",
+      "Output 0 is the offer. Cancel it any time before it is closed with `cancel-offer <its box id>`.")
+    prepare("Create offer", plan(Seq.empty, Seq(offer)), notes)
   }
 
-  /** Before the mint: take the generator back, authorized by a box at its lender address. */
-  def refundGenerator(generatorId: String): Prepared = {
-    val gen = protocol.asGenerator(unspent(generatorId)).getOrElse(fail(s"$generatorId is not a bond asset generator"))
-    val auth = walletBoxes.find(b => hashOf(b.input.getErgoTree).sameElements(gen.lenderHash))
-      .getOrElse(fail("this wallet holds no box at the generator's lender address (R5); only its lender can refund it"))
-    prepare(s"Refund generator $generatorId", sweep(Seq(gen.box, auth)))
-  }
-
-  /** Tx 4A: the holder of the lender's unit burns both units and takes the principal. */
+  /** Tx 3A: take the principal back, authorized by a box at the offer's lender address. */
   def cancelOffer(offerId: String): Prepared = {
-    val offer = protocol.asOffer(unspent(offerId)).getOrElse(fail(s"$offerId is not a SigmaFi offer"))
-    val unit = walletBoxes.find(_.tokens.exists(_.id == offer.asset))
-      .getOrElse(fail(s"this wallet does not hold the offer's bond asset ${offer.asset}; only its holder can cancel"))
-    prepare(s"Cancel offer $offerId", sweep(Seq(offer.box, unit), burn = Seq(Token(offer.asset, 2L))),
-      Seq(s"Burns both units of ${offer.asset} and returns the principal to this wallet."))
+    val box = unspent(offerId)
+    val terms = protocol.offerTermsOf(box.input.getErgoTree).getOrElse(fail(s"$offerId is not a SigmaFi offer"))
+    val auth = walletBoxes.find(b => hashOf(b.input.getErgoTree).sameElements(terms.lenderHash))
+      .getOrElse(fail("this wallet holds no box at the offer's lender address; only its lender can cancel"))
+    prepare(s"Cancel offer $offerId", sweep(Seq(box, auth)), Seq("Returns the principal to this wallet."))
   }
 
   /**
-   * Tx 2B: pay the principal and create the bond. The order is INPUTS(0), so the fill mints the bond asset;
-   * this wallet's unit, at OUTPUTS(0), names it.
+   * Tx 2B: pay the principal and create the bond. The order is INPUTS(0), so the fill mints the bond asset,
+   * one unit, to this wallet at OUTPUTS(0), which names it.
    */
   def fillOrder(orderId: String, name: String, description: String): Prepared = {
     val order = protocol.asOrder(unspent(orderId)).getOrElse(fail(s"$orderId is not a SigmaFi order"))
@@ -252,10 +233,9 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
 
     val unit = UTXO(Contract(myTree), MinBox, Seq(Token(asset, 1L)),
       Seq(utf8Value(name), utf8Value(description), utf8Value("0")))
-    val bond = UTXO(protocol.bondContract(repayToken), order.box.value, Token(asset, 1L) +: order.box.tokens,
+    val bond = UTXO(protocol.bondContract(repayToken), order.box.value, order.box.tokens,
       Seq(bytesValue(asset.getBytes), bytesValue(order.borrowerHash),
-        longsValue(order.repayment, order.batchingFee), intValue(maturity),
-        bytesValue(protocol.vault.hashedPropBytes), bytesValue(order.liqScriptHash)))
+        longsValue(order.repayment, order.batchingFee), intValue(maturity), bytesValue(order.liqScriptHash)))
     val principal = UTXO(Contract(borrower), math.max(order.principalErg, MinBox), order.principalTokens)
 
     val notes = Seq(
@@ -267,7 +247,7 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
     prepare(s"Fill order $orderId", plan(Seq(order.box), Seq(unit, bond, principal), minted = Some(asset)), notes)
   }
 
-  /** Tx 7: every vault box naming the asset, claimed at once with the unit, which is burned. */
+  /** Tx 6: every vault box naming the asset, claimed at once with the unit, which is burned. */
   def claim(assetId: String): Prepared = {
     val asset = Try(ErgoId.create(assetId)).getOrElse(fail(s"$assetId is not a token id"))
     val settled = vaultBoxes().getOrElse(asset, Seq.empty)
@@ -316,10 +296,13 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
     prepare(s"Cancel order $orderId", sweep(Seq(order.box, auth)))
   }
 
-  /** Tx 3A: post the collateral as the exact bond the offer asks for, and take the principal. */
+  /**
+   * Tx 2A: post the collateral as the exact bond the offer asks for, and take the principal. The offer is
+   * INPUTS(0), so the close mints the bond asset: one unit, at OUTPUTS(0), to the lender, under the name and
+   * description the offer names. The lender's tree comes from the offer's hint or its history.
+   */
   def closeOffer(offerId: String): Prepared = {
     val offer = protocol.asOffer(unspent(offerId)).getOrElse(fail(s"$offerId is not a SigmaFi offer"))
-    verifyOffer(offer).left.foreach(reason => fail(s"refusing an unverified offer: $reason"))
     val t = offer.terms
     val repayToken = protocol.pairedBond(t.bondHash, offer.principalTokens)
       .getOrElse(fail("the offer's bond contract does not match its principal, so its bond could not be repaid"))
@@ -330,9 +313,16 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
     if (t.batchingFee < 0 || t.collateralErg - t.batchingFee < MinBox)
       fail("the offer's batching fee leaves its bond under 0.001 ERG, so it cannot be closed")
 
-    val bond = UTXO(protocol.bondContract(repayToken), t.collateralErg, Token(offer.asset, 1L) +: offer.collateralTokens,
-      Seq(bytesValue(offer.box.id.getBytes), bytesValue(hashOf(myTree)), longsValue(t.repayment, t.batchingFee),
-        intValue(t.maturity), bytesValue(protocol.vault.hashedPropBytes), bytesValue(t.liqScriptHash)))
+    val lender = treeFor(t.lenderHash, offer.box, treesReg(offer.box, 4)).getOrElse(fail(
+      "cannot find the lender's ErgoTree: the offer carries no hint, and no box in the transaction that " +
+        "created it hashes to CONST_LENDER_HASH"))
+    val asset = offer.asset
+
+    val unit = UTXO(Contract(lender), MinBox, Seq(Token(asset, 1L)),
+      Seq(bytesValue(t.assetName), bytesValue(t.assetDescription), utf8Value("0")))
+    val bond = UTXO(protocol.bondContract(repayToken), t.collateralErg, offer.collateralTokens,
+      Seq(bytesValue(asset.getBytes), bytesValue(hashOf(myTree)), longsValue(t.repayment, t.batchingFee),
+        intValue(t.maturity), bytesValue(t.liqScriptHash)))
     val principal = UTXO(Contract(myTree), offer.principalErg, offer.principalTokens)
 
     val notes = Seq(
@@ -340,20 +330,19 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
       s"repay: ${Fmt.amount(t.repayment, repayToken)} before height ${t.maturity} (${t.maturity - height} blocks)",
       s"collateral: ${Fmt.contents(t.collateralErg, offer.collateralTokens)}; if not repaid, it goes to the " +
         s"lender less at most ${Fmt.erg(t.batchingFee)} to a liquidator; liquidation: ${liq.name}",
-      "Output 0 is your bond. Repay it with `repay <its box id>`.")
-    prepare(s"Close offer $offerId", plan(Seq(offer.box), Seq(bond, principal)), notes)
+      s"The lender's bond asset will be $asset, named '${offer.name}'.",
+      "Output 1 is your bond. Repay it with `repay <its box id>`.")
+    prepare(s"Close offer $offerId", plan(Seq(offer.box), Seq(unit, bond, principal), minted = Some(asset)), notes)
   }
 
   /**
-   * Tx 5: the repayment to the vault, tagged with the bond and its asset, and the collateral back to the
+   * Tx 4: the repayment to the vault, tagged with the bond and its asset, and the collateral back to the
    * borrower. Anyone may repay; the borrower's tree comes from this wallet or the bond's history.
    */
   def repay(bondId: String): Prepared = {
     val bond = protocol.asBond(unspent(bondId)).getOrElse(fail(s"$bondId is not a SigmaFi bond"))
     if (height + 1 >= bond.maturity) fail(s"the bond matured at height ${bond.maturity}: repayment is closed")
-    if (!bond.lenderHash.sameElements(protocol.vault.hashedPropBytes))
-      fail("the bond does not pay the BondAssetVault, so this client cannot build its repayment")
-    val originHints = node.boxById(Base16.encode(bond.origin)).flatMap(j => Try(NodeJson.box(j)).toOption)
+    val originHints = node.boxById(bond.asset.toString).flatMap(j => Try(NodeJson.box(j)).toOption)
       .toSeq.flatMap(treesReg(_, 4))
     val borrower = treeFor(bond.borrowerHash, bond.box, originHints)
       .getOrElse(fail("cannot find the borrower's ErgoTree, which the collateral must return to"))
@@ -370,53 +359,19 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
       s"collateral back: ${Fmt.contents(bond.box.value, bond.collateral)}" +
         (if (sameTree(borrower, myTree) || isWalletHash(hashOf(borrower))) " to this wallet" else s" to ${addressOf(borrower)}"),
       s"maturity: height ${bond.maturity} (${bond.maturity - height} blocks left)")
-    prepare(s"Repay bond $bondId", plan(Seq(bond.box), Seq(settlement, collateral), burn = Seq(Token(bond.asset, 1L))), notes)
+    prepare(s"Repay bond $bondId", plan(Seq(bond.box), Seq(settlement, collateral)), notes)
   }
 
   // ═══ EXECUTOR ═════════════════════════════════════════════════════════════
 
   /**
-   * Tx 2A: mint a generator's bond asset into its offer. The generator is INPUTS(0); the lender's unit goes
-   * to OUTPUTS(0) and the offer to OUTPUTS(1). What the executor fee leaves after the miner fee is this
-   * wallet's change.
-   */
-  def mint(generatorId: String): Prepared = {
-    val gen = protocol.asGenerator(unspent(generatorId)).getOrElse(fail(s"$generatorId is not a bond asset generator"))
-    val name = gen.name.getOrElse(fail("the generator has no token name in R7, so it cannot mint; only a refund remains"))
-    val description = gen.description.getOrElse(fail("the generator has no token description in R8, so it cannot mint"))
-    val offerTree = gen.hints.find(t => hashOf(t).sameElements(gen.offerHash)).getOrElse(fail(
-      "the generator does not carry its offer's ErgoTree in R9, so only its lender knows the offer"))
-    val offerTerms = protocol.offerTermsOf(offerTree)
-      .getOrElse(fail("the generator's R4 names a contract that is not a SigmaFi offer"))
-    val lender = treeFor(gen.lenderHash, gen.box, gen.hints)
-      .getOrElse(fail("cannot find the lender's ErgoTree, which the lender's unit must go to"))
-    val offerValue = gen.box.value - MinBox - gen.executorFee
-    if (offerValue < MinBox) fail("the generator holds too little ERG to fund its offer")
-    val asset = gen.box.id
-
-    val unit = UTXO(Contract(lender), MinBox, Seq(Token(asset, 1L)),
-      Seq(bytesValue(name), bytesValue(description), utf8Value("0")))
-    val offer = UTXO(Contract(offerTree), offerValue, Token(asset, 1L) +: gen.box.tokens)
-
-    val notes = Seq(
-      s"offer: ${Fmt.principal(offerValue, gen.box.tokens)} for collateral of " +
-        s"${Fmt.contents(offerTerms.collateralErg, offerTerms.collateralTokens.map { case (id, n) => Token(new ErgoId(id), n) })}, " +
-        s"maturing at height ${offerTerms.maturity}",
-      s"executor fee: ${Fmt.erg(gen.executorFee)}, of which this wallet keeps what the miner fee leaves",
-      s"Output 1 is the offer; its bond asset is $asset.")
-    prepare(s"Mint offer from generator $generatorId", plan(Seq(gen.box), Seq(unit, offer), minted = Some(asset)), notes)
-  }
-
-  /**
-   * Tx 6: liquidate bonds in one batch. Bond i is INPUTS(i), runs its liquidation script from context var 0,
+   * Tx 5: liquidate bonds in one batch. Bond i is INPUTS(i), runs its liquidation script from context var 0,
    * and settles into the vault at OUTPUTS(i). This wallet keeps the batching fees, less the miner fee.
    */
   def liquidate(bondIds: Seq[String]): Prepared = {
     if (bondIds.isEmpty) fail("name at least one bond box id")
     val bonds = bondIds.distinct.map(id => protocol.asBond(unspent(id)).getOrElse(fail(s"$id is not a SigmaFi bond")))
     val scripts = bonds.map { b =>
-      if (!b.lenderHash.sameElements(protocol.vault.hashedPropBytes))
-        fail(s"bond ${b.box.id} does not pay the BondAssetVault, so this client cannot settle it")
       val liq = protocol.liquidationOf(b.liqScriptHash)
         .getOrElse(fail(s"bond ${b.box.id} names a liquidation script this client does not know"))
       if (liq.name == "MaturityLiquidation" && height + 1 < b.maturity)
@@ -429,7 +384,7 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
 
     val notes = Seq(s"${bonds.size} bond(s); batching fees total ${Fmt.erg(bonds.map(_.batchingFee).sum)}, " +
       "less the miner fee, to this wallet")
-    prepare(s"Liquidate ${bonds.size} bond(s)", plan(inputs, outputs, burn = bonds.map(b => Token(b.asset, 1L))), notes)
+    prepare(s"Liquidate ${bonds.size} bond(s)", plan(inputs, outputs), notes)
   }
 
   // ═══ SIGN AND SUBMIT ══════════════════════════════════════════════════════

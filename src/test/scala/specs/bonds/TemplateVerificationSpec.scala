@@ -8,7 +8,7 @@ import org.scalatest.propspec.AnyPropSpec
 import scorex.crypto.hash.Blake2b256
 import sigma.Colls
 import sigma.ast.SCollection.SByteArray
-import sigma.ast.{Constant, ErgoTree, SLong, SType}
+import sigma.ast.{Constant, ErgoTree, SInt, SLong, SType}
 import work.lithos.mutations.{Contract, Token, UTXO}
 
 /**
@@ -47,45 +47,52 @@ class TemplateVerificationSpec extends AnyPropSpec with BondSpecBase {
     }
   }
 
-  property("every template pins the vault hash as a fixed constant, not a term") {
+  property("no template carries the vault hash: the bond compiles it in, and CONST_BOND_HASH commits to it") {
     withCtx { ctx =>
       val vault = Colls.fromArray(ScriptGenerator.vaultHash(ctx))
       Seq(offerTemplate(ctx), orderTemplate(ctx), onCloseTemplate(ctx)).foreach { t =>
-        val i = indexOf(t, vault, SByteArray)
-        t.positions.values.toSeq should not contain i
+        t.tree.constants.map(_.value) should not contain vault
       }
     }
   }
 
-  property("an offer paying another vault has the same template hash, and does not match") {
+  property("an offer minting 2 units has the same template hash, really mints 2, and does not match") {
     withCtx { ctx =>
       val t = offerTemplate(ctx)
-      val offer = t.withTerms(offerTerms(ctx, ErgBond))
-      val forged = forge(offer, indexOf(t, Colls.fromArray(ScriptGenerator.vaultHash(ctx)), SByteArray),
-        Colls.fromArray(hashOf(otherTree(ctx))), SByteArray)
-      sameTemplate(forged, offer) shouldBe true
-      t.matches(forged) shouldBe false
-    }
-  }
-
-  property("an order minting 3 units has the same template hash, really mints 3, and does not match") {
-    withCtx { ctx =>
-      val t = orderTemplate(ctx)
-      val genuine = t.withTerms(orderTerms(ctx, ErgBond))
-      val forged = forge(genuine, indexOf(t, 2L, SLong), 3L, SLong)
+      val c = closeScenario(ctx, ErgBond)
+      val genuine = t.withTerms(c.terms)
+      val forged = forge(genuine, indexOf(t, 1L, SLong), 2L, SLong)
       sameTemplate(forged, genuine) shouldBe true
       t.matches(forged) shouldBe false
 
-      // On chain the forgery behaves as written: a fill with a third unit goes through
+      // On chain the forgery behaves as written: the borrower keeps a second claim on the bond
+      val forgedIn = inputAt(c.offer.setContract(Contract(forged)), ctx, 0)
+      val asset = forgedIn.id
+      val second = UTXO(borrowerTree(ctx), minBox, Seq(Token(asset, 1L)))
+      accepts(c.prover, closeTx(c)(
+        inputs = Seq(forgedIn, c.borrowerIn),
+        outputs = Seq(c.unitOut.setTokens(Token(asset, 1L)), bondUTXO(ctx, ErgBond, asset = asset),
+          c.principalOut, second)))
+    }
+  }
+
+  property("an order minting 2 units has the same template hash, really mints 2, and does not match") {
+    withCtx { ctx =>
+      val t = orderTemplate(ctx)
+      val genuine = t.withTerms(orderTerms(ctx, ErgBond))
+      val forged = forge(genuine, indexOf(t, 1L, SLong), 2L, SLong)
+      sameTemplate(forged, genuine) shouldBe true
+      t.matches(forged) shouldBe false
+
+      // On chain the forgery behaves as written: a fill with a second unit goes through
       val f = fillScenario(ctx, ErgBond)
       val forgedIn = inputAt(f.order.setContract(Contract(forged)), ctx, 0)
       val asset = forgedIn.id
-      val third = UTXO(lenderTree(ctx), minBox, Seq(Token(asset, 1L)))
+      val second = UTXO(lenderTree(ctx), minBox, Seq(Token(asset, 1L)))
       accepts(f.prover, fillTx(f)(
         inputs = Seq(forgedIn, f.lenderIn),
-        outputs = Seq(f.unitOut.setTokens(Token(asset, 1L)),
-          f.bondOut.setTokens(Token(asset, 1L) +: defaultCollateral: _*).withRegNum(4, bytesValue(asset.getBytes)),
-          f.principalOut, third)))
+        outputs = Seq(f.unitOut.setTokens(Token(asset, 1L)), f.bondOut.withRegNum(4, bytesValue(asset.getBytes)),
+          f.principalOut, second)))
     }
   }
 
@@ -100,14 +107,29 @@ class TemplateVerificationSpec extends AnyPropSpec with BondSpecBase {
     }
   }
 
-  property("the generator and bonds have no terms: compare their whole trees, not templates") {
+  property("bonds and the vault have no terms: compare their whole trees, not templates") {
     withCtx { ctx =>
-      // each has one address; a forged literal changes the tree bytes, so an address check is enough
-      Seq(generator(ctx), bondContract(ctx, ErgBond), vault(ctx)).foreach { c =>
-        val i = c.ergoTree.constants.indexWhere(_.tpe == SLong)
-        i should be >= 0
-        forge(c.ergoTree, i, 123456789L, SLong).bytes.toSeq should not equal c.ergoTree.bytes.toSeq
+      // each has one address (a token bond, one per token); any forged constant changes the tree bytes
+      Seq(bondContract(ctx, ErgBond), bondContract(ctx, TokenBond), vault(ctx)).foreach { c =>
+        c.ergoTree.constants.indices.foreach { i =>
+          val forged = c.ergoTree.constants(i).tpe match {
+            case SLong => Some(forge(c.ergoTree, i, 123456789L, SLong))
+            case SInt => Some(forge(c.ergoTree, i, 123456789, SInt))
+            case SByteArray => Some(forge(c.ergoTree, i, Colls.fromArray(Array.fill(32)(7.toByte)), SByteArray))
+            case _ => None
+          }
+          forged.foreach { f =>
+            sameTemplate(f, c.ergoTree) shouldBe true
+            f.bytes.toSeq should not equal c.ergoTree.bytes.toSeq
+          }
+        }
       }
+      // in particular, a bond paying another vault is another address
+      val vaultHash = Colls.fromArray(ScriptGenerator.vaultHash(ctx))
+      val bond = bondContract(ctx, ErgBond).ergoTree
+      val at = bond.constants.indexWhere(_.value == vaultHash)
+      at should be >= 0
+      forge(bond, at, Colls.fromArray(hashOf(otherTree(ctx))), SByteArray).bytes.toSeq should not equal bond.bytes.toSeq
     }
   }
 }

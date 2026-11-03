@@ -57,7 +57,7 @@ class BondAssetVaultSpec extends AnyPropSpec with BondSpecBase {
         accepts(holder, build(ctx, Seq(settled, unit), Seq(payout), holder.getAddress,
           burn = Seq(Token(bondAsset, 1L))))
 
-        // the repayer did not get to keep the singleton, so it holds nothing that opens the vault
+        // the bond holds no unit of the asset, so neither the repayer nor anyone else has one to open it with
         val stranger = other(ctx)
         val noUnit = funding(ctx, stranger, 1, Parameters.OneErg)
         rejectsAtSigning(stranger, build(ctx, Seq(settled, noUnit),

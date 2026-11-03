@@ -37,14 +37,14 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
-    property(s"$kind repay: rejects paying the lender one unit short") {
+    property(s"$kind repay: rejects paying the vault one unit short") {
       withCtx { ctx =>
         val r = repayScenario(ctx, kind)
-        rejectsAtSigning(r.prover, repayTx(r)(settleOut = repaymentBox(kind, r.lenderScript, r.bondIn.id, short = 1L)))
+        rejectsAtSigning(r.prover, repayTx(r)(settleOut = repaymentBox(kind, r.vaultScript, r.bondIn.id, short = 1L)))
       }
     }
 
-    property(s"$kind repay: rejects a repayment to a script other than the lender (toLender)") {
+    property(s"$kind repay: rejects a repayment to a script other than the vault (toVault)") {
       withCtx { ctx =>
         val r = repayScenario(ctx, kind)
         rejectsAtSigning(r.prover, repayTx(r)(settleOut = r.settleOut.setContract(otherTree(ctx))))
@@ -54,7 +54,8 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
     property(s"$kind repay: rejects a repayment tagged for another bond (settlementTagged)") {
       withCtx { ctx =>
         val r = repayScenario(ctx, kind)
-        rejectsAtSigning(r.prover, repayTx(r)(settleOut = r.settleOut.setRegs(bytesValue(originOrderId))))
+        rejectsAtSigning(r.prover, repayTx(r)(settleOut = r.settleOut.setRegs(bytesValue(originOrderId),
+          bytesValue(bondAsset.getBytes))))
       }
     }
 
@@ -86,11 +87,14 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
-    property(s"$kind repay: rejects a bond asset that survives the bond (assetBurned)") {
+    property(s"$kind repay: every token the bond holds is collateral, the first one included") {
       withCtx { ctx =>
-        // the draft ERG bond accepted this: the payer kept the singleton and could then claim the vault
-        val r = repayScenario(ctx, kind, payer = other(ctx))
-        rejectsAtSigning(r.prover, repayTx(r)(burn = Seq.empty[Token]))
+        // the bond holds no singleton any more, so nothing at tokens(0) may be skipped on the way back
+        val two = Seq(Token(collateralToken, 100L), Token(secondCollateral, 5L))
+        val r = repayScenario(ctx, kind, collateral = two)
+        accepts(r.prover, repayTx(r)())
+        rejectsAtSigning(r.prover, repayTx(r)(returnOut = r.returnOut.setTokens(Token(secondCollateral, 5L)),
+          burn = Seq(Token(collateralToken, 100L))))
       }
     }
 
@@ -121,7 +125,7 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
-    property(s"$kind liquidate: rejects a script R9 does not list, even one that passes") {
+    property(s"$kind liquidate: rejects a script R8 does not list, even one that passes") {
       withCtx { ctx =>
         val l = liquidateScenario(ctx, kind, ran = alwaysTrue(ctx))
         rejectsAtSigning(l.prover, liquidateTx(l)(height = l.maturity - 1))
@@ -150,7 +154,7 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
-    property(s"$kind liquidate: rejects collateral sent to a script other than the lender") {
+    property(s"$kind liquidate: rejects collateral sent to a script other than the vault") {
       withCtx { ctx =>
         val l = liquidateScenario(ctx, kind)
         rejectsAtSigning(l.prover, liquidateTx(l)(settleOut = l.settleOut.setContract(otherTree(ctx))))
@@ -160,7 +164,8 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
     property(s"$kind liquidate: rejects a settlement tagged for another bond") {
       withCtx { ctx =>
         val l = liquidateScenario(ctx, kind)
-        rejectsAtSigning(l.prover, liquidateTx(l)(settleOut = l.settleOut.setRegs(bytesValue(originOrderId))))
+        rejectsAtSigning(l.prover, liquidateTx(l)(settleOut = l.settleOut.setRegs(bytesValue(originOrderId),
+          bytesValue(bondAsset.getBytes))))
       }
     }
 
@@ -168,13 +173,6 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
       withCtx { ctx =>
         val l = liquidateScenario(ctx, kind)
         rejectsAtSigning(l.prover, liquidateTx(l)(settleOut = l.settleOut.setTokens(Token(collateralToken, 99L))))
-      }
-    }
-
-    property(s"$kind liquidate: rejects a bond asset that survives the bond (assetBurned)") {
-      withCtx { ctx =>
-        val l = liquidateScenario(ctx, kind)
-        rejectsAtSigning(l.prover, liquidateTx(l)(burn = Seq.empty[Token]))
       }
     }
 
@@ -190,7 +188,7 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
       withCtx { ctx =>
         // the vault opens for whatever R5 names, so this would hand the repayment to otherBondAsset's holder
         val r = repayScenario(ctx, kind, payer = other(ctx))
-        rejectsAtSigning(r.prover, repayTx(r)(settleOut = repaymentBox(kind, r.lenderScript, r.bondIn.id, otherBondAsset)))
+        rejectsAtSigning(r.prover, repayTx(r)(settleOut = repaymentBox(kind, r.vaultScript, r.bondIn.id, otherBondAsset)))
       }
     }
 
@@ -198,7 +196,7 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
       withCtx { ctx =>
         val l = liquidateScenario(ctx, kind)
         rejectsAtSigning(l.prover, liquidateTx(l)(settleOut =
-          settlement(l.lenderScript, l.settleOut.value, l.bondIn.id, otherBondAsset, defaultCollateral)))
+          settlement(l.vaultScript, l.settleOut.value, l.bondIn.id, otherBondAsset, defaultCollateral)))
       }
     }
 
@@ -215,8 +213,7 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
           settlement(vault(ctx), collateralErg - batchingFee, in.id, asset, defaultCollateral)
         }
         val ex = executor(ctx)
-        val signed = accepts(ex, buildAt(ctx, maturity, ins, outs, ex.getAddress,
-          burn = Seq(Token(bondAsset, 1L), Token(otherBondAsset, 1L))))
+        val signed = accepts(ex, buildAt(ctx, maturity, ins, outs, ex.getAddress))
         signed.getOutputsToSpend.asScala.filter(_.getErgoTree == contractOf(ex).ergoTree)
           .map(_.getValue.longValue).sum shouldBe 2 * batchingFee - Parameters.MinFee
       }
@@ -233,32 +230,25 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
           tagged(borrowerTree(ctx), collateralErg, a.id, defaultCollateral),
           repaymentBox(kind, vault(ctx), b.id, otherBondAsset),
           tagged(borrowerTree(ctx), collateralErg, b.id, Seq(Token(secondCollateral, 5L))))
-        accepts(payer, build(ctx, Seq(a, filler, b), outs, payer.getAddress,
-          burn = Seq(Token(bondAsset, 1L), Token(otherBondAsset, 1L))))
+        accepts(payer, build(ctx, Seq(a, filler, b), outs, payer.getAddress))
       }
     }
 
-    property(s"$kind double satisfaction: one output cannot repay bond B and return bond A's collateral") {
+    property(s"$kind double satisfaction: one vault box cannot return bond A's collateral and settle bond B") {
       withCtx { ctx =>
-        // Alice borrowed in bond A and lent in bond B. The draft ERG bond accepted this exact shape:
-        // OUTPUTS(1) was A's collateral return and B's repayment at once, so Alice was paid once, not twice.
-        val alice = borrowerTree(ctx)
-        val bob = otherTree(ctx)
+        // Bond A names the vault as its borrower, so its collateral return and B's liquidation are both
+        // vault boxes holding the same collateral at OUTPUTS(1). Only R4 = SELF.id on both tells them apart:
+        // without it, one box would satisfy both bonds and the executor would keep B's whole collateral.
         val payer = executor(ctx)
-        val aCollateral = kind match {
-          case ErgBond => defaultCollateral
-          case TokenBond => Seq(Token(stableToken, repaymentTokens)) // so one box can look like both
-        }
-        val a = inputAt(bondUTXO(ctx, kind, asset = bondAsset, collateral = aCollateral), ctx, 0)
-        val b = inputAt(bondUTXO(ctx, kind, asset = otherBondAsset, borrowerScript = bob, lenderScript = alice,
-          collateral = Seq(Token(secondCollateral, 5L))), ctx, 1)
+        val maturity = maturityOf(ctx)
+        val a = inputAt(bondUTXO(ctx, kind, asset = bondAsset, borrowerScript = vault(ctx), maturity = maturity), ctx, 0)
+        // B matured a block before A, so at maturity - 1 A is still repayable and B already liquidatable
+        val b = inputAt(bondUTXO(ctx, kind, asset = otherBondAsset, fee = 0L, maturity = maturity - 1), ctx, 1)
+          .withCtxVar(0.toByte, liqVar(matured(ctx)))
         val fund = funding(ctx, payer, 2, slack, repaymentFunds(kind))
-        val outs = Seq(
-          repaymentBox(kind, vault(ctx), a.id),
-          settlement(alice, collateralErg, b.id, otherBondAsset, aCollateral),
-          tagged(bob, collateralErg, b.id, Seq(Token(secondCollateral, 5L))))
-        rejectsAtSigning(payer, build(ctx, Seq(a, b, fund), outs, payer.getAddress,
-          burn = Seq(Token(bondAsset, 1L), Token(otherBondAsset, 1L))))
+        val shared = settlement(vault(ctx), collateralErg, a.id, otherBondAsset, defaultCollateral)
+        rejectsAtSigning(payer, buildAt(ctx, maturity - 1, Seq(a, b, fund),
+          Seq(repaymentBox(kind, vault(ctx), a.id), shared), payer.getAddress))
       }
     }
   }
@@ -268,7 +258,7 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
   property("TokenBond repay: rejects repayment in a token other than CONST_TOKEN_ID") {
     withCtx { ctx =>
       val r = repayScenario(ctx, TokenBond)
-      val wrong = UTXO(r.lenderScript, minBox, Seq(Token(collateralToken, repaymentTokens)), r.settleOut.registers)
+      val wrong = UTXO(r.vaultScript, minBox, Seq(Token(collateralToken, repaymentTokens)), r.settleOut.registers)
       rejectsAtSigning(r.prover, repayTx(r)(settleOut = wrong,
         inputs = Seq(r.bondIn, funding(ctx, r.prover, 1, slack, Seq(Token(collateralToken, 1000L))))))
     }

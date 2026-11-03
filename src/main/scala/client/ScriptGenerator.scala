@@ -40,20 +40,28 @@ object ScriptGenerator {
     )
   }
 
-  // Zero-coupon bonds with liquidation and a bond asset
+  /**
+   * Zero-coupon bonds with liquidation, paying the vault. Every bond compiles in the vault's hash, so a bond
+   * paying anywhere else is a different tree: an ERG bond has one address, and a token bond one per token.
+   */
   def mkZcBondContract(ctx: BlockchainContext, optTokenId: Option[String]): ErgoContract = {
+    val vault = Colls.fromArray(vaultHash(ctx))
     optTokenId match {
       case Some(id) =>
         val script = mkScript(ZC_BOND_PREFIX + TOKEN + BOND_SUFFIX)
         val constants = ConstantsBuilder
           .create()
           .item("CONST_TOKEN_ID", idFromStr(id))
+          .item("CONST_VAULT_HASH", vault)
           .build()
 
         ctx.compileContract(constants, script)
       case None =>
         val script = mkScript(ZC_BOND_PREFIX + ERG + BOND_SUFFIX)
-        val constants = ConstantsBuilder.empty()
+        val constants = ConstantsBuilder
+          .create()
+          .item("CONST_VAULT_HASH", vault)
+          .build()
 
         ctx.compileContract(constants, script)
     }
@@ -65,10 +73,8 @@ object ScriptGenerator {
     ctx.compileContract(ConstantsBuilder.empty(), script)
   }
 
-  def mkBondAssetGenerator(ctx: BlockchainContext): ErgoContract = {
-    val script = mkScript(LENDER_SCRIPTS + "BondNFT_Generator")
-    ctx.compileContract(ConstantsBuilder.empty(), script)
-  }
+  /** blake2b256 of BondAssetVault, which every bond compiles in as CONST_VAULT_HASH. */
+  def vaultHash(ctx: BlockchainContext): Array[Byte] = Blake2b256.hash(mkBondAssetVault(ctx).getErgoTree.bytes)
 
   /**
    * A liquidation script. `bytes` is the serialized expression a bond runs with executeFromVar, which an
@@ -90,10 +96,13 @@ object ScriptGenerator {
   }
 
   /**
-   * A lender's terms, which become the constants of one zero-coupon offer. There is no lender term: the
-   * bond always pays the vault, and the lender is whoever holds the bond asset.
+   * A lender's terms, which become the constants of one zero-coupon offer. `lenderHash` receives the bond
+   * asset when the offer closes, under the EIP-4 name and description given here, and authorizes a cancel.
    */
-  case class OfferTerms(bondHash: Array[Byte],
+  case class OfferTerms(lenderHash: Array[Byte],
+                        assetName: Array[Byte],
+                        assetDescription: Array[Byte],
+                        bondHash: Array[Byte],
                         repayment: Long,
                         batchingFee: Long,
                         maturity: Int,
@@ -102,6 +111,9 @@ object ScriptGenerator {
                         collateralTokens: Seq[(Array[Byte], Long)]) extends ContractTerms {
 
     def constants: Seq[(String, Any)] = Seq(
+      "CONST_LENDER_HASH" -> Colls.fromArray(lenderHash),
+      "CONST_ASSET_NAME" -> Colls.fromArray(assetName),
+      "CONST_ASSET_DESCRIPTION" -> Colls.fromArray(assetDescription),
       "CONST_BOND_HASH" -> Colls.fromArray(bondHash),
       "CONST_REPAYMENT" -> repayment,
       "CONST_BATCHING_FEE" -> batchingFee,
@@ -188,6 +200,9 @@ object ScriptGenerator {
     liqScriptHash = Array.fill(32)(0x73.toByte))
 
   private val OfferSentinels = OfferTerms(
+    lenderHash = Array.fill(32)(0x52.toByte),
+    assetName = Array.fill(20)(0x55.toByte),
+    assetDescription = Array.fill(21)(0x56.toByte),
     bondHash = Array.fill(32)(0x51.toByte),
     repayment = 7777777771L,
     batchingFee = 7777777772L,
@@ -207,8 +222,8 @@ object ScriptGenerator {
 
     /**
      * Whether `candidate` is this template stamped with some terms. A template hash leaves out EVERY
-     * constant, so a tree can share it while changing a literal such as an order's mint amount, or the
-     * vault hash. Only the terms may differ, and only in value, never in type.
+     * constant, so a tree can share it while changing a literal such as an order's mint amount. Only the
+     * terms may differ, and only in value, never in type.
      */
     def matches(candidate: ErgoTree): Boolean = {
       val terms = positions.values.toSet
@@ -233,15 +248,8 @@ object ScriptGenerator {
     }
   }
 
-  /** blake2b256 of BondAssetVault, which every offer and order pins as its bonds' R8. */
-  def vaultHash(ctx: BlockchainContext): Array[Byte] = Blake2b256.hash(mkBondAssetVault(ctx).getErgoTree.bytes)
-
-  /** Compile-time values every template shares; they are not terms, and `matches` holds them fixed. */
-  private def fixedConstants(ctx: BlockchainContext): Seq[(String, Any)] =
-    Seq("CONST_VAULT_HASH" -> Colls.fromArray(vaultHash(ctx)))
-
   private def mkTemplate(ctx: BlockchainContext, name: String, sentinels: ContractTerms): ContractTemplate = {
-    val constants = (fixedConstants(ctx) ++ sentinels.constants).foldLeft(ConstantsBuilder.create()) {
+    val constants = sentinels.constants.foldLeft(ConstantsBuilder.create()) {
       case (b, (term, value)) => b.item(term, value)
     }.build()
     val tree = ctx.compileContract(constants, mkScript(name)).getErgoTree

@@ -23,20 +23,20 @@ sbt "runMain ksingh.sigmabonds.app.SigmaFiCli orders --node http://127.0.0.1:905
 sbt "runMain ksingh.sigmabonds.app.SigmaFiCli fill-order <order box id> --api-key <key> --wallet-pass <pass>"
 ```
 
-List commands (`orders`, `offers`, `generators`, `bonds`, `claims`) find and verify boxes. Actions take
-the box ids they print:
-- Lender: `create-offer`, `refund-generator`, `cancel-offer`, `fill-order`, `claim`
+List commands (`orders`, `offers`, `bonds`, `claims`) find and verify boxes. Actions take the box ids
+they print:
+- Lender: `create-offer`, `cancel-offer`, `fill-order`, `claim`
 - Borrower: `create-order`, `cancel-order`, `close-offer`, `repay`
-- Executor: `mint`, `liquidate`
+- Executor: `liquidate`
 
 Every action is a dry run unless you pass `--send`: it is built, signed by the node wallet, and checked
 by the node (`/transactions/check`), but never submitted. `--node`, `--api-key` and `--wallet-pass` can
 also come from `SIGMAFI_NODE`, `SIGMAFI_API_KEY` and `SIGMAFI_WALLET_PASS`. If the CLI unlocks the
 wallet, it locks it again when it is done.
 
-The CLI writes optional hint registers that no contract reads: an order's R4 and a generator's R9 hold
-the ErgoTrees their hashes commit to (see [SigmaBonds](./SigmaBonds.MD)). They let any lender fill an
-order, and any executor mint an offer, without asking the other party for those trees.
+The CLI writes optional hint registers that no contract reads: an order's R4 holds the borrower's
+ErgoTree, and an offer's R4 the lender's (see [SigmaBonds](./SigmaBonds.MD)). They let any lender fill an
+order, and any borrower close an offer, without asking the other party for those trees.
 
 ## Development
 - [TESTING.md](./TESTING.md): the offline contract specs, and how to write them.

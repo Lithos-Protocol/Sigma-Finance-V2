@@ -37,16 +37,14 @@ object SigmaFiCli {
       |Look around (no API key needed, except with --mine or for claims):
       |  info                               heights, protocol addresses and hashes, your wallet address
       |  orders [--mine]                    open borrower orders
-      |  offers [--mine]                    open lender offers, with their bond assets verified
-      |  generators [--mine]                lender offers waiting for an executor to mint them
-      |  bonds [--mine] [--liquidatable]    live bonds
+      |  offers [--mine]                    open lender offers
+      |  bonds [--mine] [--liquidatable]    live bonds, each checked against its bond asset's mint
       |  claims                             bond assets in your wallet whose bond has paid the vault
       |
-      |Lender:
+      |Lender (each bond mints you its bond asset: the name and description are its EIP-4 metadata):
       |  create-offer <loan terms> (--maturity <height> | --term <blocks>)
-      |               [--executor-fee <ERG>] [--name <text>] [--description <text>]
-      |  refund-generator <generator box id>   take back an offer that has not been minted yet
-      |  cancel-offer <offer box id>          burn your bond asset, take the principal back
+      |               [--name <text>] [--description <text>]
+      |  cancel-offer <offer box id>          take the principal back
       |  fill-order <order box id> [--name <text>] [--description <text>]
       |  claim <bond asset id>               collect a repaid or liquidated bond from the vault
       |
@@ -58,7 +56,6 @@ object SigmaFiCli {
       |  repay <bond box id>
       |
       |Executor:
-      |  mint <generator box id>                 mint an offer and keep the executor fee
       |  liquidate <bond box id> [<bond box id> ...]  liquidate matured bonds and keep their batching fees
       |
       |Loan terms:
@@ -73,10 +70,9 @@ object SigmaFiCli {
 
   private val DefaultNode = "http://127.0.0.1:9053"
   private val DefaultBatchingFee = "0.002"
-  private val DefaultExecutorFee = "0.002"
-  private val DefaultName = "SigmaFi Bond"
+  private val DefaultName = "SigmaFi V2 ZC Bond Asset"
   private val DefaultDescription =
-    "SigmaFi V2 zero-coupon bond asset. Verify it by its genesis box, never by its name."
+    "SigmaFi V2 zero-coupon bond asset"
 
   def main(args: Array[String]): Unit = {
     val code =
@@ -139,7 +135,6 @@ object SigmaFiCli {
       case "info" => info(app, node, a)
       case "orders" => listOrders(app, node, a.flag("mine"))
       case "offers" => listOffers(app, node, a.flag("mine"))
-      case "generators" => listGenerators(app, node, a.flag("mine"))
       case "bonds" => listBonds(app, node, a.flag("mine"), a.flag("liquidatable"))
       case "claims" => listClaims(app, node)
 
@@ -148,9 +143,7 @@ object SigmaFiCli {
           case FixedMaturity(h) => h
           case OnClose(_) => throw CliError("offers have a fixed maturity: use --maturity or --term")
         }
-        app.submit(app.createOffer(loan(a), maturity,
-          parseErg(a.opt("executor-fee").getOrElse(DefaultExecutorFee)), name, description))
-      case "refund-generator" => app.submit(app.refundGenerator(one("generator box id")))
+        app.submit(app.createOffer(loan(a), maturity, name, description))
       case "cancel-offer" => app.submit(app.cancelOffer(one("offer box id")))
       case "fill-order" => app.submit(app.fillOrder(one("order box id"), name, description))
       case "claim" => app.submit(app.claim(one("bond asset id")))
@@ -160,7 +153,6 @@ object SigmaFiCli {
       case "close-offer" => app.submit(app.closeOffer(one("offer box id")))
       case "repay" => app.submit(app.repay(one("bond box id")))
 
-      case "mint" => app.submit(app.mint(one("generator box id")))
       case "liquidate" => app.submit(app.liquidate(a.positional))
 
       case other => throw CliError(s"unknown command $other; run with --help for the list")
@@ -175,8 +167,7 @@ object SigmaFiCli {
     println(s"Network: $network; height ${app.height}")
     indexStatus(node).foreach(println)
     println(s"BondAssetVault:     ${p.vault.address(network)}")
-    println(s"  hash (bond R8):   ${p.vault.hashedPropBytesHex}")
-    println(s"BondNFT_Generator:  ${p.generator.address(network)}")
+    println(s"  hash (every bond's CONST_VAULT_HASH): ${p.vault.hashedPropBytesHex}")
     println(s"ZC_ERG_Bond:        ${p.ergBond.address(network)}")
     println(s"  hash:             ${p.ergBond.hashedPropBytesHex}")
     println(s"ZC_Token_Bond template hash:  ${Base16.encode(p.tokenBondTemplateHash)}")
@@ -213,39 +204,19 @@ object SigmaFiCli {
 
   private def listOffers(app: SigmaFiApp, node: NodeApi, mine: Boolean): Unit = {
     indexStatus(node).foreach(System.err.println)
-    val offers = app.offers().filter(o => !mine || app.walletHolds(o.asset))
+    val offers = app.offers().filter(o => !mine || app.isWalletHash(o.terms.lenderHash))
     if (offers.isEmpty) println("No open offers.")
     offers.foreach { o =>
       val t = o.terms
       val bond = app.protocol.pairedBond(t.bondHash, o.principalTokens)
-      val verified = app.verifyOffer(o)
-      println(s"Offer ${o.box.id}  bond asset ${o.asset}  " + verified.fold(r => s"NOT VERIFIED: $r", _ => "verified"))
+      println(s"Offer ${o.box.id}  bond asset '${o.name}'")
       println(s"  lend:        ${Fmt.principal(o.principalErg, o.principalTokens)}; repay " +
         bond.fold("?")(tk => Fmt.amount(t.repayment, tk)))
       println(s"  maturity:    height ${t.maturity} (${t.maturity - app.height} blocks from now)")
       println(s"  collateral:  ${Fmt.contents(t.collateralErg, o.collateralTokens)}")
       println(s"  batching fee ${Fmt.erg(t.batchingFee)}; liquidation ${liqName(app, t.liqScriptHash)}")
       if (bond.isEmpty) println("  WARNING: its bond contract does not match its principal; close-offer refuses it")
-      if (mine) println("  (you hold its bond asset)")
-    }
-  }
-
-  private def listGenerators(app: SigmaFiApp, node: NodeApi, mine: Boolean): Unit = {
-    indexStatus(node).foreach(System.err.println)
-    val gens = app.generators().filter(g => !mine || app.isWalletHash(g.lenderHash))
-    if (gens.isEmpty) println("No generators waiting to mint.")
-    gens.foreach { g =>
-      val name = g.name.map(n => new String(n, "UTF-8")).getOrElse("(none: cannot mint)")
-      println(s"Generator ${g.box.id}  bond asset name '$name'")
-      println(s"  principal:    ${Fmt.contents(g.box.value, g.box.tokens)} (with the lender unit's box and the fee)")
-      println(s"  executor fee: ${Fmt.erg(g.executorFee)}")
-      app.generatorTrees(g).flatMap { case (offer, _) => app.protocol.offerTermsOf(offer) } match {
-        case Some(t) =>
-          println(s"  offer:        collateral ${Fmt.contents(t.collateralErg, t.collateralTokens.map { case (id, n) =>
-            Token(new ErgoId(id), n)
-          })}, maturing at height ${t.maturity}")
-        case None => println("  offer:        unknown: no valid R9 hint, so only its lender can mint it")
-      }
+      if (app.isOwnHash(t.lenderHash)) println("  (your offer)")
     }
   }
 
@@ -257,7 +228,8 @@ object SigmaFiCli {
       .filter(b => !mine || app.isWalletHash(b.borrowerHash) || app.walletHolds(b.asset))
     if (bonds.isEmpty) println("No bonds.")
     bonds.foreach { b =>
-      println(s"Bond ${b.box.id}  bond asset ${b.asset}")
+      println(s"Bond ${b.box.id}  bond asset ${b.asset}  " +
+        app.verifyBond(b).fold(r => s"NOT VERIFIED: $r", _ => "verified"))
       println(s"  repay:       ${Fmt.amount(b.repayment, b.repayToken)} " + (
         if (matured(b)) s"(matured at ${b.maturity}: liquidatable by ${liqName(app, b.liqScriptHash)})"
         else s"before height ${b.maturity} (${b.maturity - app.height} blocks left)"))
@@ -351,7 +323,7 @@ object Args {
   val Flags: Set[String] = Set("send", "mine", "liquidatable", "help")
   val Options: Set[String] = Set("node", "api-key", "wallet-pass", "address", "fee",
     "principal", "principal-token", "repayment", "collateral-erg", "collateral-token", "batching-fee",
-    "liquidation", "maturity", "term", "duration", "executor-fee", "name", "description")
+    "liquidation", "maturity", "term", "duration", "name", "description")
 
   def parse(args: Seq[String]): Args = {
     val positional = Vector.newBuilder[String]
