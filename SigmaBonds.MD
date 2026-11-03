@@ -103,6 +103,9 @@ plus the executor fee. For a token loan, the principal tokens go in the same box
 - R6: `Long` executor fee
 - R7: `Coll[Byte]` the bond asset's name (UTF-8)
 - R8: `Coll[Byte]` the bond asset's description (UTF-8)
+- R9 (optional, never read): `Coll[Coll[Byte]]` the ErgoTrees R4 and R5 commit to: the offer's and the
+  lender's. R4 and R5 hold only hashes, so without this hint only the lender knows the offer to mint.
+  Executors must check each tree against its hash, and the offer with `ContractTemplate.matches`.
 
 The generator may be refunded at any time before it mints, in a transaction that also spends a box
 belonging to the lender's wallet.
@@ -140,6 +143,10 @@ The box's whole contents become the bond's collateral. The terms are constants:
   receives. An ERG loan has no tokens; a token loan pays one token and a minimal amount of ERG.
 - `CONST_REPAYMENT`, `CONST_BATCHING_FEE`, `CONST_LIQ_SCRIPT_HASH`: copied to the bond
 - `CONST_MATURITY` (fixed height), or `CONST_DURATION` (on-close): see below
+
+The order may carry R4 (optional, never read): `Coll[Coll[Byte]]` holding the borrower's ErgoTree, the
+preimage of `CONST_BORROWER_HASH`, which a lender needs to pay the principal. Without it, a lender looks
+for that tree among the boxes of the transaction that created the order.
 
 ### Tx 2B: Fill an Order
 A lender pays the principal and creates the bond. The order is `INPUTS(0)`, so the fill mints the bond
