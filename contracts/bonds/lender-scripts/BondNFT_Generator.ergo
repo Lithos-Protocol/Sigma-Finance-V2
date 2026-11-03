@@ -1,0 +1,104 @@
+{
+    // Bond Asset generator for verified mint
+    // Mints the bond asset with a supply of exactly 2 and fixes where both units go: one to the lender
+    // (the circulating claim on the bond), one into the order, where it becomes the bond's singleton
+    // once the order is matched. The token id is this box's id, so anyone can verify a bond asset by
+    // looking up the spent box with that id and checking that it ran this contract.
+    //
+    // REGISTERS
+    // R4: Coll[Byte] - orderHash: blake2b256 of the ErgoTree of the order the principal goes to.
+    //                  On register so generator contract can stay constant.
+    // R5: Coll[Byte] - lenderHash: blake2b256 of the ErgoTree that receives the circulating bond asset.
+    //                  Also authorizes the refund.
+    // R6: Long       - executorFee: the most nanoERG the executor of the mint may keep. The miner fee
+    //                  comes out of it, so an executor needs no capital of its own.
+    // R7: Coll[Byte] - tokenName: EIP-4 name of the bond asset, UTF-8. Read on the mint path only.
+    // R8: Coll[Byte] - tokenDescription: EIP-4 description of the bond asset, UTF-8. Read on the mint path only.
+    //
+    // PATHS
+    // Mint (SELF at INPUTS(0)):
+    //   OUTPUTS(0) lender: (asset, 1) at tokens(0), script hashes to lenderHash, value >= 0.001 ERG,
+    //                      R4 = tokenName, R5 = tokenDescription, R6 = "0" (decimals), nothing from R7 on
+    //   OUTPUTS(1) order:  (asset, 1) at tokens(0), then SELF.tokens unchanged, script hashes to
+    //                      orderHash, no registers, value >= SELF.value - 0.001 ERG - executorFee
+    // Refund: nothing is minted, and an input guarded by lenderHash is spent alongside.
+    //
+    // EIP-4
+    // Indexers take a new token's name, description and decimals from the FIRST output carrying it,
+    // here OUTPUTS(0), and only add the amounts of later ones. So the lender's unit is the issuing box,
+    // and its R4-R6 are pinned to the lender's own registers. Decimals are always "0": one indivisible
+    // unit circulates. Refusing R7 also refuses R8 and R9, so an executor cannot give the asset an
+    // EIP-4 asset type, such as an NFT image link.
+    //
+    // ASSUMPTIONS
+    // - Only INPUTS(0) can mint, so one transaction mints one bond asset. Mints cannot be batched; the
+    //   executor fee pays for one transaction each.
+    // - The executor builds the order output, so every term of the order must be fixed by orderHash.
+    //   That is why the order output may not carry registers: its terms have to be compiled into the
+    //   order's ErgoTree. An order contract that reads terms from registers needs each one pinned here,
+    //   or the executor picks them.
+    // - The name and description are the lender's to choose and are not checked. A wallet name is not
+    //   proof of anything: verify a bond asset by the contract its genesis box ran, never by its name.
+    // - executorFee is the lender's own term and is not bounded. A negative fee makes the mint
+    //   impossible and leaves only the refund.
+    // - The refund authenticates the lender by co-spend, as a P2PK lender's box needs their signature.
+    //   It does not constrain outputs, so a lenderHash anyone can spend makes the refund anyone's.
+
+    // Helper Methods
+    def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
+        OUTPUTS.fold(0L, {
+            (a: Long, b: Box) =>
+                val totalTokens = b.tokens.fold(0L, {
+                  (z: Long, t: (Coll[Byte], Long)) => if(t._1 == tokenId) z + t._2 else z
+                })
+                a + totalTokens
+        })
+    }
+
+    val orderHash   = SELF.R4[Coll[Byte]].get
+    val lenderHash  = SELF.R5[Coll[Byte]].get
+    val executorFee = SELF.R6[Long].get
+
+    // Technically we mint 2, but only 1 is ever circulating.
+    val mintAmount = 2L
+    val minted     = numTokenInOutputs(SELF.id)
+
+    if (minted > 0L) {
+        val onlyOne      = SELF.id == INPUTS(0).id
+        val lenderOutput = OUTPUTS(0)
+        val orderOutput  = OUTPUTS(1)
+
+        val validLender =
+            lenderOutput.tokens.size > 0 &&
+            lenderOutput.tokens(0)._1 == SELF.id &&
+            lenderOutput.tokens(0)._2 == 1L &&
+            blake2b256(lenderOutput.propositionBytes) == lenderHash &&
+            lenderOutput.value >= 1000000L
+
+        // Lazy, so a missing or wrongly typed register is a rejection on this path only
+        val validMetadata =
+            lenderOutput.R4[Coll[Byte]].get == SELF.R7[Coll[Byte]].get &&
+            lenderOutput.R5[Coll[Byte]].get == SELF.R8[Coll[Byte]].get &&
+            lenderOutput.R6[Coll[Byte]].get == Coll(48.toByte) &&
+            lenderOutput.R7[Coll[Byte]].isDefined == false
+
+        val validOrder =
+            orderOutput.tokens.size > 0 &&
+            orderOutput.tokens(0)._1 == SELF.id &&
+            orderOutput.tokens(0)._2 == 1L &&
+            orderOutput.tokens.slice(1, orderOutput.tokens.size) == SELF.tokens &&
+            blake2b256(orderOutput.propositionBytes) == orderHash &&
+            orderOutput.R4[Coll[Byte]].isDefined == false &&
+            orderOutput.value >= SELF.value - 1000000L - executorFee
+
+        val verifiedMint = minted == mintAmount
+        sigmaProp(onlyOne && validLender && validMetadata && validOrder && verifiedMint)
+    } else {
+        // Refund
+        val lenderAuth = INPUTS.exists { (b: Box) =>
+            blake2b256(b.propositionBytes) == lenderHash &&
+            b.propositionBytes != SELF.propositionBytes
+        }
+        sigmaProp(lenderAuth)
+    }
+}

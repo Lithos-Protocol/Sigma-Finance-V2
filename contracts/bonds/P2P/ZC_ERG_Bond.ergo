@@ -1,0 +1,112 @@
+{
+    // Zero-Coupon ERG Bond, with pluggable liquidation and a bond asset
+    // Holds the borrower's collateral until the loan is repaid in nanoERG before maturity,
+    // or liquidated to the lender under the liquidation script both sides agreed to.
+    //
+    // REGISTERS
+    // R4: Coll[Byte] - Box id of originating order
+    // R5: Coll[Byte] - borrowerHash: blake2b256 of the borrower's ErgoTree bytes
+    // R6: Coll[Long] - amounts: Idx 0 is the repayment in nanoERG, Idx 1 is the batching fee in nanoERG,
+    //                  the most an executor may keep for itself when it liquidates this bond
+    // R7: Int        - Bond Maturity Height. Repayment is open strictly below it.
+    // R8: Coll[Byte] - lenderHash: blake2b256 of the lender's ErgoTree bytes. For a tradeable bond this
+    //                  is the hash of the one generic BondAssetVault.
+    // R9: Coll[Byte] - liqScriptHash: blake2b256 of the serialized liquidation EXPRESSION, i.e. the exact
+    //                  bytes executeFromVar runs. Not an ErgoTree, so not a propositionBytes hash.
+    //                  UIs may filter bonds by known liquidation hashes.
+    //
+    // TOKENS
+    // tokens(0):  the bond asset singleton. Burned on every path.
+    // tokens(1..): the collateral tokens
+    //
+    // CONTEXT VARS
+    // CTX_LIQ_SCRIPT(0): Coll[Byte] - the liquidation expression. Its presence selects the liquidation
+    //                    path, so a repayment must leave it unset.
+    //
+    // OUTPUTS (index-paired: the bond at INPUTS(i) settles into OUTPUTS(i))
+    // Liquidate: OUTPUTS(i)   collateral to the lender
+    // Repay:     OUTPUTS(i)   repayment to the lender
+    //            OUTPUTS(i+1) collateral back to the borrower
+    // Both settlement boxes carry R4 = SELF.id, so one output can never settle two bonds. The lender's
+    // also carries R5 = tokens(0)._1, the asset that claims it from the vault. Batching repayments
+    // still needs a "filler" input between bond inputs, since each repayment takes two outputs.
+    //
+    // ASSUMPTIONS
+    // - The order that created this box pinned every register, put the bond asset at tokens(0), and
+    //   bounded the batching fee to 0 <= fee <= SELF.value - min box value. None of that is re-checked.
+    // - R9 is trusted completely, including WHEN liquidation is allowed: this contract never compares
+    //   HEIGHT to maturity on the liquidation path. The order must only accept liquidation scripts the
+    //   borrower agreed to; a script that is always true lets the bond be liquidated at once.
+    // - Repayment is permissionless: anyone may pay the lender in full and return the collateral.
+    // - The batching fee is a ceiling, not a payment. Nothing says where the difference goes, so the
+    //   transaction builder keeps it. A lender liquidating their own bond may simply take everything.
+
+    // Helper Methods
+    def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
+        OUTPUTS.fold(0L, {
+            (a: Long, b: Box) =>
+                val totalTokens = b.tokens.fold(0L, {
+                    (z: Long, t: (Coll[Byte], Long)) => if(t._1 == tokenId) z + t._2 else z
+                })
+                a + totalTokens
+        })
+    }
+
+    val borrowerHash     = SELF.R5[Coll[Byte]].get
+    val amounts          = SELF.R6[Coll[Long]].get
+    val repayment        = amounts(0)
+    val batchingFee      = amounts(1)
+    val maturityHeight   = SELF.R7[Int].get
+    val lenderHash       = SELF.R8[Coll[Byte]].get
+    val liqScriptHash    = SELF.R9[Coll[Byte]].get
+    val bondAssetId      = SELF.tokens(0)._1
+    val collateralAssets = SELF.tokens.slice(1, SELF.tokens.size)
+    val collateralERG    = SELF.value
+
+    // Shared by both paths, so evaluating these eagerly costs neither path anything it does not need
+    val settlementBox    = OUTPUTS(CONTEXT.selfBoxIndex)
+    val toLender         = blake2b256(settlementBox.propositionBytes) == lenderHash
+    // R5 is what the generic vault opens with. Unpinned, a settler could name an asset of its own
+    // there and claim the lender's box from the vault itself.
+    val settlementTagged =
+        settlementBox.R4[Coll[Byte]].get == SELF.id &&
+        settlementBox.R5[Coll[Byte]].get == bondAssetId
+    // The singleton must not survive the bond, or its holder could claim the lender's vault
+    val assetBurned      = numTokenInOutputs(bondAssetId) == 0L
+
+    val liquidationScript = getVar[Coll[Byte]](0)
+
+    if (liquidationScript.isDefined) {
+        val liquidated = allOf(
+            Coll(
+                blake2b256(liquidationScript.get) == liqScriptHash,
+                toLender,
+                settlementTagged,
+                settlementBox.tokens == collateralAssets,
+                settlementBox.value  >= collateralERG - batchingFee,
+                assetBurned
+            )
+        )
+        sigmaProp(liquidated) && executeFromVar[SigmaProp](0)
+    } else {
+        // Collateral box returned to borrower. Read only here, so a liquidation of the last bond in a
+        // transaction does not need an output after it.
+        val returnBox = OUTPUTS(CONTEXT.selfBoxIndex + 1)
+        val repaid = allOf(
+            Coll(
+                HEIGHT < maturityHeight,
+                // RepaymentBox Conditions
+                toLender,
+                settlementTagged,
+                settlementBox.value >= repayment,
+                // ReturnBox Conditions
+                blake2b256(returnBox.propositionBytes) == borrowerHash,
+                returnBox.R4[Coll[Byte]].get == SELF.id,
+                returnBox.tokens == collateralAssets,
+                returnBox.value  >= collateralERG,
+                assetBurned
+            )
+        )
+        sigmaProp(repaid)
+    }
+}

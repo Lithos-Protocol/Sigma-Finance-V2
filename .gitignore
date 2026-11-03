@@ -2,3 +2,12 @@
 /project/project/target/
 /project/target/
 /target/
+
+# IDE / build server
+.bsp/
+.idea/
+.vscode/
+.metals/
+.bloop/
+project/.bloop/
+project/metals.sbt
