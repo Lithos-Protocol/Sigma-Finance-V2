@@ -8,13 +8,23 @@
     // liquidated: R7 is that bond's maturity height. Its serialized expression is what an executor attaches
     // as context var 0, and the blake2b256 of those bytes is what a bond keeps in R8.
     //
-    // Everything else about the liquidation is the bond's: where the collateral goes, the R4/R5 settlement
-    // tags into the vault, and the batching fee. That fee (bond R6(1)) is the only difference from
-    // V1: the lender receives the collateral less at most the fee, and whoever builds the transaction keeps
-    // the difference. A bond with a zero fee liquidates to the lender in full, as V1 did.
+    // Everything else about the liquidation is the bond's:the R4/R5 settlement
+    // tags into the vault.
     //
     // Repayment closes at the same height (the bond allows it strictly below maturity), so as in V1 there
     // is no block where both or neither are open.
+    val settlementBox = OUTPUTS(CONTEXT.selfBoxIndex)
+    val amounts          = SELF.R6[Coll[Long]].get
+    val batchingFee      = amounts(1)
+    val collateralAssets = SELF.tokens
+    val collateralERG    = SELF.value
+    val liqConditions = allOf(
+        Coll(
+              settlementBox.tokens == collateralAssets,
+              settlementBox.value  >= collateralERG - batchingFee,
+              HEIGHT >= SELF.R7[Int].get
+        )
+    )
 
-    sigmaProp(HEIGHT >= SELF.R7[Int].get)
+    sigmaProp(liqConditions)
 }

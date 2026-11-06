@@ -74,8 +74,7 @@
                 blake2b256(liquidationScript.get) == liqScriptHash,
                 toVault,
                 settlementTagged,
-                settlementBox.tokens == collateralAssets,
-                settlementBox.value  >= collateralERG - batchingFee
+                // Value and tokens of the settlement box are determined by the liquidationScripte
             )
         )
         sigmaProp(liquidated) && executeFromVar[SigmaProp](0)

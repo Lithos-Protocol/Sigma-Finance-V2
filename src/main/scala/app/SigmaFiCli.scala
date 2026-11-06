@@ -69,7 +69,7 @@ object SigmaFiCli {
       |""".stripMargin
 
   private val DefaultNode = "http://127.0.0.1:9053"
-  private val DefaultBatchingFee = "0.002"
+  private val DefaultBatchingFee = "0.05"
   private val DefaultName = "SigmaFi ZC-Bond"
   private val DefaultDescription =
     "SigmaFi V2 zero-coupon bond asset"
