@@ -2,7 +2,7 @@ package ksingh.sigmabonds
 package app
 
 import ksingh.sigmabonds.client.ScriptGenerator
-import ksingh.sigmabonds.client.ScriptGenerator.{ContractTemplate, LiquidationScript, OfferTerms}
+import ksingh.sigmabonds.client.ScriptGenerator.{ContractTemplate, LiquidationScript}
 import org.ergoplatform.ErgoBox
 import org.ergoplatform.appkit.impl.InputBoxImpl
 import org.ergoplatform.appkit.scalaapi._
@@ -21,14 +21,6 @@ import scala.collection.mutable
 sealed trait Schedule
 case class FixedMaturity(height: Int) extends Schedule
 case class OnClose(duration: Int) extends Schedule
-
-/** A lender's offer: the bond asset's second unit at tokens(0), then the principal. */
-case class OfferInfo(box: InputUTXO, terms: OfferTerms) {
-  def asset: ErgoId = box.tokens.head.id
-  def principalErg: Long = box.value
-  def principalTokens: Seq[Token] = box.tokens.drop(1)
-  def collateralTokens: Seq[Token] = terms.collateralTokens.map { case (id, n) => Token(new ErgoId(id), n) }
-}
 
 /** A borrower's order, of either style. The box's whole contents are the collateral. */
 case class OrderInfo(box: InputUTXO,
@@ -49,34 +41,22 @@ case class BondInfo(box: InputUTXO,
                     repayment: Long,
                     batchingFee: Long,
                     maturity: Int,
-                    lenderHash: Array[Byte],
                     liqScriptHash: Array[Byte]) {
   def asset: ErgoId = box.tokens.head.id
   def collateral: Seq[Token] = box.tokens.drop(1)
 }
 
-/** A generator waiting to mint. `hints` are the ErgoTrees R9 offers as preimages of R4 and R5. */
-case class GeneratorInfo(box: InputUTXO,
-                         offerHash: Array[Byte],
-                         lenderHash: Array[Byte],
-                         executorFee: Long,
-                         name: Option[Array[Byte]],
-                         description: Option[Array[Byte]],
-                         hints: Seq[ErgoTree])
-
 /**
  * SigmaFi V2 as a client sees it: each contract compiled once, through ScriptGenerator, and boxes read back
- * into their terms. A box is only ever read as a protocol box if it really is one: offers and orders must
- * pass `ContractTemplate.matches`, and bonds must be the exact bond tree for their repayment token.
+ * into their terms. Orders must pass `ContractTemplate.matches`, and bonds must have the exact bond tree
+ * for their repayment token. Recognizing a bond's shape does not authenticate its mint or origin.
  */
 class Protocol(ctx: BlockchainContext) {
 
   import Protocol._
 
   lazy val vault: Contract = Contract.fromErgoContract(ScriptGenerator.mkBondAssetVault(ctx))
-  lazy val generator: Contract = Contract.fromErgoContract(ScriptGenerator.mkBondAssetGenerator(ctx))
   lazy val ergBond: Contract = Contract.fromErgoContract(ScriptGenerator.mkZcBondContract(ctx, None))
-  lazy val offerTemplate: ContractTemplate = ScriptGenerator.mkOfferTemplate(ctx)
   lazy val orderTemplate: ContractTemplate = ScriptGenerator.mkOrderTemplate(ctx)
   lazy val onCloseTemplate: ContractTemplate = ScriptGenerator.mkOnCloseOrderTemplate(ctx)
   lazy val liquidations: Seq[LiquidationScript] =
@@ -114,7 +94,7 @@ class Protocol(ctx: BlockchainContext) {
   /**
    * The bond a bond hash names, if it is a genuine bond and fits the principal: an ERG loan (no principal
    * tokens) is an ERG bond, and a loan of one token is that token's bond. Anything else is refused, since
-   * neither offers nor orders check the pairing themselves.
+   * orders do not check the pairing themselves.
    */
   def pairedBond(bondHash: Array[Byte], principalTokens: Seq[Token]): Option[Option[ErgoId]] =
     principalTokens match {
@@ -143,28 +123,11 @@ class Protocol(ctx: BlockchainContext) {
       borrower <- bytesReg(box, 5)
       amounts <- longsReg(box, 6) if amounts.length == 2
       maturity <- intReg(box, 7)
-      lender <- bytesReg(box, 8)
-      liq <- bytesReg(box, 9)
-    } yield BondInfo(box, token, origin, borrower, amounts(0), amounts(1), maturity, lender, liq)
+      liq <- bytesReg(box, 8)
+    } yield BondInfo(box, token, origin, borrower, amounts(0), amounts(1), maturity, liq)
   }
 
-  // ─── offers and orders ───────────────────────────────────────────────────
-
-  def asOffer(box: InputUTXO): Option[OfferInfo] =
-    if (box.tokens.isEmpty || box.tokens.head.amount != 1L) None
-    else offerTermsOf(box.input.getErgoTree).map(OfferInfo(box, _))
-
-  /** An offer's terms, if the tree is a genuine offer: the template with only the terms changed. */
-  def offerTermsOf(tree: ErgoTree): Option[OfferTerms] =
-    if (!offerTemplate.matches(tree)) None
-    else Some(OfferTerms(
-      bondHash = bytesTerm(offerTemplate, tree, "CONST_BOND_HASH"),
-      repayment = longTerm(offerTemplate, tree, "CONST_REPAYMENT"),
-      batchingFee = longTerm(offerTemplate, tree, "CONST_BATCHING_FEE"),
-      maturity = intTerm(offerTemplate, tree, "CONST_MATURITY"),
-      liqScriptHash = bytesTerm(offerTemplate, tree, "CONST_LIQ_SCRIPT_HASH"),
-      collateralErg = longTerm(offerTemplate, tree, "CONST_COLLATERAL_ERG"),
-      collateralTokens = tokensTerm(offerTemplate, tree, "CONST_COLLATERAL_TOKENS")))
+  // ─── orders ──────────────────────────────────────────────────────────────
 
   def asOrder(box: InputUTXO): Option[OrderInfo] = {
     val tree = box.input.getErgoTree
@@ -186,15 +149,6 @@ class Protocol(ctx: BlockchainContext) {
 
   // ─── lender scripts ──────────────────────────────────────────────────────
 
-  def asGenerator(box: InputUTXO): Option[GeneratorInfo] =
-    if (!sameTree(box.input.getErgoTree, generator.ergoTree)) None
-    else for {
-      offerHash <- bytesReg(box, 4)
-      lenderHash <- bytesReg(box, 5)
-      fee <- longReg(box, 6)
-    } yield GeneratorInfo(box, offerHash, lenderHash, fee, bytesReg(box, 7), bytesReg(box, 8),
-      treesReg(box, 9))
-
   /** The bond asset a vault box opens for, from its R5. */
   def vaultAsset(box: InputUTXO): Option[ErgoId] =
     if (!sameTree(box.input.getErgoTree, vault.ergoTree)) None
@@ -203,10 +157,8 @@ class Protocol(ctx: BlockchainContext) {
   /** A short name for a contract this client knows, for transaction summaries. */
   def nameOf(tree: ErgoTree): Option[String] =
     if (sameTree(tree, vault.ergoTree)) Some("BondAssetVault")
-    else if (sameTree(tree, generator.ergoTree)) Some("BondNFT_Generator")
     else if (sameTree(tree, ergBond.ergoTree)) Some("ZC_ERG_Bond")
     else if (templateHash(tree).sameElements(tokenBondTemplateHash)) Some("ZC_Token_Bond")
-    else if (offerTemplate.matches(tree)) Some("ZC_Offer")
     else if (orderTemplate.matches(tree)) Some("ZC_Order")
     else if (onCloseTemplate.matches(tree)) Some("ZC_OrderOnClose")
     else if (sameTree(tree, Contract.FEE.ergoTree)) Some("miner fee")

@@ -2,7 +2,7 @@ package org.lithosprotocol.sigmafi
 package specs.bonds
 
 import ksingh.sigmabonds.client.ScriptGenerator
-import ksingh.sigmabonds.client.ScriptGenerator.{ContractTemplate, OfferTerms, OnCloseOrderTerms, OrderTerms}
+import ksingh.sigmabonds.client.ScriptGenerator.{ContractTemplate, OnCloseOrderTerms, OrderTerms}
 import org.ergoplatform.appkit._
 import org.ergoplatform.appkit.scalaapi._
 import org.ergoplatform.sdk.ErgoId
@@ -29,10 +29,10 @@ object BondSpecBase {
    * contract file; `alwaysTrue` stands in for an attacker's script that would pass but was never agreed
    * to; `neverTrue` is a listed script that fails.
    */
-  case class Compiled(ergBond: Contract, tokenBond: Contract, generator: Contract, vault: Contract,
-                      offerTemplate: ContractTemplate, orderTemplate: ContractTemplate,
+  case class Compiled(ergBond: Contract, tokenBond: Contract, vault: Contract,
+                      orderTemplate: ContractTemplate,
                       onCloseTemplate: ContractTemplate,
-                      matured: Contract, alwaysTrue: Contract, neverTrue: Contract)
+                      matured: Contract, alwaysTrue: Contract, neverTrue: Contract, converted: Contract)
 
   private var cache: Option[Compiled] = None
 
@@ -43,14 +43,17 @@ object BondSpecBase {
       val c = Compiled(
         Contract.fromErgoContract(ScriptGenerator.mkZcBondContract(ctx, None)),
         Contract.fromErgoContract(ScriptGenerator.mkZcBondContract(ctx, Some(stableToken.toString))),
-        Contract.fromErgoContract(ScriptGenerator.mkBondAssetGenerator(ctx)),
         Contract.fromErgoContract(ScriptGenerator.mkBondAssetVault(ctx)),
-        ScriptGenerator.mkOfferTemplate(ctx),
         ScriptGenerator.mkOrderTemplate(ctx),
         ScriptGenerator.mkOnCloseOrderTemplate(ctx),
         Contract(ScriptGenerator.mkLiquidationScript(ctx, "MaturityLiquidation").tree),
         expr("{ sigmaProp(HEIGHT > 0) }"),
-        expr("{ sigmaProp(HEIGHT < 0) }"))
+        expr("{ sigmaProp(HEIGHT < 0) }"),
+        expr("""{
+          val payout = OUTPUTS(CONTEXT.selfBoxIndex)
+          sigmaProp(HEIGHT >= SELF.R7[Int].get && payout.tokens.size == 0 &&
+            payout.value >= SELF.value + 2000000000L)
+        }"""))
       cache = Some(c)
       c
     }
@@ -66,22 +69,6 @@ object BondSpecBase {
   case object OnClose extends OrderStyle
 }
 
-/**
- * Harness for the zero-coupon bonds, the bond asset vault, the bond asset generator and the offer.
- *
- * Positions are load bearing:
- *
- *   repay       IN  bond(i), payer           OUT settlement(i) to lender, return(i+1) to borrower
- *   liquidate   IN  bond(i) + var 0          OUT settlement(i) to lender; the executor keeps the change
- *   mint        IN  generator(0)             OUT lender unit(0), order(1); the executor keeps the change
- *   refund      IN  generator, lender box    OUT anything
- *   close       IN  offer, borrower          OUT bond(0), principal anywhere
- *   cancel      IN  offer, lender's unit     OUT anything, both units burned
- *   claim       IN  vault, holder's unit     OUT anything, unit burned
- *
- * A lender's settlement box names its bond in R4 and the bond's asset in R5; the one generic vault
- * opens for whoever burns the asset R5 names. Borrower orders do not exist yet.
- */
 trait BondSpecBase extends ContractSpecBase {
 
   import BondSpecBase._
@@ -92,25 +79,21 @@ trait BondSpecBase extends ContractSpecBase {
     case ErgBond => compiled(ctx).ergBond
     case TokenBond => compiled(ctx).tokenBond
   }
-  protected def generator(ctx: BlockchainContext): Contract = compiled(ctx).generator
   protected def vault(ctx: BlockchainContext): Contract = compiled(ctx).vault
-  protected def offerTemplate(ctx: BlockchainContext): ContractTemplate = compiled(ctx).offerTemplate
   protected def orderTemplate(ctx: BlockchainContext): ContractTemplate = compiled(ctx).orderTemplate
   protected def onCloseTemplate(ctx: BlockchainContext): ContractTemplate = compiled(ctx).onCloseTemplate
   protected def matured(ctx: BlockchainContext): Contract = compiled(ctx).matured
   protected def alwaysTrue(ctx: BlockchainContext): Contract = compiled(ctx).alwaysTrue
   protected def neverTrue(ctx: BlockchainContext): Contract = compiled(ctx).neverTrue
+  protected def converted(ctx: BlockchainContext): Contract = compiled(ctx).converted
 
   // ─── identities ───────────────────────────────────────────────────────────
 
   protected def borrower(ctx: BlockchainContext): ErgoProver = proverWith(ctx, BigInteger.valueOf(1001L))
   protected def lender(ctx: BlockchainContext): ErgoProver = proverWith(ctx, BigInteger.valueOf(2002L))
-  /** No relationship to either party. Liquidation and minting must both work for it. */
+  /** No relationship to either party. Liquidation must work for it. */
   protected def executor(ctx: BlockchainContext): ErgoProver = proverWith(ctx, BigInteger.valueOf(3003L))
   protected def other(ctx: BlockchainContext): ErgoProver = proverWith(ctx, BigInteger.valueOf(4004L))
-  /** Where a generator sends the principal in specs that are not about offers. */
-  protected def orderStandIn(ctx: BlockchainContext): Contract = contractOf(proverWith(ctx, BigInteger.valueOf(5005L)))
-
   protected def borrowerTree(ctx: BlockchainContext): Contract = contractOf(borrower(ctx))
   protected def lenderTree(ctx: BlockchainContext): Contract = contractOf(lender(ctx))
   protected def otherTree(ctx: BlockchainContext): Contract = contractOf(other(ctx))
@@ -136,7 +119,6 @@ trait BondSpecBase extends ContractSpecBase {
 
   /** Above MinFee on purpose: a fee at or below the miner fee pays nobody to act. */
   protected val batchingFee: Long = 5L * Parameters.MinFee
-  protected val executorFee: Long = 5L * Parameters.MinFee
 
   protected def maturityOf(ctx: BlockchainContext): Int = ctx.getHeight + 1000
   protected def repaymentOf(kind: Kind): Long = kind match {
@@ -152,7 +134,6 @@ trait BondSpecBase extends ContractSpecBase {
                          value: Long = collateralErg,
                          collateral: Seq[Token] = defaultCollateral,
                          borrowerScript: Contract = null,
-                         lenderScript: Contract = null,
                          fee: Long = batchingFee,
                          maturity: Int = -1,
                          liqScript: Contract = null,
@@ -163,7 +144,6 @@ trait BondSpecBase extends ContractSpecBase {
         bytesValue(hashOf(if (borrowerScript == null) borrowerTree(ctx) else borrowerScript)),
         longsValue(repaymentOf(kind), fee),
         ErgoValue.of(if (maturity < 0) maturityOf(ctx) else maturity),
-        bytesValue(hashOf(if (lenderScript == null) vault(ctx) else lenderScript)),
         bytesValue((if (liqScript == null) matured(ctx) else liqScript).hashedValueBytes)))
 
   /** A collateral return: names the bond it settles in R4. */
@@ -242,7 +222,7 @@ trait BondSpecBase extends ContractSpecBase {
 
   /**
    * Fired by the executor with the bond as its only input: the batching fee pays the miner fee and the
-   * rest comes back as the executor's change. `listed` is the script R9 commits to, `ran` the one
+   * rest comes back as the executor's change. `listed` is the script R8 commits to, `ran` the one
    * supplied in var 0.
    */
   protected def liquidateScenario(ctx: BlockchainContext,
@@ -270,128 +250,20 @@ trait BondSpecBase extends ContractSpecBase {
       if (outputs == null) Seq(settleOut) else outputs,
       if (changeTo == null) l.prover.getAddress else changeTo, Seq.empty[InputUTXO], burn)
 
-  // ═══ MINT / REFUND ════════════════════════════════════════════════════════
-
   protected val tokenName: String = "SigmaFi Bond"
   protected val tokenDescription: String = "Zero-coupon ERG bond. Claims its BondAssetVault."
 
   protected def utf8(s: String): ErgoValue[_] = bytesValue(s.getBytes("UTF-8"))
 
-  /** EIP-4 issuance registers R4-R6, as the generator requires them on the lender's unit. */
+  /** EIP-4 issuance registers R4-R6, on the lender's unit. */
   protected def eip4(name: String = tokenName, description: String = tokenDescription,
                      decimals: String = "0"): Seq[ErgoValue[_]] =
     Seq(utf8(name), utf8(description), utf8(decimals))
 
-  /**
-   * `withMetadata = false` leaves off R7-R8, as a generator made before they existed would. The value
-   * covers the principal, the lender unit's box and the executor fee.
-   */
-  protected def generatorUTXO(ctx: BlockchainContext,
-                              tokens: Seq[Token] = Seq.empty[Token],
-                              fee: Long = executorFee,
-                              lenderScript: Contract = null,
-                              withMetadata: Boolean = true,
-                              orderScript: Contract = null,
-                              principal: Long = principalErg): UTXO =
-    UTXO(generator(ctx), principal + minBox + executorFee, tokens,
-      Seq(
-        bytesValue(hashOf(if (orderScript == null) orderStandIn(ctx) else orderScript)),
-        bytesValue(hashOf(if (lenderScript == null) lenderTree(ctx) else lenderScript)),
-        ErgoValue.of(fee)) ++
-        (if (withMetadata) Seq(utf8(tokenName), utf8(tokenDescription)) else Seq.empty[ErgoValue[_]]))
-
-  protected case class Mint(ctx: BlockchainContext,
-                            gen: UTXO,
-                            genIn: InputUTXO,
-                            asset: ErgoId,
-                            lenderOut: UTXO,
-                            orderOut: UTXO,
-                            prover: ErgoProver)
-
-  /** The executor spends the generator alone: the fee covers the miner fee and leaves it the rest. */
-  protected def mintScenario(ctx: BlockchainContext,
-                             genTokens: Seq[Token] = Seq.empty[Token],
-                             fee: Long = executorFee,
-                             orderScript: Contract = null,
-                             principal: Long = principalErg): Mint = {
-    val gen = generatorUTXO(ctx, genTokens, fee, orderScript = orderScript, principal = principal)
-    val genIn = inputAt(gen, ctx, 0)
-    val asset = genIn.id
-    Mint(ctx, gen, genIn, asset,
-      UTXO(lenderTree(ctx), minBox, Seq(Token(asset, 1L)), eip4()),
-      UTXO(if (orderScript == null) orderStandIn(ctx) else orderScript,
-        gen.value - minBox - fee, Seq(Token(asset, 1L)) ++ genTokens),
-      executor(ctx))
-  }
-
-  protected def mintTx(m: Mint)(lenderOut: UTXO = m.lenderOut,
-                                orderOut: UTXO = m.orderOut,
-                                inputs: Seq[InputUTXO] = null,
-                                outputs: Seq[UTXO] = null,
-                                burn: Seq[Token] = Seq.empty[Token]): UnsignedTransaction =
-    build(m.ctx,
-      if (inputs == null) Seq(m.genIn) else inputs,
-      if (outputs == null) Seq(lenderOut, orderOut) else outputs,
-      m.prover.getAddress, Seq.empty[InputUTXO], burn)
-
-  // ═══ OFFER ════════════════════════════════════════════════════════════════
-
-  protected def offerTerms(ctx: BlockchainContext,
-                           kind: Kind,
-                           collateral: Seq[Token] = defaultCollateral,
-                           fee: Long = batchingFee,
-                           collateralValue: Long = collateralErg): OfferTerms =
-    OfferTerms(
-      bondHash = hashOf(bondContract(ctx, kind)),
-      repayment = repaymentOf(kind),
-      batchingFee = fee,
-      maturity = maturityOf(ctx),
-      liqScriptHash = matured(ctx).hashedValueBytes,
-      collateralErg = collateralValue,
-      collateralTokens = collateral.map(t => t.id.getBytes -> t.amount))
-
-  protected def offerContract(ctx: BlockchainContext, terms: OfferTerms): Contract =
-    Contract(offerTemplate(ctx).withTerms(terms))
-
-  /** What sits in an offer beside its unit: nanoERG for an ERG loan, the loan token for a token loan. */
   protected def principalOf(kind: Kind): (Long, Seq[Token]) = kind match {
     case ErgBond => (principalErg, Seq.empty[Token])
     case TokenBond => (minBox, Seq(Token(stableToken, principalTokens)))
   }
-
-  protected case class Close(ctx: BlockchainContext,
-                             kind: Kind,
-                             terms: OfferTerms,
-                             offer: UTXO,
-                             offerIn: InputUTXO,
-                             borrowerIn: InputUTXO,
-                             bondOut: UTXO,
-                             principalOut: UTXO,
-                             prover: ErgoProver)
-
-  /** The borrower brings the collateral, creates the bond at OUTPUTS(0) and takes the principal. */
-  protected def closeScenario(ctx: BlockchainContext,
-                              kind: Kind,
-                              fee: Long = batchingFee): Close = {
-    val terms = offerTerms(ctx, kind, fee = fee)
-    val (value, tokens) = principalOf(kind)
-    val offer = UTXO(offerContract(ctx, terms), value, Seq(Token(bondAsset, 1L)) ++ tokens)
-    val offerIn = inputAt(offer, ctx, 0)
-    val b = borrower(ctx)
-    Close(ctx, kind, terms, offer, offerIn, funding(ctx, b, 1, slack, defaultCollateral),
-      bondUTXO(ctx, kind, fee = fee, origin = offerIn.id.getBytes),
-      UTXO(borrowerTree(ctx), value, tokens), b)
-  }
-
-  protected def closeTx(c: Close)(bondOut: UTXO = c.bondOut,
-                                  principalOut: UTXO = c.principalOut,
-                                  inputs: Seq[InputUTXO] = null,
-                                  outputs: Seq[UTXO] = null,
-                                  burn: Seq[Token] = Seq.empty[Token]): UnsignedTransaction =
-    build(c.ctx,
-      if (inputs == null) Seq(c.offerIn, c.borrowerIn) else inputs,
-      if (outputs == null) Seq(bondOut, principalOut) else outputs,
-      c.prover.getAddress, Seq.empty[InputUTXO], burn)
 
   // ═══ ORDER ════════════════════════════════════════════════════════════════
 
@@ -460,13 +332,16 @@ trait BondSpecBase extends ContractSpecBase {
                              kind: Kind,
                              fee: Long = batchingFee,
                              style: OrderStyle = FixedHeight,
-                             duration: Int = defaultDuration): Fill = {
+                             duration: Int = defaultDuration,
+                             liqScript: Contract = null): Fill = {
+    val liq = if (liqScript == null) matured(ctx) else liqScript
     val (script, maturity, height) = style match {
       case FixedHeight =>
-        val terms = orderTerms(ctx, kind, fee)
+        val terms = orderTerms(ctx, kind, fee).copy(liqScriptHash = liq.hashedValueBytes)
         (orderContract(ctx, terms), terms.maturity, -1)
       case OnClose =>
-        (onCloseContract(ctx, onCloseTerms(ctx, kind, fee, duration)), fillHeightOf(ctx) + duration, fillHeightOf(ctx))
+        val terms = onCloseTerms(ctx, kind, fee, duration).copy(liqScriptHash = liq.hashedValueBytes)
+        (onCloseContract(ctx, terms), fillHeightOf(ctx) + duration, fillHeightOf(ctx))
     }
     val order = UTXO(script, collateralErg, defaultCollateral)
     val orderIn = inputAt(order, ctx, 0)
@@ -475,7 +350,7 @@ trait BondSpecBase extends ContractSpecBase {
     val l = lender(ctx)
     Fill(ctx, kind, style, order, orderIn, funding(ctx, l, 1, slack, tokens), asset,
       UTXO(lenderTree(ctx), minBox, Seq(Token(asset, 1L)), eip4()),
-      bondUTXO(ctx, kind, asset = asset, fee = fee, maturity = maturity, origin = orderIn.id.getBytes),
+      bondUTXO(ctx, kind, asset = asset, fee = fee, maturity = maturity, liqScript = liq, origin = orderIn.id.getBytes),
       UTXO(borrowerTree(ctx), value, tokens),
       repaymentOf(kind), fee, maturity, height, l)
   }

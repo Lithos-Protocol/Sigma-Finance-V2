@@ -37,16 +37,10 @@ object SigmaFiCli {
       |Look around (no API key needed, except with --mine or for claims):
       |  info                               heights, protocol addresses and hashes, your wallet address
       |  orders [--mine]                    open borrower orders
-      |  offers [--mine]                    open lender offers, with their bond assets verified
-      |  generators [--mine]                lender offers waiting for an executor to mint them
       |  bonds [--mine] [--liquidatable]    live bonds
       |  claims                             bond assets in your wallet whose bond has paid the vault
       |
       |Lender:
-      |  create-offer <loan terms> (--maturity <height> | --term <blocks>)
-      |               [--executor-fee <ERG>] [--name <text>] [--description <text>]
-      |  refund-generator <generator box id>   take back an offer that has not been minted yet
-      |  cancel-offer <offer box id>          burn your bond asset, take the principal back
       |  fill-order <order box id> [--name <text>] [--description <text>]
       |  claim <bond asset id>               collect a repaid or liquidated bond from the vault
       |
@@ -54,11 +48,9 @@ object SigmaFiCli {
       |  create-order <loan terms> (--maturity <height> | --term <blocks> | --duration <blocks>)
       |               --duration makes an on-close order: the bond matures that many blocks after the fill
       |  cancel-order <order box id>
-      |  close-offer <offer box id>
       |  repay <bond box id>
       |
       |Executor:
-      |  mint <generator box id>                 mint an offer and keep the executor fee
       |  liquidate <bond box id> [<bond box id> ...]  liquidate matured bonds and keep their batching fees
       |
       |Loan terms:
@@ -66,14 +58,13 @@ object SigmaFiCli {
       |  --principal-token <token id>:<n>  lend n units of one token, repaid in the same token
       |  --repayment <amount>              ERG for an ERG loan, token units for a token loan
       |  --collateral-erg <ERG>
-      |  --collateral-token <token id>:<n> repeat for each token; an offer's bond must hold exactly these
+      |  --collateral-token <token id>:<n> repeat for each collateral token
       |  --batching-fee <ERG>              the most a liquidator may keep (default 0.002)
       |  --liquidation <name>              default MaturityLiquidation
       |""".stripMargin
 
   private val DefaultNode = "http://127.0.0.1:9053"
   private val DefaultBatchingFee = "0.002"
-  private val DefaultExecutorFee = "0.002"
   private val DefaultName = "SigmaFi Bond"
   private val DefaultDescription =
     "SigmaFi V2 zero-coupon bond asset. Verify it by its genesis box, never by its name."
@@ -138,29 +129,16 @@ object SigmaFiCli {
     a.command.get match {
       case "info" => info(app, node, a)
       case "orders" => listOrders(app, node, a.flag("mine"))
-      case "offers" => listOffers(app, node, a.flag("mine"))
-      case "generators" => listGenerators(app, node, a.flag("mine"))
       case "bonds" => listBonds(app, node, a.flag("mine"), a.flag("liquidatable"))
       case "claims" => listClaims(app, node)
 
-      case "create-offer" =>
-        val maturity = schedule(a, app) match {
-          case FixedMaturity(h) => h
-          case OnClose(_) => throw CliError("offers have a fixed maturity: use --maturity or --term")
-        }
-        app.submit(app.createOffer(loan(a), maturity,
-          parseErg(a.opt("executor-fee").getOrElse(DefaultExecutorFee)), name, description))
-      case "refund-generator" => app.submit(app.refundGenerator(one("generator box id")))
-      case "cancel-offer" => app.submit(app.cancelOffer(one("offer box id")))
       case "fill-order" => app.submit(app.fillOrder(one("order box id"), name, description))
       case "claim" => app.submit(app.claim(one("bond asset id")))
 
       case "create-order" => app.submit(app.createOrder(loan(a), schedule(a, app)))
       case "cancel-order" => app.submit(app.cancelOrder(one("order box id")))
-      case "close-offer" => app.submit(app.closeOffer(one("offer box id")))
       case "repay" => app.submit(app.repay(one("bond box id")))
 
-      case "mint" => app.submit(app.mint(one("generator box id")))
       case "liquidate" => app.submit(app.liquidate(a.positional))
 
       case other => throw CliError(s"unknown command $other; run with --help for the list")
@@ -175,12 +153,10 @@ object SigmaFiCli {
     println(s"Network: $network; height ${app.height}")
     indexStatus(node).foreach(println)
     println(s"BondAssetVault:     ${p.vault.address(network)}")
-    println(s"  hash (bond R8):   ${p.vault.hashedPropBytesHex}")
-    println(s"BondNFT_Generator:  ${p.generator.address(network)}")
+    println(s"  hash (CONST_VAULT_HASH):   ${p.vault.hashedPropBytesHex}")
     println(s"ZC_ERG_Bond:        ${p.ergBond.address(network)}")
     println(s"  hash:             ${p.ergBond.hashedPropBytesHex}")
     println(s"ZC_Token_Bond template hash:  ${Base16.encode(p.tokenBondTemplateHash)}")
-    println(s"ZC_Offer template hash:       ${Base16.encode(p.offerTemplate.templateHash)}")
     println(s"ZC_Order template hash:       ${Base16.encode(p.orderTemplate.templateHash)}")
     println(s"ZC_OrderOnClose template hash: ${Base16.encode(p.onCloseTemplate.templateHash)}")
     p.liquidations.foreach(l => println(s"Liquidation ${l.name}: ${Base16.encode(l.hash)}"))
@@ -208,44 +184,6 @@ object SigmaFiCli {
       println(s"  batching fee ${Fmt.erg(o.batchingFee)}; liquidation ${liqName(app, o.liqScriptHash)}")
       if (bond.isEmpty) println("  WARNING: its bond contract does not match its principal; fill-order refuses it")
       if (app.isOwnHash(o.borrowerHash)) println("  (your order)")
-    }
-  }
-
-  private def listOffers(app: SigmaFiApp, node: NodeApi, mine: Boolean): Unit = {
-    indexStatus(node).foreach(System.err.println)
-    val offers = app.offers().filter(o => !mine || app.walletHolds(o.asset))
-    if (offers.isEmpty) println("No open offers.")
-    offers.foreach { o =>
-      val t = o.terms
-      val bond = app.protocol.pairedBond(t.bondHash, o.principalTokens)
-      val verified = app.verifyOffer(o)
-      println(s"Offer ${o.box.id}  bond asset ${o.asset}  " + verified.fold(r => s"NOT VERIFIED: $r", _ => "verified"))
-      println(s"  lend:        ${Fmt.principal(o.principalErg, o.principalTokens)}; repay " +
-        bond.fold("?")(tk => Fmt.amount(t.repayment, tk)))
-      println(s"  maturity:    height ${t.maturity} (${t.maturity - app.height} blocks from now)")
-      println(s"  collateral:  ${Fmt.contents(t.collateralErg, o.collateralTokens)}")
-      println(s"  batching fee ${Fmt.erg(t.batchingFee)}; liquidation ${liqName(app, t.liqScriptHash)}")
-      if (bond.isEmpty) println("  WARNING: its bond contract does not match its principal; close-offer refuses it")
-      if (mine) println("  (you hold its bond asset)")
-    }
-  }
-
-  private def listGenerators(app: SigmaFiApp, node: NodeApi, mine: Boolean): Unit = {
-    indexStatus(node).foreach(System.err.println)
-    val gens = app.generators().filter(g => !mine || app.isWalletHash(g.lenderHash))
-    if (gens.isEmpty) println("No generators waiting to mint.")
-    gens.foreach { g =>
-      val name = g.name.map(n => new String(n, "UTF-8")).getOrElse("(none: cannot mint)")
-      println(s"Generator ${g.box.id}  bond asset name '$name'")
-      println(s"  principal:    ${Fmt.contents(g.box.value, g.box.tokens)} (with the lender unit's box and the fee)")
-      println(s"  executor fee: ${Fmt.erg(g.executorFee)}")
-      app.generatorTrees(g).flatMap { case (offer, _) => app.protocol.offerTermsOf(offer) } match {
-        case Some(t) =>
-          println(s"  offer:        collateral ${Fmt.contents(t.collateralErg, t.collateralTokens.map { case (id, n) =>
-            Token(new ErgoId(id), n)
-          })}, maturing at height ${t.maturity}")
-        case None => println("  offer:        unknown: no valid R9 hint, so only its lender can mint it")
-      }
     }
   }
 
@@ -351,7 +289,7 @@ object Args {
   val Flags: Set[String] = Set("send", "mine", "liquidatable", "help")
   val Options: Set[String] = Set("node", "api-key", "wallet-pass", "address", "fee",
     "principal", "principal-token", "repayment", "collateral-erg", "collateral-token", "batching-fee",
-    "liquidation", "maturity", "term", "duration", "executor-fee", "name", "description")
+    "liquidation", "maturity", "term", "duration", "name", "description")
 
   def parse(args: Seq[String]): Args = {
     val positional = Vector.newBuilder[String]

@@ -9,13 +9,10 @@
     // The bond always pays the BondAssetVault, so the bond asset always unlocks the repayment or collateral.
     //
     // CONSTANTS
-    // Every order is this one ErgoTree template with different constants, as with ZC_Offer: UIs find orders
+    // Every order is this one ErgoTree template with different constants: UIs find orders
     // by template hash, read the terms from the constants, and clients stamp orders out of the template.
-    // Verifying an order, like an offer, means also checking each constant that is not a term against the
-    // template's own: the template hash leaves out CONST_VAULT_HASH and every literal, mintAmount included.
-    //
-    // Fixed, the same in every order:
-    // CONST_VAULT_HASH:       Coll[Byte] - blake2b256 of BondAssetVault. Bond R8.
+    // Verifying an order means also checking each constant that is not a term against the
+    // template's own: the template hash leaves out every literal, mintAmount included.
     //
     // The borrower's terms:
     // CONST_BOND_HASH:        Coll[Byte] - blake2b256 of the bond ErgoTree: ZC_ERG_Bond, or ZC_Token_Bond
@@ -27,14 +24,14 @@
     // CONST_REPAYMENT:        Long       - bond R6(0)
     // CONST_BATCHING_FEE:     Long       - bond R6(1)
     // CONST_MATURITY:         Int        - bond R7, an absolute height
-    // CONST_LIQ_SCRIPT_HASH:  Coll[Byte] - bond R9
+    // CONST_LIQ_SCRIPT_HASH:  Coll[Byte] - bond R8
     //
     // PATHS
     // Fill (SELF at INPUTS(0), the only input that can mint; asset supply exactly 2):
     //   OUTPUTS(0) lender's unit: (asset, 1) at tokens(0), anywhere the lender likes. It is the first output
     //              carrying the new token, so its R4-R6 are the asset's EIP-4 name, description, decimals.
     //   OUTPUTS(1) bond: (asset, 1), then SELF.tokens unchanged, value >= SELF.value. Every register is
-    //              pinned; R8 is CONST_VAULT_HASH.
+    //              pinned; R8 names the liquidation expression. The bond's script pins the vault.
     //   OUTPUTS(2) principal: to the borrower.
     // Cancel: nothing is minted, and the borrower spends a box guarded by CONST_BORROWER_HASH alongside.
     //
@@ -94,8 +91,7 @@
             bondAmounts(0) == CONST_REPAYMENT &&
             bondAmounts(1) == CONST_BATCHING_FEE &&
             bondBox.R7[Int].get == CONST_MATURITY &&
-            bondBox.R8[Coll[Byte]].get == CONST_VAULT_HASH &&
-            bondBox.R9[Coll[Byte]].get == CONST_LIQ_SCRIPT_HASH
+            bondBox.R8[Coll[Byte]].get == CONST_LIQ_SCRIPT_HASH
 
         // Read off the bond, not the constants, so the compiler cannot fold these and change the template
         val feeBounded =

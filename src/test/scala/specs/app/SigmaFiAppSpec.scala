@@ -193,81 +193,6 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
     }
   }
 
-  // ═══ LENDER OFFERS ════════════════════════════════════════════════════════
-
-  property("offer: generator, a third-party mint, a borrower's close, repayment and the lender's claim") {
-    withCtx { ctx =>
-      val w = new World(ctx)
-      val (b, l, e) = (borrower(ctx), lender(ctx), executor(ctx))
-      w.fund(l, erg("20"))
-      w.fund(b, erg("20"), Token(collateralToken, 100L))
-
-      val maturity = ctx.getHeight + 1000
-      w.run(l, w.app(l).createOffer(ergLoan(), maturity, erg("0.003"), "SigmaFi Bond", "spec"))
-      val gen = w.app(e).generators().loneElement
-      w.app(e).generatorTrees(gen) shouldBe defined
-
-      // The executor brings nothing: the fee pays the miner, and the rest is its change
-      w.run(e, w.app(e).mint(gen.box.id.toString))
-      w.balance(e)._1 shouldBe erg("0.002")
-      w.app(e).generators() shouldBe empty
-
-      val offer = w.app(b).offers().loneElement
-      w.app(b).verifyOffer(offer) shouldBe Right(())
-      offer.terms.maturity shouldBe maturity
-      offer.principalErg shouldBe erg("5")
-      w.app(l).walletHolds(offer.asset) shouldBe true
-
-      w.run(b, w.app(b).closeOffer(offer.box.id.toString))
-      w.app(b).offers() shouldBe empty
-      val bond = w.app(b).bonds().loneElement
-      bond.asset shouldBe offer.asset
-      bond.origin.toSeq shouldBe offer.box.id.getBytes.toSeq
-
-      w.run(b, w.app(b).repay(bond.box.id.toString))
-      w.balance(b)._2.get(collateralToken) shouldBe Some(100L)
-      w.run(l, w.app(l).claim(offer.asset.toString))
-      w.balance(l)._1 shouldBe erg("20") - erg("5") - erg("0.001") - erg("0.003") - Parameters.MinFee +
-        erg("0.001") + erg("6") - Parameters.MinFee
-    }
-  }
-
-  property("offer: the lender refunds an unminted generator, or cancels a minted offer") {
-    withCtx { ctx =>
-      val w = new World(ctx)
-      val (l, e) = (lender(ctx), executor(ctx))
-      w.fund(l, erg("20"))
-
-      w.run(l, w.app(l).createOffer(ergLoan(), ctx.getHeight + 1000, erg("0.003"), "n", "d"))
-      w.run(l, w.app(l).refundGenerator(w.app(l).generators().loneElement.box.id.toString))
-      w.app(l).generators() shouldBe empty
-      w.balance(l)._1 shouldBe erg("20") - 2 * Parameters.MinFee
-
-      w.run(l, w.app(l).createOffer(ergLoan(), ctx.getHeight + 1000, erg("0.003"), "n", "d"))
-      w.run(e, w.app(e).mint(w.app(e).generators().loneElement.box.id.toString))
-      val offer = w.app(l).offers().loneElement
-      w.run(l, w.app(l).cancelOffer(offer.box.id.toString))
-      w.app(l).offers() shouldBe empty
-      w.app(l).walletHolds(offer.asset) shouldBe false
-    }
-  }
-
-  property("offer: a borrower refuses an offer whose bond asset no generator minted") {
-    withCtx { ctx =>
-      val w = new World(ctx)
-      val b = borrower(ctx)
-      w.fund(b, erg("20"), Token(collateralToken, 100L))
-      val loan = ergLoan()
-      val terms = ksingh.sigmabonds.client.ScriptGenerator.OfferTerms(w.protocol.ergBond.hashedPropBytes,
-        loan.repayment, loan.batchingFee, ctx.getHeight + 1000, w.protocol.liquidation("MaturityLiquidation").hash,
-        loan.collateralErg, loan.collateralTokens.map(t => t.id.getBytes -> t.amount))
-      val forged = w.seed(UTXO(Contract(w.protocol.offerTemplate.withTerms(terms)), erg("5"),
-        Seq(Token(ErgoId.create("f00d" * 16), 1L))))
-      w.app(b).offers().loneElement.box.id shouldBe forged.id
-      refused(w.app(b).closeOffer(forged.id.toString)) should include("unverified")
-    }
-  }
-
   // ═══ BONDS ════════════════════════════════════════════════════════════════
 
   /** A bond made by some earlier fill, with the lender's unit in the lender's wallet. */
@@ -276,8 +201,7 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
     w.fund(l, erg("0.01"), Token(asset, 1L))
     val box = w.seed(UTXO(p.ergBond, erg("10"), Seq(Token(asset, 1L), Token(collateralToken, 50L)), Seq(
       bytesValue(Array.fill(32)(9.toByte)), bytesValue(hashOf(b.getAddress.toErgoContract.getErgoTree)),
-      longsValue(erg("6"), fee), intValue(maturity), bytesValue(p.vault.hashedPropBytes),
-      bytesValue(p.liquidation("MaturityLiquidation").hash))))
+      longsValue(erg("6"), fee), intValue(maturity), bytesValue(p.liquidation("MaturityLiquidation").hash))))
     p.asBond(box).get
   }
 

@@ -22,7 +22,7 @@ object ScriptGenerator {
   private final val LENDER_SCRIPTS = "bonds/lender-scripts/"
   private final val LIQUIDATIONS = "bonds/liquidations/"
 
-  /** Every liquidation script a bond may name in R9. */
+  /** Every liquidation script a bond may name in R8. */
   final val LIQUIDATION_SCRIPTS: Seq[String] = Seq("MaturityLiquidation")
 
   def mkScript(name: String): String = {
@@ -40,20 +40,28 @@ object ScriptGenerator {
     )
   }
 
-  // Zero-coupon bonds with liquidation and a bond asset
+  /**
+   * Zero-coupon bonds with liquidation, paying the vault. Every bond compiles in the vault's hash, so a bond
+   * paying anywhere else is a different tree: an ERG bond has one address, and a token bond one per token.
+   */
   def mkZcBondContract(ctx: BlockchainContext, optTokenId: Option[String]): ErgoContract = {
+    val vault = Colls.fromArray(vaultHash(ctx))
     optTokenId match {
       case Some(id) =>
         val script = mkScript(ZC_BOND_PREFIX + TOKEN + BOND_SUFFIX)
         val constants = ConstantsBuilder
           .create()
           .item("CONST_TOKEN_ID", idFromStr(id))
+          .item("CONST_VAULT_HASH", vault)
           .build()
 
         ctx.compileContract(constants, script)
       case None =>
         val script = mkScript(ZC_BOND_PREFIX + ERG + BOND_SUFFIX)
-        val constants = ConstantsBuilder.empty()
+        val constants = ConstantsBuilder
+          .create()
+          .item("CONST_VAULT_HASH", vault)
+          .build()
 
         ctx.compileContract(constants, script)
     }
@@ -65,14 +73,9 @@ object ScriptGenerator {
     ctx.compileContract(ConstantsBuilder.empty(), script)
   }
 
-  def mkBondAssetGenerator(ctx: BlockchainContext): ErgoContract = {
-    val script = mkScript(LENDER_SCRIPTS + "BondNFT_Generator")
-    ctx.compileContract(ConstantsBuilder.empty(), script)
-  }
-
   /**
    * A liquidation script. `bytes` is the serialized expression a bond runs with executeFromVar, which an
-   * executor attaches as context var 0; `hash` is what the bond keeps in R9. Neither is an ErgoTree.
+   * executor attaches as context var 0; `hash` is what the bond keeps in R8. Neither is an ErgoTree.
    */
   case class LiquidationScript(name: String, tree: ErgoTree) {
     def bytes: Array[Byte] = work.lithos.mutations.Contract.compileValue(tree)
@@ -87,29 +90,6 @@ object ScriptGenerator {
   /** Terms compiled into an ErgoTree template as named constants. */
   trait ContractTerms {
     def constants: Seq[(String, Any)]
-  }
-
-  /**
-   * A lender's terms, which become the constants of one zero-coupon offer. There is no lender term: the
-   * bond always pays the vault, and the lender is whoever holds the bond asset.
-   */
-  case class OfferTerms(bondHash: Array[Byte],
-                        repayment: Long,
-                        batchingFee: Long,
-                        maturity: Int,
-                        liqScriptHash: Array[Byte],
-                        collateralErg: Long,
-                        collateralTokens: Seq[(Array[Byte], Long)]) extends ContractTerms {
-
-    def constants: Seq[(String, Any)] = Seq(
-      "CONST_BOND_HASH" -> Colls.fromArray(bondHash),
-      "CONST_REPAYMENT" -> repayment,
-      "CONST_BATCHING_FEE" -> batchingFee,
-      "CONST_MATURITY" -> maturity,
-      "CONST_LIQ_SCRIPT_HASH" -> Colls.fromArray(liqScriptHash),
-      "CONST_COLLATERAL_ERG" -> collateralErg,
-      "CONST_COLLATERAL_TOKENS" -> tokenColl(collateralTokens)
-    )
   }
 
   /**
@@ -187,17 +167,8 @@ object ScriptGenerator {
     duration = 999994,
     liqScriptHash = Array.fill(32)(0x73.toByte))
 
-  private val OfferSentinels = OfferTerms(
-    bondHash = Array.fill(32)(0x51.toByte),
-    repayment = 7777777771L,
-    batchingFee = 7777777772L,
-    maturity = 777773,
-    liqScriptHash = Array.fill(32)(0x53.toByte),
-    collateralErg = 7777777774L,
-    collateralTokens = Seq(Array.fill(32)(0x54.toByte) -> 7777777775L))
-
   /**
-   * Every offer (or order) is this tree with different constants. `positions` maps each term to its
+   * Every order is this tree with different constants. `positions` maps each term to its
    * constant index, which is what a UI needs to read the terms off any box with this template.
    */
   case class ContractTemplate(tree: ErgoTree, positions: Map[String, Int]) {
@@ -233,15 +204,11 @@ object ScriptGenerator {
     }
   }
 
-  /** blake2b256 of BondAssetVault, which every offer and order pins as its bonds' R8. */
+  /** blake2b256 of BondAssetVault, which every bond compiles in as CONST_VAULT_HASH. */
   def vaultHash(ctx: BlockchainContext): Array[Byte] = Blake2b256.hash(mkBondAssetVault(ctx).getErgoTree.bytes)
 
-  /** Compile-time values every template shares; they are not terms, and `matches` holds them fixed. */
-  private def fixedConstants(ctx: BlockchainContext): Seq[(String, Any)] =
-    Seq("CONST_VAULT_HASH" -> Colls.fromArray(vaultHash(ctx)))
-
   private def mkTemplate(ctx: BlockchainContext, name: String, sentinels: ContractTerms): ContractTemplate = {
-    val constants = (fixedConstants(ctx) ++ sentinels.constants).foldLeft(ConstantsBuilder.create()) {
+    val constants = sentinels.constants.foldLeft(ConstantsBuilder.create()) {
       case (b, (term, value)) => b.item(term, value)
     }.build()
     val tree = ctx.compileContract(constants, mkScript(name)).getErgoTree
@@ -254,9 +221,6 @@ object ScriptGenerator {
     ContractTemplate(tree, positions)
   }
 
-  def mkOfferTemplate(ctx: BlockchainContext): ContractTemplate =
-    mkTemplate(ctx, ZC_BOND_PREFIX + "Offer", OfferSentinels)
-
   def mkOrderTemplate(ctx: BlockchainContext): ContractTemplate =
     mkTemplate(ctx, ZC_BOND_PREFIX + "Order", OrderSentinels)
 
@@ -265,9 +229,6 @@ object ScriptGenerator {
 
   def mkZcOnCloseOrderContract(ctx: BlockchainContext, template: ContractTemplate,
                                terms: OnCloseOrderTerms): ErgoContract =
-    ctx.newContract(template.withTerms(terms))
-
-  def mkZcOfferContract(ctx: BlockchainContext, template: ContractTemplate, terms: OfferTerms): ErgoContract =
     ctx.newContract(template.withTerms(terms))
 
   def mkZcOrderContract(ctx: BlockchainContext, template: ContractTemplate, terms: OrderTerms): ErgoContract =

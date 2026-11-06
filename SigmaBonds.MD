@@ -1,236 +1,179 @@
 # SigmaBonds
 
-SigmaBonds is a decentralized, P2P bond protocol built on the Ergo blockchain.
-Borrowers post bond orders, setting the maturity, repayment, principal and collateral. Lenders post
-bond offers, setting the same terms from the other side. Either side may close what the other posted.
-SigmaBonds may be collateralized by *any* asset on the Ergo blockchain: ERG, tokens (like SIGUSD,
-Ergopad, Neta, etc.) and NFTs, in any combination in a single bond.
+SigmaBonds is a P2P zero-coupon bond protocol on Ergo. Borrowers post orders funded with collateral;
+lenders fill them by paying the principal. Collateral can combine ERG, fungible tokens and NFTs.
+There are no lender offers or bond-asset generators in the current protocol.
 
-Every V2 bond is a zero-coupon bond: the borrower repays one fixed amount before maturity, or the
-collateral may be liquidated to the lender. Every V2 bond also carries a **bond asset**, a token that
-is the lender's claim on the bond. The lender may hold it, or sell it.
+Every bond repays one fixed amount before maturity, in ERG or one token. Repayment or liquidation
+always settles into `BondAssetVault`, where the holder of the circulating bond asset claims it.
+There are no protocol fees.
 
-## Utility
-SigmaBonds can be used for a variety of different purposes, including the raising of funds,
-access to quick liquid assets, improvements to mining rigs/farms,
-arbitrage opportunities, and many other unique DeFi usecases. For lenders, SigmaBonds
-can be used to slowly gain yield on ERG or a native asset of their choice. Flexibility in collateralization also allows
-for lenders to have more options when evaluating loans (e.g. A lender may be willing to take less collateral
-from entities they deem to be "trusted". Borrower identities can be verified via Public Key or ErgoNames).
+## Bond assets and verification
 
-## Bond Assets
-Each bond asset is minted with a supply of exactly 2. One unit sits inside the bond box as its
-singleton, and is burned when the bond is repaid or liquidated. The other unit goes to the lender.
+Filling an order mints exactly **two units** of a new SigmaFi bond asset:
 
-Every bond made by an offer or an order pays its repayment, or its liquidated collateral, into the
-`BondAssetVault`, and whoever holds the lender's unit claims it by burning that unit. Each bond asset
-therefore unlocks exactly what its bond pays out. The position on the bond is simply the token: lenders
-may trade it, and buyers may speculate on the value of the bond. The cost is one more transaction for
-the lender: being paid means claiming from the vault ([Tx 7](#tx-7-claim-from-the-vault)).
+- One unit goes to the lender and may be traded.
+- One unit sits at `tokens(0)` in the bond and must be burned when the bond settles.
 
-A bond asset is only worth anything if its supply really is 2. Verify one by its genesis box: the token
-id is the id of the box that minted it, and that box must be one of:
-- a `BondNFT_Generator` box: compare its whole ErgoTree. Then check that the mint transaction's second
-  output, where the other unit went, is a genuine `ZC_Offer`.
-- a `ZC_Order` or `ZC_OrderOnClose` instance.
+The order must be `INPUTS(0)`, so its box id becomes the asset id. The bond also records this id in R4.
+An order fills once and creates one bond. The circulating unit claims the bond's vault settlement by
+being spent and burned alongside it. Never send that unit into the vault: a vault box carrying its own
+claim asset is spendable by anyone.
 
-Check offers and orders with `ScriptGenerator.ContractTemplate.matches`, never by template hash alone.
-A template hash leaves out every constant, not just the terms, so a forged order can share the genuine
-template hash while minting 3 units, or an offer while paying another vault. `matches` allows only the
-terms to differ. **Never trust a bond asset by its name.** The name is chosen by the lender and proves
-nothing.
+Verify the mint's genesis box as a genuine `ZC_Order` or `ZC_OrderOnClose` instance, using
+`ScriptGenerator.ContractTemplate.matches`. A template hash alone omits **every** constant: a forged
+order with a different mint amount can share the genuine template hash. Also verify the named bond
+contract, repayment asset and liquidation expression against the intended protocol and terms.
+Asset names and EIP-4 metadata are the lender's choice and prove nothing.
 
-## Fees
-SigmaBonds V2 takes no protocol fees. The only fees pay whoever executes a transaction for someone else:
+The two-unit split is a starting point for on-chain association with an unspent bond, not a complete
+on-chain authentication mechanism. Anyone can fund a box under a genuine bond script with arbitrary
+registers or create a forged mint template. Checking only a bond's script and a shared token id does
+not authenticate the genesis or enforce the original supply. The client currently recognizes bond
+scripts and shapes; its bond listings do not prove mint provenance. An on-chain consumer needs a
+separate authenticated link to the mint and current bond UTXO before treating a token as a verified bond.
 
-- **Batching fee** (bond R6(1), set as an order or offer term): the most a liquidator may keep when it
-  liquidates a bond. The lender receives the collateral less at most this amount, in nanoERG, and
-  whoever builds the liquidation keeps the difference. A batcher can liquidate many matured bonds in one
-  transaction with no funds of its own: each bond pays its fee, and one miner fee comes out of the total.
-  It is a ceiling, so a lender who liquidates their own bond simply keeps everything.
-- **Executor fee** (generator R6): the most an executor may keep for minting a lender's offer. The miner
-  fee comes out of it. Ergo mints one new token per transaction, so mints cannot be batched.
+## Contracts and compilation
 
-## Token
-SigmaBonds has no plans to make a token, and likely never will.
-
-# Protocol
-
-## Contracts
-All contracts are in [`contracts/bonds`](./contracts/bonds). V2 is not deployed yet. Addresses, script
-hashes and template hashes all change with any edit to a contract, so they are not listed here: run
-`ContractClient` to print the current ones, along with each order and offer term's constant index.
-
-| Contract | Role | Found by |
+| Contract | Role | Discovery |
 |---|---|---|
-| `P2P/ZC_ERG_Bond` | A bond repaid in nanoERG | Address |
-| `P2P/ZC_Token_Bond` | A bond repaid in one token, `CONST_TOKEN_ID` | Address (one per token) |
-| `P2P/ZC_Offer` | A lender's offer, closed by a borrower | Template hash |
-| `P2P/ZC_Order` | A borrower's order with a fixed maturity height, filled by a lender | Template hash |
-| `P2P/ZC_OrderOnClose` | A borrower's order with a duration counted from the fill | Template hash |
-| `lender-scripts/BondNFT_Generator` | Mints a lender's bond asset into an offer | Address |
-| `lender-scripts/BondAssetVault` | Holds repayments and collateral for the holder of a bond asset | Address |
-| `liquidations/MaturityLiquidation` | Liquidation from the maturity height on, as in V1 | Script hash |
+| `P2P/ZC_ERG_Bond` | A bond repaid in nanoERG | Exact address |
+| `P2P/ZC_Token_Bond` | A bond repaid in `CONST_TOKEN_ID` | Exact address per repayment token |
+| `P2P/ZC_Order` | Collateral-backed borrower order with fixed maturity | Template, then `matches` |
+| `P2P/ZC_OrderOnClose` | Borrower order with duration counted from fill | Template, then `matches` |
+| `lender-scripts/BondAssetVault` | Settlement claimed by burning the lender's unit | Exact address |
+| `liquidations/MaturityLiquidation` | Maturity, collateral payout and executor fee rules | Expression hash |
 
-Offers and orders keep their terms as compiled-in constants rather than registers. Every offer is the
-same ErgoTree template with different constants, and likewise for each order type, so UIs find them by
-template hash and read the terms from the constants. Clients must build an offer or order by replacing
-the constants of the compiled template (`ScriptGenerator.ContractTemplate.withTerms`), never by
-recompiling the script, and must verify one found by template hash with `ContractTemplate.matches`.
-Every template also carries one fixed constant, `CONST_VAULT_HASH`, which pins each bond's R8 to the vault.
+`ScriptGenerator` compiles the vault's full ErgoTree hash into each bond as `CONST_VAULT_HASH`.
+Orders commit to their bond's full script hash. Every recognized bond therefore pins the vault directly;
+there is no lender destination register. Hashes of wallets and contracts are `blake2b256` of full
+ErgoTree bytes.
 
-Hashes of contracts and wallets are always `blake2b256` of the full ErgoTree bytes.
+Order terms are constants, not registers. Compile each template once and instantiate it with
+`ContractTemplate.withTerms`; recompilation can change the template through constant folding.
+`ContractClient` prints current addresses, hashes, expression bytes and term constant positions.
+V2 is not deployed. Contract edits change script hashes and addresses.
 
-## The Bond Box
-- tokens(0): the bond asset singleton, amount 1
-- tokens(1..): the collateral tokens
-- value: the collateral nanoERG
-- R4: `Coll[Byte]` box id of the originating order or offer
-- R5: `Coll[Byte]` borrower hash: receives the collateral back on repayment
-- R6: `Coll[Long]` (repayment, batching fee). Repayment is in nanoERG, or in `CONST_TOKEN_ID` for a token bond.
-- R7: `Int` maturity height. Repayment is open strictly below it.
-- R8: `Coll[Byte]` lender hash: receives repayment or collateral. Always the `BondAssetVault` for bonds
-  made by offers and orders.
-- R9: `Coll[Byte]` liquidation script hash. See [Liquidation Scripts](#liquidation-scripts).
+## The bond box
 
-## Lender Side: Offers
+| Field | Meaning |
+|---|---|
+| `tokens(0)` | Bond asset, amount 1; burned on settlement |
+| `tokens(1..)` | Collateral tokens |
+| `value` | Collateral nanoERG |
+| R4: `Coll[Byte]` | Originating order id, also the bond asset id |
+| R5: `Coll[Byte]` | Borrower's script hash; collateral returns here on repayment |
+| R6: `Coll[Long]` | Exactly `(repayment, batching fee)`; fee is nanoERG |
+| R7: `Int` | Maturity height; repayment requires `HEIGHT < R7` |
+| R8: `Coll[Byte]` | Hash of the serialized liquidation expression |
 
-### Tx 1A: Create a Generator
-The lender sends the principal to a `BondNFT_Generator` box, plus 0.001 ERG for their own unit's box,
-plus the executor fee. For a token loan, the principal tokens go in the same box.
-- R4: `Coll[Byte]` hash of the lender's `ZC_Offer` instance
-- R5: `Coll[Byte]` hash of the lender's wallet: receives the lender's unit, and authorizes a refund
-- R6: `Long` executor fee
-- R7: `Coll[Byte]` the bond asset's name (UTF-8)
-- R8: `Coll[Byte]` the bond asset's description (UTF-8)
-- R9 (optional, never read): `Coll[Coll[Byte]]` the ErgoTrees R4 and R5 commit to: the offer's and the
-  lender's. R4 and R5 hold only hashes, so without this hint only the lender knows the offer to mint.
-  Executors must check each tree against its hash, and the offer with `ContractTemplate.matches`.
+The vault is a compiled constant. This layout replaces the earlier `Generators` layout with vault hash
+in R8 and liquidation hash in R9. Builders, readers and scripts must use the matching contract version;
+old boxes are not migrated by these source changes.
 
-The generator may be refunded at any time before it mints, in a transaction that also spends a box
-belonging to the lender's wallet.
+## Create, fill or cancel an order
 
-### Tx 2A: Mint the Offer
-Anyone may execute this; the executor keeps up to the executor fee. The generator is `INPUTS(0)`, so the
-bond asset's id is the generator box's id.
-- `OUTPUTS(0)`: the lender's unit, (asset, 1) at tokens(0), to the lender's wallet, at least 0.001 ERG.
-  R4 and R5 are the generator's R7 and R8, R6 is `"0"` (decimals), and there are no further registers.
-  As the first output carrying the new token, this box sets the asset's EIP-4 name and decimals.
-- `OUTPUTS(1)`: the offer, (asset, 1) at tokens(0) followed by the generator's tokens, under the offer
-  instance named in R4, with no registers, holding at least the generator's value less 0.001 ERG and the
-  executor fee.
+The borrower funds a `ZC_Order` or `ZC_OrderOnClose` box with the collateral. Its entire token list and
+at least its entire ERG value must pass into the resulting bond. The terms are:
 
-### Tx 3A: Close an Offer
-A borrower takes the principal by creating the exact bond the lender asked for. Whoever posts the
-collateral is the borrower, so the principal may go wherever they send it. One offer closes per transaction.
-- `OUTPUTS(0)`: the bond, under `CONST_BOND_HASH`, carrying the offer's unit at tokens(0), exactly
-  `CONST_COLLATERAL_TOKENS` after it, and at least `CONST_COLLATERAL_ERG`. R4 is the offer's box id,
-  R5 is the borrower's hash, R6, R7 and R9 are the offer's terms (`CONST_REPAYMENT`,
-  `CONST_BATCHING_FEE`, `CONST_MATURITY`, `CONST_LIQ_SCRIPT_HASH`), and R8 is the vault.
+- `CONST_BOND_HASH`: full hash of the ERG bond or the token bond for the repayment asset.
+- `CONST_BORROWER_HASH`: principal recipient, collateral recipient and cancellation authority.
+- `CONST_PRINCIPAL_ERG`, `CONST_PRINCIPAL_TOKENS`: principal ERG floor and exact principal tokens.
+- `CONST_REPAYMENT`, `CONST_BATCHING_FEE`, `CONST_LIQ_SCRIPT_HASH`: the bond's repayment and liquidation terms.
+- `CONST_MATURITY` for fixed orders, or `CONST_DURATION` for on-close orders.
 
-### Tx 4A: Cancel an Offer
-The holder of the lender's unit spends it alongside the offer, and both units are burned. The principal
-goes wherever they like.
+An ERG loan has an empty principal token list; a token loan pays one token plus the box's ERG floor.
+The client checks that principal and repayment asset match. The order contract itself trusts the
+borrower's chosen bond hash and does not check that pairing.
 
-## Borrower Side: Orders
+An order may carry an optional R4 hint of type `Coll[Coll[Byte]]`, containing the borrower's ErgoTree.
+The client verifies that it hashes to the borrower term. Contracts never read the hint. Without it,
+the client looks for that tree in the transaction that created the order.
 
-### Tx 1B: Create an Order
-The borrower sends the collateral (ERG and tokens) to an instance of `ZC_Order` or `ZC_OrderOnClose`.
-The box's whole contents become the bond's collateral. The terms are constants:
-- `CONST_BOND_HASH`: which bond, ERG or token
-- `CONST_BORROWER_HASH`: the borrower's wallet; receives the principal, authorizes a cancel
-- `CONST_PRINCIPAL_ERG` and `CONST_PRINCIPAL_TOKENS`: the least nanoERG and the exact tokens the borrower
-  receives. An ERG loan has no tokens; a token loan pays one token and a minimal amount of ERG.
-- `CONST_REPAYMENT`, `CONST_BATCHING_FEE`, `CONST_LIQ_SCRIPT_HASH`: copied to the bond
-- `CONST_MATURITY` (fixed height), or `CONST_DURATION` (on-close): see below
+For a fill, the order is `INPUTS(0)` and the lender supplies the principal:
 
-The order may carry R4 (optional, never read): `Coll[Coll[Byte]]` holding the borrower's ErgoTree, the
-preimage of `CONST_BORROWER_HASH`, which a lender needs to pay the principal. Without it, a lender looks
-for that tree among the boxes of the transaction that created the order.
+| Output | Contents |
+|---|---|
+| `OUTPUTS(0)` | Lender's unit: `(order.id, 1)` at tokens(0), to the lender's chosen script |
+| `OUTPUTS(1)` | Bond: `(order.id, 1)`, followed by the order's unchanged tokens, value at least the order's |
+| `OUTPUTS(2)` | Principal to the borrower |
 
-### Tx 2B: Fill an Order
-A lender pays the principal and creates the bond. The order is `INPUTS(0)`, so the fill mints the bond
-asset, with the order's box id as its id. One order fills per transaction.
-- `OUTPUTS(0)`: the lender's unit, (asset, 1) at tokens(0), anywhere the lender likes. It sets the
-  asset's EIP-4 metadata, which is the lender's own choice here.
-- `OUTPUTS(1)`: the bond, under `CONST_BOND_HASH`: (asset, 1), then the order's tokens unchanged, and at
-  least the order's value. R4 is the order's box id, R5 is `CONST_BORROWER_HASH`, R6 and R9 are the
-  order's terms, and R8 is the vault.
-- `OUTPUTS(2)`: the principal, to the borrower.
+The order pins bond R4-R8 and requires exactly two new units across **all** outputs. The lender unit
+is the first output carrying the asset, so its R4-R6 define EIP-4 name, description and decimals.
+One order fills per transaction.
 
-Maturity (bond R7) depends on the order type:
-- **Fixed height:** exactly `CONST_MATURITY`, which must be at least two blocks above the fill, so the
-  borrower always has a block in which to repay. Borrowers should cancel orders left open near maturity.
-- **On-close:** `HEIGHT + CONST_DURATION`, stamped by the lender when building the fill, and allowed to
-  trail by up to 8 blocks so the fill can still confirm. A fill unconfirmed after 8 blocks must be
-  rebuilt. `CONST_DURATION` must be at least 30 blocks.
+Fixed maturity must be at least two blocks above inclusion height, leaving a full block to repay.
+Borrowers should cancel orders left open near maturity. An on-close order requires at least 30 blocks
+of duration; its bond maturity may trail `HEIGHT + duration` by up to 8 blocks. A fill built at height
+h remains valid through h + 8, then must be rebuilt.
 
-### Tx 3B: Cancel an Order
-The borrower takes the collateral back, in a transaction that also spends a box belonging to their wallet.
+Both order types bound the fee to `0 <= fee <= bond.value - 0.001 ERG`, preserving the existing order
+terms. `MaturityLiquidation` uses this ceiling; a custom expression determines its own payout rule.
 
-## Bonds
+The borrower may cancel before fill by co-spending a box guarded by the borrower script, without
+minting the asset. Cancellation leaves outputs unconstrained. Use an appropriate borrower script:
+if anyone can spend that script, anyone can satisfy the cancellation authorization.
 
-### Tx 5: Repay a Bond
-Anyone may repay a bond before its maturity height; it is normally the borrower. No context variable is
-attached: its absence is what selects repayment. For the bond at `INPUTS(i)`:
-- `OUTPUTS(i)`: the repayment, to the lender hash in R8. R4 is the bond's box id, R5 its bond asset's id.
-  For an ERG bond it holds at least the repayment; for a token bond, exactly one token, `CONST_TOKEN_ID`,
-  at least the repayment, and at least 0.001 ERG.
-- `OUTPUTS(i + 1)`: the collateral, to the borrower hash in R5, with exactly the bond's tokens after the
-  singleton, at least the bond's value, and R4 the bond's box id.
-- The bond asset singleton is burned.
+## Repay a bond
 
-Each repayment takes two outputs, so repaying several bonds in one transaction needs a filler input
-between bond inputs.
+Repayment is permissionless and must occur strictly below maturity. Leave context variable 0 unset.
+For the bond at `INPUTS(i)`:
 
-### Tx 6: Liquidate a Bond
-Anyone may liquidate a bond once its liquidation script allows it. The liquidation script's bytes are
-attached to the bond input as context variable 0. For the bond at `INPUTS(i)`:
-- `OUTPUTS(i)`: the collateral, to the lender hash in R8, with exactly the bond's tokens after the
-  singleton, and at least the bond's value less the batching fee. R4 is the bond's box id, R5 its bond
-  asset's id.
-- The bond asset singleton is burned.
+- `OUTPUTS(i)` pays the vault, with R4 = bond box id and R5 = bond asset id. ERG bonds pay at least
+  the repayment value. Token bonds pay exactly one token id, `CONST_TOKEN_ID`, at least the repayment
+  quantity, plus at least 0.001 ERG.
+- `OUTPUTS(i + 1)` returns all collateral tokens and at least the bond's value to the borrower, with
+  R4 = bond box id.
+- No output may carry the bond asset: the singleton is burned.
 
-Liquidations batch freely: bonds at `INPUTS(0..n)` settle into `OUTPUTS(0..n)`.
+Multiple repayments need filler inputs between bond inputs, since each bond requires two outputs.
+Bond-specific R4 tags prevent one output from satisfying two different settlements or returns.
 
-### Tx 7: Claim from the Vault
-The holder of a bond asset spends every `BondAssetVault` box whose R5 names that asset, alongside the
-unit, and burns it. The outputs are theirs to choose. All of an asset's vault boxes must be claimed in
-one transaction, since the unit is gone afterwards.
+## Liquidate a bond
 
-## Liquidation Scripts
-A bond's R9 is the `blake2b256` of a serialized liquidation *expression* (not an ErgoTree). A liquidator
-attaches those bytes as context variable 0, and the bond runs them with `executeFromVar`, with the bond
-as `SELF`. The script decides only *when* a bond may be liquidated; where the collateral goes, the
-batching fee and the bond asset burn are always the bond's. `ContractClient` prints each script's hash
-and bytes.
+Attach the agreed serialized liquidation **expression** as context variable 0 on each bond input.
+Its `blake2b256` must match R8, and the bond runs it through `executeFromVar[SigmaProp](0)`.
+The bytes are an expression, not an ErgoTree; `ContractClient` prints both bytes and hash.
 
-- `MaturityLiquidation`: `sigmaProp(HEIGHT >= SELF.R7[Int].get)`. Anyone may liquidate from the maturity
-  height on, exactly as V1 bonds allowed. Repayment closes at the same height, so there is never a block
-  in which both or neither are open.
+For the bond at `INPUTS(i)`, the bond always requires `OUTPUTS(i)` to use the compiled vault script,
+R4 = bond box id, and R5 = bond asset id. It also requires the singleton to be burned. **The liquidation
+expression controls eligibility, vault ERG value and vault tokens.** It can therefore enforce a
+conversion of collateral tokens into ERG or another agreed asset in the same transaction.
 
-A bond trusts its liquidation script completely. A script that is always true makes a bond liquidatable
-at once, so orders and offers name their script as a term, and both sides must check it.
+`MaturityLiquidation` implements the standard rule:
 
-## Changes from V1
-| | V1 | V2 |
-|---|---|---|
-| Lender | A public key in R8 | Whoever holds the bond asset; R8 is always the vault |
-| Lender's position | Not transferable | A bond asset, tradeable and claimed through the vault |
-| Repayment | Signed by the borrower | Anyone may pay it |
-| Liquidation | From maturity on, by anyone, collateral in full | Set by a liquidation script; `MaturityLiquidation` is V1's rule, less at most the batching fee |
-| Protocol fees | 0.5% dev fee, plus up to 0.5% UI fee | None |
-| Order and offer terms | Registers, one address per contract | Constants, one template per contract type |
-| Offers | Funded directly by the lender | Minted from a generator by an executor; cancelled by the lender's unit |
+- `HEIGHT >= R7`.
+- Vault tokens exactly equal the collateral tokens after the singleton.
+- Vault value is at least `bond.value - R6(1)`.
 
-SigmaFi V1's contracts, documentation and mainnet addresses remain in this repository's history, up to
-commit `5210d0c`.
+The executor keeps up to the batching fee and pays the miner fee from it. With a zero fee, the executor
+supplies the miner fee separately. Multiple bonds may liquidate together with bond input i settling
+into output i. The CLI currently builds only the standard maturity liquidation, including batching.
+Custom swap expressions and their transaction builders require their own review and implementation.
 
-## KYA / Note To Users
-Lenders should always be wary to ensure that the bond orders they accept match
-their own personal risk/reward ratio. Lenders of NFT-backed loans should also
-be sure that the NFTs used as collateral are real and minted by their original artists.
-Both sides should check a bond's liquidation script before agreeing to it, and buyers of a bond asset
-should verify it by its genesis box rather than its name.
-The creator of SigmaBonds is not responsible for the gain/loss of any digital
-assets and/or perceived value incurred through the use of SigmaBonds.
+Both parties must inspect the liquidation expression: an always-true expression can liquidate
+immediately and permit any vault payout value or tokens. The bond protects the destination and claim
+identity, while the chosen expression protects the economics.
+
+## Claim from the vault
+
+The circulating asset holder spends the vault settlement alongside their unit and burns it. The
+outputs are theirs to choose. Every vault box for the asset must be claimed in that same transaction;
+boxes sent there later are locked because the claim unit is gone.
+
+The vault assumes a verified two-unit mint and that the bond burned its own unit. The settlement
+transaction can also sweep any pre-existing vault boxes for that asset using the bond singleton;
+the protocol creates no vault settlement before closing the bond. Arbitrary donations to the vault
+and boxes carrying their own claim asset do not carry the protocol's provenance guarantees.
+
+## Development and evidence
+
+See [TESTING.md](./TESTING.md) for offline interpreter signing tests and CLI tests over `FakeNode`.
+The suites exercise both repayment assets, both order schedules, mint splitting, cancellation,
+repayment, maturity liquidation, batching, vault claims and an atomic collateral-to-ERG conversion
+with a funded counterparty. That conversion is a test expression, not a deployed DEX integration.
+Offline tests do not establish live-node admission, maximum transaction cost, storage-rent safety,
+deployment validity or a complete on-chain proof of bond provenance and current unspent status.
+
+SigmaFi V1 contracts and addresses remain in repository history through commit `5210d0c`.
+Lenders and borrowers must evaluate collateral authenticity and their own risk before agreeing to a loan.

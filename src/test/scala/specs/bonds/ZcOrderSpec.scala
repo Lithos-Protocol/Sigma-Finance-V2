@@ -45,7 +45,7 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
           (tree.header & 0x08).toByte should not be 0.toByte
         }
       }
-      Seq(fixed.templateHash, onClose.templateHash, offerTemplate(ctx).templateHash).map(_.toSeq).distinct.size shouldBe 3
+      Seq(fixed.templateHash, onClose.templateHash).map(_.toSeq).distinct.size shouldBe 2
     }
   }
 
@@ -110,6 +110,10 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
         val signed = accepts(f.prover, fillTx(f)())
         signed.getOutputsToSpend.asScala.flatMap(_.getTokens.asScala).filter(_.getId == f.asset)
           .map(_.getValue.longValue).sum shouldBe 2L
+        val outs = signed.getOutputsToSpend.asScala
+        outs(0).getTokens.get(0).getValue.longValue shouldBe 1L
+        outs(1).getTokens.get(0).getId shouldBe f.asset
+        outs(1).getTokens.get(0).getValue.longValue shouldBe 1L
       }
     }
 
@@ -127,13 +131,6 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
       withCtx { ctx =>
         val f = fillScenario(ctx, kind, style = style)
         accepts(f.prover, fillTx(f)(unitOut = f.unitOut.setContract(otherTree(ctx))))
-      }
-    }
-
-    property(s"$name fill: rejects repayment directed away from the vault, even to the lender's own wallet") {
-      withCtx { ctx =>
-        val f = fillScenario(ctx, kind, style = style)
-        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(8, bytesValue(hashOf(lenderTree(ctx))))))
       }
     }
 
@@ -172,7 +169,7 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
-    property(s"$name fill: rejects a lender address the bond could not read") {
+    property(s"$name fill: rejects a liquidation hash the bond could not read") {
       withCtx { ctx =>
         val f = fillScenario(ctx, kind, style = style)
         rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(8, ErgoValue.of(5L))))
@@ -182,7 +179,7 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
     property(s"$name fill: rejects a liquidation script the borrower did not ask for") {
       withCtx { ctx =>
         val f = fillScenario(ctx, kind, style = style)
-        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(9, bytesValue(alwaysTrue(ctx).hashedValueBytes))))
+        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(8, bytesValue(alwaysTrue(ctx).hashedValueBytes))))
       }
     }
 
@@ -227,6 +224,14 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
         val f = fillScenario(ctx, kind, style = style)
         rejectsAtSigning(f.prover, fillTx(f)(unitOut = f.unitOut.setTokens(),
           bondOut = f.bondOut.setTokens(Token(f.asset, 2L) +: defaultCollateral: _*)))
+      }
+    }
+
+    property(s"$name fill: rejects both units for the lender and none in the bond") {
+      withCtx { ctx =>
+        val f = fillScenario(ctx, kind, style = style)
+        rejectsAtSigning(f.prover, fillTx(f)(unitOut = f.unitOut.setTokens(Token(f.asset, 2L)),
+          bondOut = f.bondOut.setTokens(defaultCollateral: _*)))
       }
     }
 
@@ -281,6 +286,31 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
       val holder = lender(ctx)
       accepts(holder, build(ctx, Seq(settled, lenderUnit, funding(ctx, holder, 2)),
         Seq(UTXO(lenderTree(ctx), settled.value, settled.tokens)), holder.getAddress, burn = Seq(Token(asset, 1L))))
+    }
+
+    property(s"$name chain: the agreed liquidation converts collateral tokens to ERG, then the lender claims") {
+      withCtx { ctx =>
+        val script = converted(ctx)
+        val f = fillScenario(ctx, kind, style = style, liqScript = script)
+        val filled = accepts(f.prover, fillTx(f)())
+        val lenderUnit = spendOutput(filled, 0)
+        val bondIn = spendOutput(filled, 1).withCtxVar(0.toByte, liqVar(script))
+        val buyer = executor(ctx)
+        val proceeds = settlement(vault(ctx), bondIn.value + 2 * Parameters.OneErg, bondIn.id, f.asset)
+        val inputs = Seq(bondIn, funding(ctx, buyer, 1))
+
+        // The counterparty supplies ERG and receives the collateral tokens in its change, atomically.
+        val liquidated = accepts(buyer, buildAt(ctx, f.maturity, inputs, Seq(proceeds), buyer.getAddress,
+          burn = Seq(Token(f.asset, 1L))))
+        liquidated.getOutputsToSpend.asScala.filter(_.getErgoTree == contractOf(buyer).ergoTree)
+          .flatMap(_.getTokens.asScala).filter(_.getId == collateralToken)
+          .map(_.getValue.longValue).sum shouldBe 100L
+        rejectsAtSigning(buyer, buildAt(ctx, f.maturity, inputs, Seq(proceeds.subValue(1L)), buyer.getAddress,
+          burn = Seq(Token(f.asset, 1L))))
+        rejectsAtSigning(buyer, buildAt(ctx, f.maturity, inputs, Seq(proceeds.setTokens(defaultCollateral: _*)),
+          buyer.getAddress, burn = Seq(Token(f.asset, 1L))))
+        claim(ctx, f.asset, lenderUnit, spendOutput(liquidated, 0))
+      }
     }
 
     property(s"$name chain: order, fill, repay, and the lender's unit claims the repayment") {

@@ -18,7 +18,7 @@ class MaturityLiquidationSpec extends AnyPropSpec with BondSpecBase {
 
   import BondSpecBase._
 
-  property("the client's bytes are what a bond runs, and its hash is what R9 holds") {
+  property("the client's bytes are what a bond runs, and its hash is what R8 holds") {
     withCtx { ctx =>
       val script = ScriptGenerator.mkLiquidationScript(ctx, "MaturityLiquidation")
       script.hash.toSeq shouldBe Blake2b256.hash(script.bytes).toSeq

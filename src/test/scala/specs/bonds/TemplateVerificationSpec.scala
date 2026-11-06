@@ -13,7 +13,7 @@ import work.lithos.mutations.{Contract, Token, UTXO}
 
 /**
  * A template hash leaves out every constant, not only the terms. These pin down what that means for
- * verifying offers and orders, and that `ContractTemplate.matches` closes it.
+ * verifying orders, and that `ContractTemplate.matches` closes it.
  */
 class TemplateVerificationSpec extends AnyPropSpec with BondSpecBase {
 
@@ -35,36 +35,14 @@ class TemplateVerificationSpec extends AnyPropSpec with BondSpecBase {
     found.head
   }
 
-  property("stamped offers and orders match their templates, whatever their terms") {
+  property("stamped orders match their templates, whatever their terms") {
     withCtx { ctx =>
       Seq(
-        offerTemplate(ctx) -> Seq(offerTerms(ctx, ErgBond), offerTerms(ctx, TokenBond, fee = 0L)),
         orderTemplate(ctx) -> Seq(orderTerms(ctx, ErgBond), orderTerms(ctx, TokenBond, fee = 0L)),
         onCloseTemplate(ctx) -> Seq(onCloseTerms(ctx, ErgBond), onCloseTerms(ctx, TokenBond, duration = 30))
       ).foreach { case (t, terms) =>
         terms.foreach(term => t.matches(t.withTerms(term)) shouldBe true)
       }
-    }
-  }
-
-  property("every template pins the vault hash as a fixed constant, not a term") {
-    withCtx { ctx =>
-      val vault = Colls.fromArray(ScriptGenerator.vaultHash(ctx))
-      Seq(offerTemplate(ctx), orderTemplate(ctx), onCloseTemplate(ctx)).foreach { t =>
-        val i = indexOf(t, vault, SByteArray)
-        t.positions.values.toSeq should not contain i
-      }
-    }
-  }
-
-  property("an offer paying another vault has the same template hash, and does not match") {
-    withCtx { ctx =>
-      val t = offerTemplate(ctx)
-      val offer = t.withTerms(offerTerms(ctx, ErgBond))
-      val forged = forge(offer, indexOf(t, Colls.fromArray(ScriptGenerator.vaultHash(ctx)), SByteArray),
-        Colls.fromArray(hashOf(otherTree(ctx))), SByteArray)
-      sameTemplate(forged, offer) shouldBe true
-      t.matches(forged) shouldBe false
     }
   }
 
@@ -100,10 +78,26 @@ class TemplateVerificationSpec extends AnyPropSpec with BondSpecBase {
     }
   }
 
-  property("the generator and bonds have no terms: compare their whole trees, not templates") {
+  property("both bond scripts pin the vault hash; an order rejects a bond paying another vault") {
+    withCtx { ctx =>
+      for (kind <- Seq[Kind](ErgBond, TokenBond); style <- Seq[OrderStyle](FixedHeight, OnClose)) {
+        val tree = bondContract(ctx, kind).ergoTree
+        val pinned = Colls.fromArray(ScriptGenerator.vaultHash(ctx))
+        val positions = tree.constants.indices.filter(i => tree.constants(i).value == pinned)
+        positions.size shouldBe 1
+        val forged = forge(tree, positions.head, Colls.fromArray(hashOf(otherTree(ctx))), SByteArray)
+        sameTemplate(tree, forged) shouldBe true
+        forged.bytes.toSeq should not equal tree.bytes.toSeq
+        val f = fillScenario(ctx, kind, style = style)
+        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.setContract(Contract(forged))))
+      }
+    }
+  }
+
+  property("the ERG bond and vault have no terms: compare their whole trees, not templates") {
     withCtx { ctx =>
       // each has one address; a forged literal changes the tree bytes, so an address check is enough
-      Seq(generator(ctx), bondContract(ctx, ErgBond), vault(ctx)).foreach { c =>
+      Seq(bondContract(ctx, ErgBond), vault(ctx)).foreach { c =>
         val i = c.ergoTree.constants.indexWhere(_.tpe == SLong)
         i should be >= 0
         forge(c.ergoTree, i, 123456789L, SLong).bytes.toSeq should not equal c.ergoTree.bytes.toSeq

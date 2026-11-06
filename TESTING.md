@@ -20,7 +20,7 @@ shared with c-bonds; anything in this file or the repository takes precedence ov
 | `src/main/scala/mutations/NodeWallet.scala` | the miner-reward-delay constant the above needs |
 | `src/test/scala/specs/harness/` | `ContractSpecBase`, `HarnessProbeSpec` |
 | `src/test/scala/specs/<product>/` | one `<Product>SpecBase` plus one suite per contract |
-| `src/test/scala/specs/bonds/` | `BondSpecBase`; suites for the ZC bonds, offer, order, `MaturityLiquidation`, `BondAssetVault`, `BondNFT_Generator`, and template verification |
+| `src/test/scala/specs/bonds/` | `BondSpecBase`; suites for the ZC bonds, orders, `MaturityLiquidation`, `BondAssetVault`, template verification and collateral conversion |
 | `src/test/scala/specs/app/` | `SigmaFiAppSpec`: the CLI's App end to end, over `FakeNode`, an in-memory chain served as the node's index and wallet JSON |
 
 The mutations package keeps its Lithos name rather than the `org.lithosprotocol.sigmafi` prefix so
@@ -92,7 +92,7 @@ name.
   condition that reads a register or an index off a foreign box. c-bonds shipped exactly this bug:
   cancel died on `None.get` while every negative still passed, because a throw reads as a
   rejection.
-- **A template term must never sit in a constant-only expression.** Offers and orders are compiled
+- **A template term must never sit in a constant-only expression.** Orders are compiled
   once with sentinel values and stamped by swapping constants. The compiler folds any expression made
   only of constants, so `CONST_DURATION >= 30` became `true` at the sentinel and disappeared: every
   order stamped from that template, a 29-block one included, skipped the check. Write such checks

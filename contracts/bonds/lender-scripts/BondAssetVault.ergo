@@ -1,6 +1,6 @@
 {
     // Bond Asset Vault - May be spent with the bond asset, as long as the asset is burned.
-    // A bond whose lenderHash names this vault pays its repayment or liquidated collateral here, and
+    // Every bond pins this vault's hash and pays its repayment or liquidation proceeds here, and
     // whoever holds the circulating bond asset claims it. The asset is the bearer claim on the bond.
     // One vault serves every bond: it has no constants, so every tradeable bond names the same hash.
     //
