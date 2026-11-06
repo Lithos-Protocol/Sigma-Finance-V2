@@ -148,7 +148,7 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
    * Tx 2B: pay the principal and create the bond. The order is INPUTS(0), so the fill mints the bond asset;
    * this wallet's unit, at OUTPUTS(0), names it.
    */
-  def fillOrder(orderId: String, name: String, description: String): Prepared = {
+  def fillOrder(orderId: String): Prepared = {
     val order = protocol.asOrder(unspent(orderId)).getOrElse(fail(s"$orderId is not a SigmaFi order"))
     val repayToken = protocol.pairedBond(order.bondHash, order.principalTokens)
       .getOrElse(fail("the order's bond contract does not match its principal, so its bond could not be repaid as asked"))
@@ -170,7 +170,8 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
     val asset = order.box.id
 
     val unit = UTXO(Contract(myTree), MinBox, Seq(Token(asset, 1L)),
-      Seq(utf8Value(name), utf8Value(description), utf8Value("0")))
+      Seq(utf8Value(BondAssetMetadata.name(asset)),
+        utf8Value(BondAssetMetadata.description(order, repayToken, maturity, height, liq.name)), utf8Value("0")))
     val bond = UTXO(protocol.bondContract(repayToken), order.box.value, Token(asset, 1L) +: order.box.tokens,
       Seq(bytesValue(asset.getBytes), bytesValue(order.borrowerHash),
         longsValue(order.repayment, order.batchingFee), intValue(maturity),

@@ -41,7 +41,7 @@ object SigmaFiCli {
       |  claims                             bond assets in your wallet whose bond has paid the vault
       |
       |Lender:
-      |  fill-order <order box id> [--name <text>] [--description <text>]
+      |  fill-order <order box id>          mint the named bond asset with its terms as JSON metadata
       |  claim <bond asset id>               collect a repaid or liquidated bond from the vault
       |
       |Borrower:
@@ -65,9 +65,6 @@ object SigmaFiCli {
 
   private val DefaultNode = "http://127.0.0.1:9053"
   private val DefaultBatchingFee = "0.002"
-  private val DefaultName = "SigmaFi Bond"
-  private val DefaultDescription =
-    "SigmaFi V2 zero-coupon bond asset. Verify it by its genesis box, never by its name."
 
   def main(args: Array[String]): Unit = {
     val code =
@@ -123,8 +120,6 @@ object SigmaFiCli {
       case Seq(id) => id
       case _ => throw CliError(s"${a.command.get} takes one argument: the $what")
     }
-    def name = a.opt("name").getOrElse(DefaultName)
-    def description = a.opt("description").getOrElse(DefaultDescription)
 
     a.command.get match {
       case "info" => info(app, node, a)
@@ -132,7 +127,7 @@ object SigmaFiCli {
       case "bonds" => listBonds(app, node, a.flag("mine"), a.flag("liquidatable"))
       case "claims" => listClaims(app, node)
 
-      case "fill-order" => app.submit(app.fillOrder(one("order box id"), name, description))
+      case "fill-order" => app.submit(app.fillOrder(one("order box id")))
       case "claim" => app.submit(app.claim(one("bond asset id")))
 
       case "create-order" => app.submit(app.createOrder(loan(a), schedule(a, app)))
@@ -289,7 +284,7 @@ object Args {
   val Flags: Set[String] = Set("send", "mine", "liquidatable", "help")
   val Options: Set[String] = Set("node", "api-key", "wallet-pass", "address", "fee",
     "principal", "principal-token", "repayment", "collateral-erg", "collateral-token", "batching-fee",
-    "liquidation", "maturity", "term", "duration", "name", "description")
+    "liquidation", "maturity", "term", "duration")
 
   def parse(args: Seq[String]): Args = {
     val positional = Vector.newBuilder[String]

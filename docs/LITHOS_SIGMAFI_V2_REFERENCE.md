@@ -90,6 +90,32 @@ An order's optional hint is never read by the contracts. Without it, resolve the
 wallet knowledge or the order's creating transaction; verify its full-tree hash before using it.
 Names/descriptions and any client metadata never authenticate an asset.
 
+### Generated EIP-4 metadata
+
+`src/main/scala/app/BondAssetMetadata.scala` generates issuance metadata when an order is filled. The name is
+`SigmaFi-ZC-Bond-<first6>`, with the first six hexadecimal characters of the asset id, matching LithosDex's
+LD-NFT suffix length. The CLI generates both name and description; it takes no manual metadata flags.
+The compact JSON description keeps the older Lithos SigmaFi field names and adds identifiers/build context:
+
+| JSON field | Value |
+|---|---|
+| `type` | `"SigmaFi ZC-Bond"`, retained for compatibility with the older JSON description |
+| `bondAsset` | Full token id, equal to the spent order box id |
+| `borrowerHash` | Borrower full-ErgoTree blake2b256, hex |
+| `principal` | `{ "nanoErgs": Long, "tokens": [{ "id": hex, "amount": Long }] }` for the planned principal output |
+| `repayment` / `repayToken` | Raw repayment amount and token-id hex, or `"ERG"` for nanoERG repayment |
+| `maturity` | Actual stamped bond R7 for either schedule |
+| `durationBlocks` | Requested duration, present only for on-close orders |
+| `collateral` | Same nanoERG/tokens shape as principal; excludes the minted bond singleton |
+| `batchingFee` | Maximum nanoERG fee used by the standard maturity liquidation |
+| `liquidation` / `liquidationHash` | Known expression name and raw-expression blake2b256, hex |
+| `height` | Build-context height, not confirmed inclusion height |
+
+R4/R5/R6 on the lender's issuing unit remain UTF-8 name, JSON description and `"0"` decimals. Long
+amounts are emitted as exact integer JSON numbers; consumers must preserve integer precision. The bond
+box id is not included: it depends on the assembled transaction, which itself includes this metadata.
+Metadata is a display snapshot and must not replace authenticated order/bond reads.
+
 ## Transaction assembly and index pairing
 
 | Operation | Inputs | Required outputs | Context and burn |

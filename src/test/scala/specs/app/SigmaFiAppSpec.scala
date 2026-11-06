@@ -93,6 +93,17 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
     case Success(_) => fail("expected a refusal, but it was accepted")
   }
 
+  /** Read the actual issuing output, including metadata that has gone through transaction signing. */
+  private def mintedMetadata(tx: SignedTransaction, asset: ErgoId): io.circe.Json = {
+    val unit = tx.getOutputsToSpend.get(0)
+    def text(r: Int): String =
+      new String(unit.getRegisters.get(r).getValue.asInstanceOf[sigma.Coll[Byte]].toArray, "UTF-8")
+    unit.getTokens.get(0).getId shouldBe asset
+    text(0) shouldBe s"SigmaFi-ZC-Bond-${asset.toString.take(6)}"
+    text(2) shouldBe "0"
+    io.circe.parser.parse(text(1)).fold(e => fail(s"invalid EIP-4 JSON: $e"), identity)
+  }
+
   // ═══ BORROWER ORDERS ══════════════════════════════════════════════════════
 
   property("order: created, filled, repaid, and the lender's unit claims the repayment") {
@@ -108,12 +119,30 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
       order.box.tokens shouldBe Seq(Token(collateralToken, 100L))
       treesReg(order.box, 4).map(hashOf).map(_.toSeq) shouldBe Seq(order.borrowerHash.toSeq)
 
-      w.run(l, w.app(l).fillOrder(order.box.id.toString, "SigmaFi Bond", "spec"))
+      val filled = w.run(l, w.app(l).fillOrder(order.box.id.toString))
       w.app(l).orders() shouldBe empty
       val bond = w.app(b).bonds().loneElement
       bond.asset shouldBe order.box.id
       bond.maturity shouldBe ctx.getHeight + 1000
       bond.collateral shouldBe Seq(Token(collateralToken, 100L))
+      val metadata = mintedMetadata(filled, bond.asset).hcursor
+      metadata.get[String]("type").toOption shouldBe Some("SigmaFi ZC-Bond")
+      metadata.get[String]("bondAsset").toOption shouldBe Some(bond.asset.toString)
+      metadata.get[String]("borrowerHash").toOption shouldBe Some(scorex.util.encode.Base16.encode(order.borrowerHash))
+      metadata.downField("principal").get[Long]("nanoErgs").toOption shouldBe Some(erg("5"))
+      metadata.downField("principal").get[Vector[io.circe.Json]]("tokens").toOption shouldBe Some(Vector.empty)
+      metadata.get[Long]("repayment").toOption shouldBe Some(erg("6"))
+      metadata.get[String]("repayToken").toOption shouldBe Some("ERG")
+      metadata.get[Int]("maturity").toOption shouldBe Some(bond.maturity)
+      metadata.downField("collateral").get[Long]("nanoErgs").toOption shouldBe Some(erg("10"))
+      metadata.downField("collateral").downField("tokens").downArray.get[String]("id").toOption shouldBe
+        Some(collateralToken.toString)
+      metadata.downField("collateral").downField("tokens").downArray.get[Long]("amount").toOption shouldBe Some(100L)
+      metadata.get[Long]("batchingFee").toOption shouldBe Some(bond.batchingFee)
+      metadata.get[String]("liquidation").toOption shouldBe Some("MaturityLiquidation")
+      metadata.get[String]("liquidationHash").toOption shouldBe Some(scorex.util.encode.Base16.encode(bond.liqScriptHash))
+      metadata.get[Int]("height").toOption shouldBe Some(ctx.getHeight)
+      metadata.downField("durationBlocks").succeeded shouldBe false
       w.app(l).walletHolds(bond.asset) shouldBe true
       w.balance(b)._1 shouldBe erg("20") - erg("10") - Parameters.MinFee + erg("5")
 
@@ -142,10 +171,18 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
       order.schedule shouldBe OnClose(720)
       order.principalTokens shouldBe Seq(Token(stable, 600L))
 
-      w.run(l, w.app(l).fillOrder(order.box.id.toString, "SigmaFi Bond", "spec"))
+      val filled = w.run(l, w.app(l).fillOrder(order.box.id.toString))
       val bond = w.app(b).bonds().loneElement
       bond.repayToken shouldBe Some(stable)
       bond.maturity shouldBe ctx.getHeight + 720
+      val metadata = mintedMetadata(filled, bond.asset).hcursor
+      metadata.downField("principal").get[Long]("nanoErgs").toOption shouldBe Some(MinBox)
+      metadata.downField("principal").downField("tokens").downArray.get[String]("id").toOption shouldBe Some(stable.toString)
+      metadata.downField("principal").downField("tokens").downArray.get[Long]("amount").toOption shouldBe Some(600L)
+      metadata.get[Long]("repayment").toOption shouldBe Some(700L)
+      metadata.get[String]("repayToken").toOption shouldBe Some(stable.toString)
+      metadata.get[Int]("maturity").toOption shouldBe Some(bond.maturity)
+      metadata.get[Int]("durationBlocks").toOption shouldBe Some(720)
       w.balance(b)._2.get(stable) shouldBe Some(700L)
 
       w.run(b, w.app(b).repay(bond.box.id.toString))
@@ -175,7 +212,7 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
 
       val order = w.app(l).orders().loneElement
       treesReg(order.box, 4) shouldBe empty
-      w.run(l, w.app(l).fillOrder(order.box.id.toString, "SigmaFi Bond", "spec"))
+      w.run(l, w.app(l).fillOrder(order.box.id.toString))
       w.balance(b)._1 shouldBe erg("20") - erg("10") - Parameters.MinFee + erg("5")
     }
   }
@@ -190,6 +227,23 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
       w.run(b, w.app(b).cancelOrder(order.box.id.toString))
       w.app(b).orders() shouldBe empty
       w.balance(b) shouldBe ((erg("20") - 2 * Parameters.MinFee, Map(collateralToken -> 100L)))
+    }
+  }
+
+  property("order: metadata preserves token amounts above double precision") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, l) = (borrower(ctx), lender(ctx))
+      val principal = 9007199254740993L
+      val repayment = principal + 100L
+      val loan = tokenLoan.copy(principalToken = Some(Token(stable, principal)), repayment = repayment)
+      w.fund(b, erg("20"), Token(collateralToken, 100L))
+      w.fund(l, erg("5"), Token(stable, principal))
+      w.run(b, w.app(b).createOrder(loan, FixedMaturity(ctx.getHeight + 1000)))
+      val order = w.app(l).orders().loneElement
+      val metadata = mintedMetadata(w.run(l, w.app(l).fillOrder(order.box.id.toString)), order.box.id).hcursor
+      metadata.downField("principal").downField("tokens").downArray.get[Long]("amount").toOption shouldBe Some(principal)
+      metadata.get[Long]("repayment").toOption shouldBe Some(repayment)
     }
   }
 

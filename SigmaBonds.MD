@@ -24,7 +24,8 @@ Verify the mint's genesis box as a genuine `ZC_Order` or `ZC_OrderOnClose` insta
 `ScriptGenerator.ContractTemplate.matches`. A template hash alone omits **every** constant: a forged
 order with a different mint amount can share the genuine template hash. Also verify the named bond
 contract, repayment asset and liquidation expression against the intended protocol and terms.
-Asset names and EIP-4 metadata are the lender's choice and prove nothing.
+The CLI generates EIP-4 metadata from the fill's terms, as described below. Other clients may choose
+different metadata; names and descriptions prove nothing.
 
 The two-unit split is a starting point for on-chain association with an unspent bond, not a complete
 on-chain authentication mechanism. Anyone can fund a box under a genuine bond script with arbitrary
@@ -101,6 +102,16 @@ For a fill, the order is `INPUTS(0)` and the lender supplies the principal:
 The order pins bond R4-R8 and requires exactly two new units across **all** outputs. The lender unit
 is the first output carrying the asset, so its R4-R6 define EIP-4 name, description and decimals.
 One order fills per transaction.
+
+The CLI names the lender's issuing unit `SigmaFi-ZC-Bond-` followed by the first six hexadecimal
+characters of its token id, matching LithosDex's `LD-NFT-` suffix convention. R5 is compact UTF-8 JSON,
+using the older Lithos SigmaFi bond field names for principal, repayment, collateral and liquidation.
+It includes the full bond asset id, borrower hash, principal nanoERG/tokens, repayment amount and asset,
+actual stamped maturity, collateral nanoERG/tokens, batching fee, liquidation name/hash and build height.
+On-close orders additionally include their requested `durationBlocks`; both schedules include the actual
+maturity. Amounts use integer nanoERG or raw token units. Build height is not a confirmation height,
+and the minted bond box id is not included because it is not known before the transaction is assembled.
+R6 remains UTF-8 `"0"` for zero decimals. The description is generated at fill time, not a static default.
 
 Fixed maturity must be at least two blocks above inclusion height, leaving a full block to repay.
 Borrowers should cancel orders left open near maturity. An on-close order requires at least 30 blocks

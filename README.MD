@@ -37,6 +37,9 @@ wallet, it locks it again when it is done.
 The CLI writes an optional order R4 hint that no contract reads: the borrower's ErgoTree, whose hash
 is an order term (see [SigmaBonds](./SigmaBonds.MD)). It lets any lender fill an order without asking
 the borrower for that tree. Filling mints two bond-asset units, one in the bond and one for the lender.
+The lender's unit is named `SigmaFi-ZC-Bond-<first6>`, using the first six token-ID characters. Its EIP-4
+description is generated JSON containing the loan terms and identifiers available when building the fill;
+there are no manual `--name` or `--description` options.
 Bond recognition does not establish mint provenance; the complete on-chain verification mechanism
 remains to be designed. The CLI currently builds `MaturityLiquidation`; contracts permit custom
 liquidation expressions to control both the vault's ERG and its tokens.
