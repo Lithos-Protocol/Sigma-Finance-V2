@@ -42,6 +42,8 @@ remains to be designed. The CLI currently builds `MaturityLiquidation`; contract
 liquidation expressions to control both the vault's ERG and its tokens.
 
 ## Development
+- [Lithos integration reference](./docs/LITHOS_SIGMAFI_V2_REFERENCE.md): generated ErgoTrees, template hex,
+  hashes, constant registries, box/transaction layouts and the Lithos migration map.
 - [TESTING.md](./TESTING.md): the offline contract specs, and how to write them.
 - `sbt "runMain ksingh.sigmabonds.client.ContractClient"` prints the current V2 addresses, script hashes,
   liquidation scripts and order templates.

@@ -8,6 +8,12 @@ sbt test                                                       # everything
 sbt "testOnly org.lithosprotocol.sigmafi.specs.harness.*"      # the harness probe
 ```
 
+The [Lithos integration reference](./docs/LITHOS_SIGMAFI_V2_REFERENCE.md) pins compiled bytes for the
+client rewrite. Regenerate its marked block with
+`sbt "Test / runMain org.lithosprotocol.sigmafi.specs.bonds.LithosReference --write"`, or verify it with
+`--check`. `BondProbeSpec` checks for drift in the default suite. The exporter uses the same offline
+V6 context and `ScriptGenerator` as the contract specs; it never contacts a live node.
+
 The rules behind the method are in [ERGOSCRIPT_TESTING_GENERAL.MD](./ERGOSCRIPT_TESTING_GENERAL.MD)
 and [ERGOSCRIPT_RULES_GENERAL.MD](./ERGOSCRIPT_RULES_GENERAL.MD). Both are project-neutral and
 shared with c-bonds; anything in this file or the repository takes precedence over them.

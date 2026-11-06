@@ -48,4 +48,18 @@ class BondProbeSpec extends AnyPropSpec with BondSpecBase {
       bondContract(ctx, TokenBond).ergoTreeHex should include(stableToken.toString)
     }
   }
+
+  property("the Lithos integration reference matches current compiler output") {
+    withCtx(LithosReference.check)
+  }
+
+  property("the exported token prototype substitutes to the directly compiled SigUSD bond") {
+    withCtx { ctx =>
+      val template = LithosReference.tokenPrototype(ctx)
+      val substituted = template.withTerms(LithosReference.tokenTerms(LithosReference.SigUsd))
+      val direct = ksingh.sigmabonds.client.ScriptGenerator.mkZcBondContract(ctx, Some(LithosReference.SigUsd)).getErgoTree
+      substituted.bytes.toSeq shouldBe direct.bytes.toSeq
+      template.matches(direct) shouldBe true
+    }
+  }
 }
