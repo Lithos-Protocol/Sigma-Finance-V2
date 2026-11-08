@@ -81,10 +81,10 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
   }
 
   private def ergLoan(collateral: Seq[Token] = Seq(Token(collateralToken, 100L))): Loan =
-    Loan(erg("5"), None, erg("6"), erg("0.002"), erg("10"), collateral, "MaturityLiquidation")
+    Loan(erg("5"), None, erg("6"), erg("10"), collateral, "MaturityLiquidation")
 
   private def tokenLoan: Loan =
-    Loan(MinBox, Some(Token(stable, 600L)), 700L, erg("0.002"), erg("10"), Seq(Token(collateralToken, 100L)),
+    Loan(MinBox, Some(Token(stable, 600L)), 700L, erg("10"), Seq(Token(collateralToken, 100L)),
       "MaturityLiquidation")
 
   private def refused(f: => Any): String = Try(f) match {
@@ -119,12 +119,18 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
       order.box.tokens shouldBe Seq(Token(collateralToken, 100L))
       treesReg(order.box, 4).map(hashOf).map(_.toSeq) shouldBe Seq(order.borrowerHash.toSeq)
 
-      val filled = w.run(l, w.app(l).fillOrder(order.box.id.toString))
+      val filled = w.run(l, w.app(l).fillOrder(order.box.id.toString, erg("0.007")))
       w.app(l).orders() shouldBe empty
       val bond = w.app(b).bonds().loneElement
       bond.asset shouldBe order.box.id
       bond.maturity shouldBe ctx.getHeight + 1000
       bond.collateral shouldBe Seq(Token(collateralToken, 100L))
+      bond.principalErg shouldBe order.principalErg
+      bond.principalTokens shouldBe order.principalTokens
+      bond.batchingFee shouldBe erg("0.007")
+      bond.box.value shouldBe order.box.value + bond.batchingFee
+      bond.collateralErg shouldBe order.box.value
+      w.balance(l)._1 shouldBe erg("20") - erg("5") - bond.batchingFee - Parameters.MinFee
       val metadata = mintedMetadata(filled, bond.asset).hcursor
       metadata.get[String]("type").toOption shouldBe Some("SigmaFi ZC-Bond")
       metadata.get[String]("bondAsset").toOption shouldBe Some(bond.asset.toString)
@@ -133,7 +139,7 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
       metadata.downField("principal").get[Vector[io.circe.Json]]("tokens").toOption shouldBe Some(Vector.empty)
       metadata.get[Long]("repayment").toOption shouldBe Some(erg("6"))
       metadata.get[String]("repayToken").toOption shouldBe Some("ERG")
-      metadata.get[Int]("maturity").toOption shouldBe Some(bond.maturity)
+      metadata.get[Long]("maturity").toOption shouldBe Some(bond.maturity)
       metadata.downField("collateral").get[Long]("nanoErgs").toOption shouldBe Some(erg("10"))
       metadata.downField("collateral").downField("tokens").downArray.get[String]("id").toOption shouldBe
         Some(collateralToken.toString)
@@ -146,7 +152,12 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
       w.app(l).walletHolds(bond.asset) shouldBe true
       w.balance(b)._1 shouldBe erg("20") - erg("10") - Parameters.MinFee + erg("5")
 
-      w.run(b, w.app(b).repay(bond.box.id.toString))
+      val beforeRepayment = w.balance(b)._1
+      val repaid = w.run(b, w.app(b).repay(bond.box.id.toString))
+      repaid.getOutputsToSpend.get(0).getValue shouldBe bond.repayment + bond.batchingFee
+      repaid.getOutputsToSpend.get(0).getRegisters.get(2).getValue shouldBe 0.toByte
+      repaid.getOutputsToSpend.get(1).getValue shouldBe order.box.value
+      w.balance(b)._1 shouldBe beforeRepayment + order.box.value - bond.repayment - Parameters.MinFee
       w.app(b).bonds() shouldBe empty
       w.balance(b)._2.get(collateralToken) shouldBe Some(100L)
       w.app(l).vaultBoxes().keySet shouldBe Set(bond.asset)
@@ -155,7 +166,7 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
       w.run(l, w.app(l).claim(bond.asset.toString))
       w.app(l).vaultBoxes() shouldBe empty
       w.app(l).walletHolds(bond.asset) shouldBe false
-      w.balance(l)._1 shouldBe before + erg("6") - Parameters.MinFee
+      w.balance(l)._1 shouldBe before + erg("6") + bond.batchingFee - Parameters.MinFee
     }
   }
 
@@ -174,6 +185,8 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
       val filled = w.run(l, w.app(l).fillOrder(order.box.id.toString))
       val bond = w.app(b).bonds().loneElement
       bond.repayToken shouldBe Some(stable)
+      bond.principalErg shouldBe MinBox
+      bond.principalTokens shouldBe Seq(Token(stable, 600L))
       bond.maturity shouldBe ctx.getHeight + 720
       val metadata = mintedMetadata(filled, bond.asset).hcursor
       metadata.downField("principal").get[Long]("nanoErgs").toOption shouldBe Some(MinBox)
@@ -181,7 +194,7 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
       metadata.downField("principal").downField("tokens").downArray.get[Long]("amount").toOption shouldBe Some(600L)
       metadata.get[Long]("repayment").toOption shouldBe Some(700L)
       metadata.get[String]("repayToken").toOption shouldBe Some(stable.toString)
-      metadata.get[Int]("maturity").toOption shouldBe Some(bond.maturity)
+      metadata.get[Long]("maturity").toOption shouldBe Some(bond.maturity)
       metadata.get[Int]("durationBlocks").toOption shouldBe Some(720)
       w.balance(b)._2.get(stable) shouldBe Some(700L)
 
@@ -203,7 +216,7 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
       val loan = ergLoan()
       val tree = w.protocol.orderTemplate.withTerms(ksingh.sigmabonds.client.ScriptGenerator.OrderTerms(
         w.protocol.ergBond.hashedPropBytes, hashOf(b.getAddress.toErgoContract.getErgoTree), loan.principalErg,
-        Seq.empty, loan.repayment, loan.batchingFee, ctx.getHeight + 1000,
+        Seq.empty, loan.repayment, ctx.getHeight + 1000,
         w.protocol.liquidation("MaturityLiquidation").hash))
       val uTx = TxBuilder(ctx).setInputs(funds)
         .setOutputs(UTXO(Contract(tree), loan.collateralErg, loan.collateralTokens))
@@ -247,15 +260,61 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
     }
   }
 
+  property("fill: rejects negative reserves and overflow; Long maturity survives reading and metadata") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, l) = (borrower(ctx), lender(ctx))
+      w.fund(b, erg("20"), Token(collateralToken, 100L))
+      w.fund(l, erg("20"))
+      w.run(b, w.app(b).createOrder(ergLoan(), FixedMaturity(Long.MaxValue)))
+      val order = w.app(l).orders().loneElement
+      refused(w.app(l).fillOrder(order.box.id.toString, -1L)) should include("cannot be negative")
+      refused(w.app(l).fillOrder(order.box.id.toString, Long.MaxValue)) should include("overflows")
+      val filled = w.run(l, w.app(l).fillOrder(order.box.id.toString, 0L))
+      val bond = w.app(b).bonds().loneElement
+      bond.maturity shouldBe Long.MaxValue
+      bond.batchingFee shouldBe 0L
+      mintedMetadata(filled, bond.asset).hcursor.get[Long]("maturity").toOption shouldBe Some(Long.MaxValue)
+      w.run(b, w.app(b).repay(bond.box.id.toString))
+    }
+  }
+
+  property("fill: on-close durations above Int.MaxValue retain their full Long maturity") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, l) = (borrower(ctx), lender(ctx))
+      val duration = Int.MaxValue.toLong + 1000L
+      w.fund(b, erg("20"), Token(collateralToken, 100L))
+      w.fund(l, erg("20"))
+      w.run(b, w.app(b).createOrder(ergLoan(), OnClose(duration)))
+      val order = w.app(l).orders().loneElement
+      order.schedule shouldBe OnClose(duration)
+      w.run(l, w.app(l).fillOrder(order.box.id.toString))
+      w.app(b).bonds().loneElement.maturity shouldBe ctx.getHeight.toLong + duration
+    }
+  }
+
+  property("fill: on-close maturity addition rejects Long overflow") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, l) = (borrower(ctx), lender(ctx))
+      w.fund(b, erg("20"), Token(collateralToken, 100L))
+      w.fund(l, erg("20"))
+      w.run(b, w.app(b).createOrder(ergLoan(), OnClose(Long.MaxValue)))
+      val order = w.app(l).orders().loneElement
+      refused(w.app(l).fillOrder(order.box.id.toString)) should include("overflows")
+    }
+  }
+
   // ═══ BONDS ════════════════════════════════════════════════════════════════
 
   /** A bond made by some earlier fill, with the lender's unit in the lender's wallet. */
   private def liveBond(w: World, asset: ErgoId, maturity: Int, fee: Long, b: ErgoProver, l: ErgoProver): BondInfo = {
     val p = w.protocol
     w.fund(l, erg("0.01"), Token(asset, 1L))
-    val box = w.seed(UTXO(p.ergBond, erg("10"), Seq(Token(asset, 1L), Token(collateralToken, 50L)), Seq(
+    val box = w.seed(UTXO(p.ergBond, erg("10") + fee, Seq(Token(asset, 1L), Token(collateralToken, 50L)), Seq(
       bytesValue(Array.fill(32)(9.toByte)), bytesValue(hashOf(b.getAddress.toErgoContract.getErgoTree)),
-      longsValue(erg("6"), fee), intValue(maturity), bytesValue(p.liquidation("MaturityLiquidation").hash))))
+      longsValue(erg("6"), fee, erg("5"), maturity.toLong), tokensValue(Seq.empty), bytesValue(p.liquidation("MaturityLiquidation").hash))))
     p.asBond(box).get
   }
 
@@ -270,7 +329,9 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
       w.app(e).bonds().map(_.box.id).toSet shouldBe bonds.map(_.box.id).toSet
       val prepared = w.app(e).liquidate(bonds.map(_.box.id.toString))
       prepared.tx.getInputs.asScala.map(_.getId) shouldBe bonds.map(_.box.id)
-      w.run(e, prepared)
+      val liquidated = w.run(e, prepared)
+      liquidated.getOutputsToSpend.get(0).getRegisters.get(2).getValue shouldBe 1.toByte
+      liquidated.getOutputsToSpend.get(1).getRegisters.get(2).getValue shouldBe 1.toByte
       w.balance(e)._1 shouldBe erg("0.006") - Parameters.MinFee
 
       w.app(l).vaultBoxes().keySet shouldBe Set(a1, a2)

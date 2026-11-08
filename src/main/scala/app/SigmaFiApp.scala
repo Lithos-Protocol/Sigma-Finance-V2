@@ -3,7 +3,7 @@ package app
 
 import io.circe.Json
 import ksingh.sigmabonds.client.ScriptGenerator.{OnCloseOrderTerms, OrderTerms}
-import org.ergoplatform.appkit.{Address, BlockchainContext, NetworkType, Parameters, UnsignedTransaction}
+import org.ergoplatform.appkit.{Address, BlockchainContext, ErgoValue, NetworkType, Parameters, UnsignedTransaction}
 import org.ergoplatform.sdk.ErgoId
 import scorex.util.encode.Base16
 import sigma.ast.ErgoTree
@@ -26,7 +26,6 @@ case class AppSettings(address: Option[String] = None,
 case class Loan(principalErg: Long,
                 principalToken: Option[Token],
                 repayment: Long,
-                batchingFee: Long,
                 collateralErg: Long,
                 collateralTokens: Seq[Token],
                 liquidation: String) {
@@ -148,21 +147,22 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
    * Tx 2B: pay the principal and create the bond. The order is INPUTS(0), so the fill mints the bond asset;
    * this wallet's unit, at OUTPUTS(0), names it.
    */
-  def fillOrder(orderId: String): Prepared = {
+  def fillOrder(orderId: String, batchingFee: Long = 2000000L): Prepared = {
+    if (batchingFee < 0L) fail("the batching fee cannot be negative")
     val order = protocol.asOrder(unspent(orderId)).getOrElse(fail(s"$orderId is not a SigmaFi order"))
+    if (order.principalErg < MinBox || order.repayment <= 0L) fail("the order has invalid principal or repayment terms")
     val repayToken = protocol.pairedBond(order.bondHash, order.principalTokens)
       .getOrElse(fail("the order's bond contract does not match its principal, so its bond could not be repaid as asked"))
     val liq = protocol.liquidationOf(order.liqScriptHash)
       .getOrElse(fail("the order names a liquidation script this client does not know"))
-    if (order.batchingFee < 0 || order.box.value - order.batchingFee < MinBox)
-      fail("the order's batching fee leaves its bond under 0.001 ERG, so it cannot be filled")
+    val bondValue = addAmount(order.box.value, batchingFee)
     val maturity = order.schedule match {
       case FixedMaturity(h) =>
-        if (h <= height + 2) fail(s"the order matures at $h, too close to the current height $height to fill")
+        if (h <= height.toLong + 2L) fail(s"the order matures at $h, too close to the current height $height to fill")
         h
       case OnClose(d) =>
         if (d < 30) fail(s"the order's duration of $d blocks is under the 30-block minimum, so it cannot be filled")
-        height + d
+        addAmount(height.toLong, d)
     }
     val borrower = treeFor(order.borrowerHash, order.box, treesReg(order.box, 4)).getOrElse(fail(
       "cannot find the borrower's ErgoTree: the order carries no hint, and no box in the transaction that " +
@@ -171,20 +171,20 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
 
     val unit = UTXO(Contract(myTree), MinBox, Seq(Token(asset, 1L)),
       Seq(utf8Value(BondAssetMetadata.name(asset)),
-        utf8Value(BondAssetMetadata.description(order, repayToken, maturity, height, liq.name)), utf8Value("0")))
-    val bond = UTXO(protocol.bondContract(repayToken), order.box.value, Token(asset, 1L) +: order.box.tokens,
+        utf8Value(BondAssetMetadata.description(order, repayToken, maturity, height, liq.name, batchingFee)), utf8Value("0")))
+    val bond = UTXO(protocol.bondContract(repayToken), bondValue, Token(asset, 1L) +: order.box.tokens,
       Seq(bytesValue(asset.getBytes), bytesValue(order.borrowerHash),
-        longsValue(order.repayment, order.batchingFee), intValue(maturity),
+        longsValue(order.repayment, batchingFee, order.principalErg, maturity), tokensValue(order.principalTokens),
         bytesValue(order.liqScriptHash)))
     val principal = UTXO(Contract(borrower), math.max(order.principalErg, MinBox), order.principalTokens)
 
     val notes = Seq(
       s"lend: ${Fmt.principal(order.principalErg, order.principalTokens)}",
       s"repaid: ${Fmt.amount(order.repayment, repayToken)} by height $maturity (${maturity - height} blocks)",
-      s"collateral: ${Fmt.contents(order.box.value, order.box.tokens)}, less at most ${Fmt.erg(order.batchingFee)} " +
-        s"to a liquidator; liquidation: ${liq.name}",
+      s"collateral: ${Fmt.contents(order.box.value, order.box.tokens)}; liquidation: ${liq.name}",
+      s"You fund an additional ${Fmt.erg(batchingFee)} liquidation reserve; refunded to the vault on repayment.",
       s"Your bond asset will be $asset. Claim the bond's payout with `claim $asset`.")
-    prepare(s"Fill order $orderId", plan(Seq(order.box), Seq(unit, bond, principal), minted = Some(asset)), notes)
+    prepare(s"Fill order $orderId", plan(Seq(order.box.withCtxVar(0.toByte, longValue(batchingFee))), Seq(unit, bond, principal), minted = Some(asset)), notes)
   }
 
   /** Tx 7: every vault box naming the asset, claimed at once with the unit, which is burned. */
@@ -212,11 +212,11 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
       case FixedMaturity(h) =>
         checkMaturity(h)
         protocol.orderTemplate.withTerms(OrderTerms(bondHash, borrowerHash, loan.principalErg, principalTokens,
-          loan.repayment, loan.batchingFee, h, liq.hash))
+          loan.repayment, h, liq.hash))
       case OnClose(d) =>
         if (d < 30) fail("an on-close order's duration must be at least 30 blocks")
         protocol.onCloseTemplate.withTerms(OnCloseOrderTerms(bondHash, borrowerHash, loan.principalErg,
-          principalTokens, loan.repayment, loan.batchingFee, d, liq.hash))
+          principalTokens, loan.repayment, d, liq.hash))
     }
     val order = UTXO(Contract(tree), loan.collateralErg, loan.collateralTokens, Seq(treesValue(myTree)))
 
@@ -242,22 +242,23 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
    */
   def repay(bondId: String): Prepared = {
     val bond = protocol.asBond(unspent(bondId)).getOrElse(fail(s"$bondId is not a SigmaFi bond"))
-    if (height + 1 >= bond.maturity) fail(s"the bond matured at height ${bond.maturity}: repayment is closed")
+    if (height.toLong + 1L >= bond.maturity) fail(s"the bond matured at height ${bond.maturity}: repayment is closed")
     val originHints = node.boxById(Base16.encode(bond.origin)).flatMap(j => Try(NodeJson.box(j)).toOption)
       .toSeq.flatMap(treesReg(_, 4))
     val borrower = treeFor(bond.borrowerHash, bond.box, originHints)
       .getOrElse(fail("cannot find the borrower's ErgoTree, which the collateral must return to"))
 
-    val tag = Seq(bytesValue(bond.box.id.getBytes), bytesValue(bond.asset.getBytes))
+    val tag = Seq(bytesValue(bond.box.id.getBytes), bytesValue(bond.asset.getBytes), ErgoValue.of(0.toByte))
     val settlement = bond.repayToken match {
-      case None => UTXO(protocol.vault, math.max(bond.repayment, MinBox), Seq.empty, tag)
-      case Some(token) => UTXO(protocol.vault, MinBox, Seq(Token(token, bond.repayment)), tag)
+      case None => UTXO(protocol.vault, math.max(addAmount(bond.repayment, bond.batchingFee), MinBox), Seq.empty, tag)
+      case Some(token) => UTXO(protocol.vault, addAmount(MinBox, bond.batchingFee), Seq(Token(token, bond.repayment)), tag)
     }
-    val collateral = UTXO(Contract(borrower), bond.box.value, bond.collateral, Seq(bytesValue(bond.box.id.getBytes)))
+    val collateral = UTXO(Contract(borrower), bond.collateralErg, bond.collateral, Seq(bytesValue(bond.box.id.getBytes)))
 
     val notes = Seq(
       s"repay: ${Fmt.amount(bond.repayment, bond.repayToken)} into the vault, for the holder of ${bond.asset}",
-      s"collateral back: ${Fmt.contents(bond.box.value, bond.collateral)}" +
+      s"lender fee reserve refunded to vault: ${Fmt.erg(bond.batchingFee)}",
+      s"collateral back: ${Fmt.contents(bond.collateralErg, bond.collateral)}" +
         (if (sameTree(borrower, myTree) || isWalletHash(hashOf(borrower))) " to this wallet" else s" to ${addressOf(borrower)}"),
       s"maturity: height ${bond.maturity} (${bond.maturity - height} blocks left)")
     prepare(s"Repay bond $bondId", plan(Seq(bond.box.withCtxVar(1.toByte, intValue(0)).withCtxVar(2.toByte, intValue(1))), Seq(settlement, collateral), burn = Seq(Token(bond.asset, 1L))), notes)
@@ -275,7 +276,7 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
     val scripts = bonds.map { b =>
       val liq = protocol.liquidationOf(b.liqScriptHash)
         .getOrElse(fail(s"bond ${b.box.id} names a liquidation script this client does not know"))
-      if (liq.name == "MaturityLiquidation" && height + 1 < b.maturity)
+      if (liq.name == "MaturityLiquidation" && height.toLong + 1L < b.maturity)
         fail(s"bond ${b.box.id} matures at height ${b.maturity}; it can be liquidated from then on")
       liq
     }
@@ -283,7 +284,7 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
       b.box.withCtxVar(0.toByte, bytesValue(liq.bytes)).withCtxVar(1.toByte, intValue(i))
     }
     val outputs = bonds.map(b => UTXO(protocol.vault, b.box.value - b.batchingFee, b.collateral,
-      Seq(bytesValue(b.box.id.getBytes), bytesValue(b.asset.getBytes))))
+      Seq(bytesValue(b.box.id.getBytes), bytesValue(b.asset.getBytes), ErgoValue.of(1.toByte))))
 
     val notes = Seq(s"${bonds.size} bond(s); batching fees total ${Fmt.erg(bonds.map(_.batchingFee).sum)}, " +
       "less the miner fee, to this wallet")
@@ -445,23 +446,23 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
   private def checkLoan(loan: Loan): Unit = {
     if (loan.principalErg < MinBox) fail("the principal box must hold at least 0.001 ERG")
     if (loan.repayment <= 0) fail("the repayment must be positive")
-    if (loan.batchingFee < 0) fail("the batching fee cannot be negative")
-    if (loan.collateralErg - loan.batchingFee < MinBox)
-      fail("the collateral ERG must exceed the batching fee by at least 0.001 ERG, or no bond could be made")
+    if (loan.collateralErg < MinBox) fail("the collateral must hold at least 0.001 ERG")
     if (loan.collateralTokens.map(_.id).distinct.size != loan.collateralTokens.size)
       fail("list each collateral token once")
     if (loan.principalToken.exists(p => loan.collateralTokens.exists(_.id == p.id)))
       fail("the principal token cannot also be collateral")
   }
 
-  private def checkMaturity(maturity: Int): Unit =
-    if (maturity <= height + 2) fail(s"maturity $maturity is not far enough above the current height $height")
+  private def checkMaturity(maturity: Long): Unit =
+    if (maturity <= height.toLong + 2L) fail(s"maturity $maturity is not far enough above the current height $height")
 
   private def describeLoan(loan: Loan): Seq[String] = Seq(
     s"loan: ${Fmt.principal(loan.principalErg, loan.principalToken.toSeq)}; repayment: " +
       Fmt.amount(loan.repayment, loan.repayToken),
-    s"collateral: ${Fmt.contents(loan.collateralErg, loan.collateralTokens)}; batching fee: " +
-      s"${Fmt.erg(loan.batchingFee)}; liquidation: ${loan.liquidation}")
+    s"collateral: ${Fmt.contents(loan.collateralErg, loan.collateralTokens)}; liquidation: ${loan.liquidation}")
+
+  private def addAmount(a: Long, b: Long): Long =
+    Try(Math.addExact(a, b)).getOrElse(fail("the requested amount or height overflows a Long"))
 
   private def fail(message: String): Nothing = throw CliError(message)
 }

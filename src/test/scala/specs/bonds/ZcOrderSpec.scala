@@ -33,11 +33,11 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
       val fixed = orderTemplate(ctx)
       val onClose = onCloseTemplate(ctx)
       Seq(
-        fixed -> Seq(orderTerms(ctx, ErgBond), orderTerms(ctx, TokenBond, fee = 0L)),
-        onClose -> Seq(onCloseTerms(ctx, ErgBond), onCloseTerms(ctx, TokenBond, fee = 0L, duration = 30))
+        fixed -> Seq(orderTerms(ctx, ErgBond), orderTerms(ctx, TokenBond)),
+        onClose -> Seq(onCloseTerms(ctx, ErgBond), onCloseTerms(ctx, TokenBond, duration = 30))
       ).foreach { case (t, terms) =>
-        t.positions.keySet.size shouldBe 8
-        t.positions.values.toSet.size shouldBe 8
+        t.positions.keySet.size shouldBe 7
+        t.positions.values.toSet.size shouldBe 7
         val trees = terms.map(t.withTerms)
         trees.distinct.size shouldBe 2
         trees.foreach { tree =>
@@ -66,9 +66,9 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
     property(s"OnClose $kind fill: the lender may stamp a maturity up to 8 blocks short, and no shorter") {
       withCtx { ctx =>
         val f = fillScenario(ctx, kind, style = OnClose)
-        accepts(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(7, ErgoValue.of(f.maturity - 8))))
-        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(7, ErgoValue.of(f.maturity - 9))))
-        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(7, ErgoValue.of(f.maturity + 1))))
+        accepts(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(6, longsValue(f.repayment, f.fee, principalOf(kind)._1, f.maturity - 8))))
+        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(6, longsValue(f.repayment, f.fee, principalOf(kind)._1, f.maturity - 9))))
+        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(6, longsValue(f.repayment, f.fee, principalOf(kind)._1, f.maturity + 1))))
       }
     }
 
@@ -83,6 +83,20 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
+    property(s"OnClose $kind fill: rejects overflow even when the stamped maturity matches the wrapped target") {
+      withCtx { ctx =>
+        val f = fillScenario(ctx, kind, style = OnClose)
+        val order = f.order.setContract(onCloseContract(ctx, onCloseTerms(ctx, kind).copy(duration = Long.MaxValue)))
+        val input = inputAt(order, ctx, 0).withCtxVar(0.toByte, ErgoValue.of(f.fee))
+        val wrapped = f.height.toLong + Long.MaxValue
+        val bond = f.bondOut.withRegNum(4, bytesValue(input.id.getBytes))
+          .withRegNum(6, longsValue(f.repayment, f.fee, principalOf(kind)._1, wrapped))
+          .setTokens(Token(input.id, 1L) +: defaultCollateral: _*)
+        rejectsAtSigning(f.prover, fillTx(f)(inputs = Seq(input, f.lenderIn), bondOut = bond,
+          unitOut = f.unitOut.setTokens(Token(input.id, 1L))))
+      }
+    }
+
     property(s"FixedHeight $kind fill: needs a full block below maturity for the borrower to repay") {
       withCtx { ctx =>
         val f = fillScenario(ctx, kind)
@@ -94,7 +108,7 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
     property(s"FixedHeight $kind fill: rejects a maturity other than the order's") {
       withCtx { ctx =>
         val f = fillScenario(ctx, kind)
-        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(7, ErgoValue.of(f.maturity - 1))))
+        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(6, longsValue(f.repayment, f.fee, principalOf(kind)._1, f.maturity - 1))))
       }
     }
   }
@@ -158,14 +172,14 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
     property(s"$name fill: rejects a repayment one unit above the order") {
       withCtx { ctx =>
         val f = fillScenario(ctx, kind, style = style)
-        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(6, longsValue(f.repayment + 1, f.fee))))
+        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(6, longsValue(f.repayment + 1, f.fee, principalOf(kind)._1, f.maturity))))
       }
     }
 
-    property(s"$name fill: rejects a batching fee other than the order's") {
+    property(s"$name fill: rejects a batching fee different from the lender context variable") {
       withCtx { ctx =>
         val f = fillScenario(ctx, kind, style = style)
-        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(6, longsValue(f.repayment, f.fee + 1))))
+        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(6, longsValue(f.repayment, f.fee + 1, principalOf(kind)._1, f.maturity))))
       }
     }
 
@@ -235,10 +249,10 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
-    property(s"$name fill: an order whose fee could eat the collateral cannot be filled (feeBounded)") {
+    property(s"$name fill: the lender can fund a fee as large as the borrower collateral without consuming it") {
       withCtx { ctx =>
         val f = fillScenario(ctx, kind, fee = collateralErg, style = style)
-        rejectsAtSigning(f.prover, fillTx(f)())
+        accepts(f.prover, fillTx(f)())
       }
     }
 
@@ -252,6 +266,59 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
           inputs = Seq(first, orderSecond),
           unitOut = f.unitOut.setTokens(Token(wrongAsset, 1L)),
           bondOut = f.bondOut.setTokens(Token(wrongAsset, 1L) +: defaultCollateral: _*)))
+      }
+    }
+
+    property(s"$name fill: zero and large lender fees do not alter the borrower order") {
+      withCtx { ctx =>
+        val zero = fillScenario(ctx, kind, fee = 0L, style = style)
+        val large = fillScenario(ctx, kind, fee = collateralErg, style = style)
+        zero.order.contract.ergoTreeHex shouldBe large.order.contract.ergoTreeHex
+        accepts(zero.prover, fillTx(zero)())
+        accepts(large.prover, fillTx(large)())
+        large.bondOut.value - large.fee shouldBe large.order.value
+      }
+    }
+
+    property(s"$name fill: rejects missing, mistyped, negative and unfunded maximum fee witnesses") {
+      withCtx { ctx =>
+        val f = fillScenario(ctx, kind, style = style)
+        rejectsAtSigning(f.prover, fillTx(f)(inputs = Seq(f.orderIn.setCtxVars(), f.lenderIn)))
+        rejectsAtSigning(f.prover, fillTx(f)(inputs = Seq(
+          f.orderIn.setCtxVars(ContextVar.of(0.toByte, ErgoValue.of(1))), f.lenderIn)))
+        for (fee <- Seq(-1L, Long.MaxValue)) {
+          val input = f.orderIn.setCtxVars(ContextVar.of(0.toByte, ErgoValue.of(fee)))
+          val bond = f.bondOut.withRegNum(6, longsValue(f.repayment, fee, principalOf(kind)._1, f.maturity))
+          rejectsAtSigning(f.prover, fillTx(f)(inputs = Seq(input, f.lenderIn), bondOut = bond))
+        }
+      }
+    }
+
+    property(s"$name fill: rejects reserving a fee out of the borrower's collateral") {
+      withCtx { ctx =>
+        val f = fillScenario(ctx, kind, style = style)
+        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.setValue(f.order.value)))
+      }
+    }
+
+    property(s"$name fill: principal fields are pinned, including against overpayment inflation") {
+      withCtx { ctx =>
+        val f = fillScenario(ctx, kind, style = style)
+        val forged = f.bondOut.withRegNum(6, longsValue(f.repayment, f.fee, principalOf(kind)._1 + 1L, f.maturity))
+        rejectsAtSigning(f.prover, fillTx(f)(bondOut = forged, principalOut = f.principalOut.addValue(1L)))
+        val wrongTokens = ksingh.sigmabonds.app.Protocol.tokensValue(Seq(Token(secondCollateral, 1L)))
+        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(7, wrongTokens)))
+        rejectsAtSigning(f.prover, fillTx(f)(bondOut = f.bondOut.withRegNum(7, ErgoValue.of(f.maturity))))
+        accepts(f.prover, fillTx(f)(principalOut = f.principalOut.addValue(1L)))
+      }
+    }
+
+    property(s"$name cancel: does not require a fill fee context variable") {
+      withCtx { ctx =>
+        val f = fillScenario(ctx, kind, style = style)
+        val b = borrower(ctx)
+        accepts(b, build(ctx, Seq(f.orderIn.setCtxVars(), funding(ctx, b, 1)),
+          Seq(UTXO(borrowerTree(ctx), f.order.value, defaultCollateral)), b.getAddress))
       }
     }
 
@@ -319,7 +386,7 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
         val b = borrower(ctx)
         val repaid = accepts(b, buildAt(ctx, f.maturity - 1, Seq(bondIn.withCtxVar(1.toByte, ErgoValue.of(0)).withCtxVar(2.toByte, ErgoValue.of(1)), funding(ctx, b, 1, slack, repaymentFunds(kind))),
           Seq(repaymentBox(kind, vault(ctx), bondIn.id, f.asset),
-            tagged(borrowerTree(ctx), bondIn.value, bondIn.id, defaultCollateral)),
+            tagged(borrowerTree(ctx), bondIn.value - f.fee, bondIn.id, defaultCollateral)),
           b.getAddress, burn = Seq(Token(f.asset, 1L))))
         claim(ctx, f.asset, lenderUnit, spendOutput(repaid, 0))
       }

@@ -4,8 +4,8 @@
     // REGISTERS
     // R4: Coll[Byte] - originating order id, also the bond asset id
     // R5: Coll[Byte] - blake2b256 of the borrower's ErgoTree
-    // R6: Coll[Long] - (repayment in CONST_TOKEN_ID, batching fee in nanoERG)
-    // R7: Int        - maturity height; repayment is open strictly below it
+    // R6: Coll[Long] - (repayment in CONST_TOKEN_ID, lender fee reserve, principal nanoERG, maturity height)
+    // R7: Coll[(Coll[Byte], Long)] - agreed principal tokens; empty for an ERG loan
     // R8: Coll[Byte] - blake2b256 of the serialized liquidation expression
     //
     // CONSTANTS
@@ -23,7 +23,7 @@
     //
     // OUTPUTS
     // Context vars select outputs independently of input positions; no filler inputs needed.
-    // Settlement: R4 = SELF.id, R5 = bond asset id. Collateral return: R4 = SELF.id.
+    // Settlement: R4 = SELF.id, R5 = bond asset id, R6: Byte = 0 repaid / 1 liquidated. Collateral return: R4 = SELF.id.
     // Repayment requires distinct settlement and return indices.
     //
     // ASSUMPTIONS
@@ -47,15 +47,17 @@
     val borrowerHash     = SELF.R5[Coll[Byte]].get
     val amounts          = SELF.R6[Coll[Long]].get
     val repayment        = amounts(0)
-    val maturityHeight   = SELF.R7[Int].get
+    val batchingFee      = amounts(1)
+    val maturityHeight   = amounts(3)
     val liqScriptHash    = SELF.R8[Coll[Byte]].get
     val bondAssetId      = SELF.tokens(0)._1
     val collateralAssets = SELF.tokens.slice(1, SELF.tokens.size)
-    val collateralERG    = SELF.value
+    val collateralERG    = SELF.value - batchingFee
 
     // Shared by both paths, so evaluating these eagerly costs neither path anything it does not need
     val settlementIndex = getVar[Int](1).get
-    if (settlementIndex < 0 || settlementIndex >= OUTPUTS.size) {
+    if (amounts.size != 4 || batchingFee < 0L || batchingFee > SELF.value - 1000000L ||
+        settlementIndex < 0 || settlementIndex >= OUTPUTS.size) {
         sigmaProp(false)
     } else {
         val settlementBox    = OUTPUTS(settlementIndex)
@@ -76,6 +78,7 @@
                     blake2b256(liquidationScript.get) == liqScriptHash,
                     toVault,
                     settlementTagged,
+                    settlementBox.R6[Byte].get == 1.toByte,
                     assetBurned
                 )
             )
@@ -94,11 +97,13 @@
                     settlementBox.tokens(0)._2 >= repayment
                 val repaid = allOf(
                     Coll(
-                        HEIGHT < maturityHeight,
-                        // RepaymentBox Conditions
+                        HEIGHT.toLong < maturityHeight,
+                        // Repayment includes refund of the lender-funded reserve; subtract to avoid overflow.
                         toVault,
                         settlementTagged,
-                        settlementBox.value >= 1000000L,
+                        settlementBox.R6[Byte].get == 0.toByte,
+                        settlementBox.value >= batchingFee &&
+                        settlementBox.value - batchingFee >= 1000000L,
                         repaymentPaid,
                         // ReturnBox Conditions
                         blake2b256(returnBox.propositionBytes) == borrowerHash,

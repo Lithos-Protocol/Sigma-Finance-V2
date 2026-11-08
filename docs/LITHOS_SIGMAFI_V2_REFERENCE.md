@@ -58,19 +58,25 @@ substrings or recompiling terms that might be folded by the compiler.
 
 ## Box schemas
 
-All values are nanoERG. Monetary amounts and token quantities are `Long`; heights and durations are `Int`.
+ERG values are in nanoERG. Monetary amounts, token quantities and bond/fixed-order maturity heights are `Long`.
+On-close durations are also `Long`. Context `HEIGHT` is `Int`; arithmetic widens to `Long` before addition,
+with overflow checks for schedule calculations.
 Hashes and token IDs are `Coll[Byte]` (32 bytes for the protocol's hash/id values).
 
 | Bond field | Meaning |
 |---|---|
-| `value` | Collateral ERG |
+| `value` | Borrower collateral ERG plus lender-funded batching reserve |
 | `tokens(0)` | `(bondAssetId, 1)`; this is the bond singleton, not collateral |
 | `tokens(1..)` | Collateral tokens, preserving the original order's sequence |
 | R4: `Coll[Byte]` | Originating order id, equal to the bond asset id for an authentic fill |
 | R5: `Coll[Byte]` | Borrower full-ErgoTree hash |
-| R6: `Coll[Long]` | Exactly `(repayment, batchingFee)` |
-| R7: `Int` | Maturity height; repayment requires `HEIGHT < R7` |
+| R6: `Coll[Long]` | Exactly `(repayment, batchingFee, principalErg, maturityHeight)` |
+| R7: `Coll[(Coll[Byte], Long)]` | Agreed principal tokens; empty for an ERG loan |
 | R8: `Coll[Byte]` | Liquidation expression hash |
+
+R6(2)/R7 are pinned to agreed order principal terms, even if the principal output is overfunded.
+Borrower collateral ERG is `bond.value - R6(1)`. R6(3) is a Long height.
+This replaces the prior two-element R6 and Int-maturity R7 schema; old boxes do not migrate.
 
 The vault is compiled into the bond. There is no lender destination register and no protocol R9.
 Do not confuse this layout with the earlier Generators layout that used R8 for the vault and R9 for
@@ -83,7 +89,7 @@ does not read R4 or prove its origin.
 | Borrower order | Entire ERG/token contents are collateral; terms are script constants |
 | Optional order hint | R4: `Coll[Coll[Byte]]`, containing the borrower's full ErgoTree; hash-check the hint |
 | Lender's minted unit | `tokens(0) = (order.id, 1)`; R4/R5/R6 are EIP-4 UTF-8 name/description/`"0"` |
-| Vault settlement | R4: closing bond box id, R5: bond asset id, both `Coll[Byte]` |
+| Vault settlement | R4: closing bond box id, R5: bond asset id (both `Coll[Byte]`); R6: `Byte`, 0 repaid / 1 liquidated |
 | Collateral return | R4: closing bond box id; script is the borrower hash's preimage |
 
 An order's optional hint is never read by the contracts. Without it, resolve the borrower's tree from
@@ -102,12 +108,12 @@ The compact JSON description keeps the older Lithos SigmaFi field names and adds
 | `type` | `"SigmaFi ZC-Bond"`, retained for compatibility with the older JSON description |
 | `bondAsset` | Full token id, equal to the spent order box id |
 | `borrowerHash` | Borrower full-ErgoTree blake2b256, hex |
-| `principal` | `{ "nanoErgs": Long, "tokens": [{ "id": hex, "amount": Long }] }` for the planned principal output |
+| `principal` | `{ "nanoErgs": Long, "tokens": [{ "id": hex, "amount": Long }] }` for the agreed principal terms |
 | `repayment` / `repayToken` | Raw repayment amount and token-id hex, or `"ERG"` for nanoERG repayment |
-| `maturity` | Actual stamped bond R7 for either schedule |
+| `maturity` | Actual stamped bond R6(3), as a Long for either schedule |
 | `durationBlocks` | Requested duration, present only for on-close orders |
-| `collateral` | Same nanoERG/tokens shape as principal; excludes the minted bond singleton |
-| `batchingFee` | Maximum nanoERG fee used by the standard maturity liquidation |
+| `collateral` | Same nanoERG/tokens shape as principal; excludes the minted bond singleton and lender-funded reserve |
+| `batchingFee` | Lender-selected nanoERG reserve added on fill; refunded to vault on repayment |
 | `liquidation` / `liquidationHash` | Known expression name and raw-expression blake2b256, hex |
 | `height` | Build-context height, not confirmed inclusion height |
 
@@ -121,16 +127,20 @@ Metadata is a display snapshot and must not replace authenticated order/bond rea
 | Operation | Inputs | Required outputs | Context and burn |
 |---|---|---|---|
 | Create order | Borrower funding | Collateral under the instantiated order | No mint |
-| Fill order | Order must be input 0; lender funds principal and extra boxes/fee | Output 0 lender unit; output 1 bond; output 2 principal to borrower | Mint exactly 2 units with id `order.id`; one in output 0, one in output 1 |
+| Fill order | Order must be input 0; lender funds principal and extra boxes/fee | Output 0 lender unit; output 1 bond; output 2 principal to borrower | Required order-input ctx var 0: Long fee reserve, funded above order value; mint exactly 2 units with id `order.id`; one in output 0, one in output 1 |
 | Cancel order | Order plus a box guarded by borrower script | Refund as borrower chooses | No units minted; borrower authorization is by co-spend |
 | Repay bond at input i | Bond plus repayment funding | Var 1 selects repayment to vault; var 2 selects full collateral return | Context var 0 absent; vars 1/2 are distinct in-range Int indices; explicitly burn the bond singleton |
 | Liquidate bond at input i | Bond with its agreed expression in context var 0; optional fee funding | Var 1 (Int) selects settlement to vault, tagged with bond id and asset id | Burn the singleton; expression decides eligibility, ERG and tokens |
 | Claim vault | All vault boxes for an asset plus the holder's circulating unit | Holder chooses outputs | Burn the circulating unit |
 
 For every settlement, vault R4 must equal the closing bond's box id, and vault R5 the bond's token id.
-Collateral-return R4 must equal that same bond box id. A full repayment returns `tokens.drop(1)` and at
-least the bond's ERG value. An ERG repayment pays at least R6(0). A token repayment pays exactly one
-token ID, the compiled `CONST_TOKEN_ID`, at least R6(0), with at least 0.001 ERG.
+The bond enforces settlement R6: Byte = 0 for repayment or 1 for liquidation. The vault ignores that
+marker for authorization; verify the originating bond spend before trusting it.
+Collateral-return R4 must equal that same bond box id. Repayment returns `tokens.drop(1)` and at
+least `bond.value - bond.R6(1)` ERG to the borrower. The unused reserve is refunded to the lender's
+vault: an ERG repayment pays at least `bond.R6(0) + bond.R6(1)`; a token repayment pays exactly one
+token ID, `CONST_TOKEN_ID`, at least bond R6(0), plus at least `0.001 ERG + bond.R6(1)`.
+Use checked additions off-chain and subtraction-based comparisons on-chain to avoid overflow.
 
 Settlement output positions are selected per input through context var 1 (Int), independently of
 input positions. Repayment also requires var 2 (Int) for a distinct collateral-return output; no filler
@@ -142,7 +152,11 @@ the lender's circulating unit as automatic settlement funding: no bond-asset uni
 settlement transaction's outputs. Burning the claim unit along with the singleton loses the lender's claim.
 
 Orders preserve their complete collateral token list after prepending the singleton. The order pins
-the new bond's borrower, repayment, fee, schedule and liquidation hash. An ERG principal has no tokens;
+the new bond's borrower, repayment, agreed principal ERG/tokens, schedule and liquidation hash.
+There is no `CONST_BATCHING_FEE`. Required ctx var 0: Long on the order input selects a nonnegative
+fee; bond R6(1) must match it, and `bond.value - order.value >= fee` funds it without consuming
+collateral. The CLI chooses it with `fill-order --batching-fee` (default 0.002 ERG). Cancellation
+requires no fill context variable. An ERG principal has no tokens;
 a token principal uses one token and an ERG floor. Pair the principal with the correct repayment bond
 off-chain: the order trusts its `CONST_BOND_HASH` and does not enforce that pairing itself.
 
@@ -151,15 +165,15 @@ least 30 blocks, and accepted maturity lies in `[HEIGHT + duration - 8, HEIGHT +
 may stamp `buildHeight + duration`; a fill can confirm through buildHeight + 8, then must be rebuilt.
 Use checked arithmetic in client code and account for tip height versus intended inclusion height.
 
-`MaturityLiquidation` requires `HEIGHT >= R7`, exact collateral tokens after removing the singleton,
-and vault value at least `bond.value - batchingFee`. The originating order bounds fee to a nonnegative
-amount leaving at least 0.001 ERG. A batch executor retains at most the sum of fees, less the miner fee;
+`MaturityLiquidation` requires `HEIGHT.toLong >= bond.R6(3)`, exact collateral tokens after removing the singleton,
+and vault value at least `bond.value - batchingFee`. The originating order requires that nonnegative
+reserve on top of its entire collateral value, preserving at least 0.001 ERG after removing it. A batch executor retains at most the sum of fees, less the miner fee;
 if fees do not cover that fee, supply additional funding. Validate the actual serialized outputs against
 the node's minimum value rules rather than treating 0.001 ERG as a consensus guarantee for every size.
 
 For custom liquidation expressions, do not assume the maturity rule's output assets, ERG floor, or
 fee economics. They may atomically convert collateral to ERG or another asset. The bond still pins
-the vault, the R4/R5 tags, and the burn. Initially enable automatic batching only for the exact known
+the vault, the R4/R5 tags, R6 = 1.toByte, and the burn. Initially enable automatic batching only for the exact known
 maturity expression hash. A custom builder requires separate review and signing tests.
 
 ## Lithos migration map
@@ -170,9 +184,9 @@ They identify rewrite surfaces; no Lithos files were changed while producing thi
 | Lithos surface | Required change |
 |---|---|
 | `lithos-lib/src/main/scala/sigmafi/contracts/SigmaFiContracts.scala` and its bundled `.ergo` resources | Replace pinned trees, templates, constant indices, source copies and maturity expression together; remove offer definitions |
-| `app/transactions/batching/sigmafi/SigmaFiBoxes.scala` | Read asset from first token, validate amount 1 and agreement with R4, expose collateral as `assets.drop(1)`; remove offer parsing |
-| `app/transactions/batching/sigmafi/SigmaFiUserTransactions.scala` | Prepend bond singleton on fill, mint supply 2, return only collateral tokens on repayment, and burn singleton on repayment; remove offer creation/close/cancel flows |
-| `app/transactions/batching/sigmafi/SigmaFiTransactions.scala` | Set new expression bytes, strip singleton from vault assets, and explicitly burn one unit per liquidated bond; preserve batching indices |
+| `app/transactions/batching/sigmafi/SigmaFiBoxes.scala` | Read asset from first token, validate amount 1 and agreement with R4, read four R6 Longs and R7 principal tokens, expose collateral as `assets.drop(1)` and ERG as value minus reserve; remove offer parsing |
+| `app/transactions/batching/sigmafi/SigmaFiUserTransactions.scala` | Prepend bond singleton on fill, mint supply 2, fund the lender-selected reserve using order ctx var 0, pin principal fields, refund reserve to vault on repayment, stamp settlement R6 = 0.toByte, and burn singleton; remove offer creation/close/cancel flows |
+| `app/transactions/batching/sigmafi/SigmaFiTransactions.scala` | Set new expression bytes and output-index ctx vars, strip singleton from vault assets, stamp settlement R6 = 1.toByte, and explicitly burn one unit per liquidated bond |
 | `app/transactions/batching/sigmafi/SigmaFiBatcher.scala` | Refresh recognized script/template hashes and maturity-expression allowlist; preserve candidate and authoritative-UTXO checks |
 | `app/transactions/engine/execution/SigmaFiAPIExecution.scala` | Rework order/fill, verification and settlement paths for the new layout; remove offers |
 | `app/transactions/engine/SigmaFiIntent.scala`, SigmaFi API/controller/models/routes/UI | Remove lender-offer operations and representations; retain borrower orders, fill, repay, liquidate and claim |
@@ -223,12 +237,12 @@ Order and token prototypes contain sentinels; replace only their listed terms be
 | Entry | Tree bytes | Full ErgoTree blake2b256 | Template blake2b256 |
 |---|---:|---|---|
 | BondAssetVault | 171 | `ed132c371e35881b1b4fde03f092bc2eb8d9deb96df89cd9a5a32ab4f94b3c6b` | `0df4042ad7c434fb388cafdc2e6cc44c02dc80952687e0b2b374e5fc001f024e` |
-| ZC_ERG_Bond | 357 | `82c9bab2e4751c46637ec4bb66cbee688a3b7e752f28b3b614de5d757dbf3fde` | `fd0a057ff2032fa474b5fab9178e4eb1c4c0005abc605aa4fec5abfe3ea1186f` |
-| ZC_Token_Bond prototype | 438 | `c3be862c4a37708e29689f0c9490c4aabc00f605371191585bb7f3af99ffff7c` | `1f63d7956fdbfb3e66503818bbe5ebf210ccc9b18f77e1ede4434ea56ffa0e79` |
-| ZC_Token_Bond SigUSD example | 438 | `1633e4d330fcc0e5fcd178810e3303e31809e029ffe7470bcc98d025c2f5f7f7` | `1f63d7956fdbfb3e66503818bbe5ebf210ccc9b18f77e1ede4434ea56ffa0e79` |
-| ZC_Order prototype | 613 | `050a5dd27b33ef127039900228e1fb767901d25f20f7177ed1b423957c29c4e6` | `5e82ac73dba7b8dbe463d8f05fd8058604542c00fecc0eade894785a24934bcf` |
-| ZC_OrderOnClose prototype | 630 | `9a7d44d46f8b3cdb41b6b8caf6a190549b5ccd01b68cd21398b9811974a06b38` | `f5e91924fcc12cce98913e60a43d9c03b8d6495fd88409143aed94373e35499f` |
-| MaturityLiquidation compilation tree | 89 | `c254f95a416d8a9ca21b1f1045fffaa7c11da35676f808a49694dbc788f767d9` | `cb95a9f4bc4c86d5dafe14ada9a6521db65f22ece98ee65749e4344df0059dce` |
+| ZC_ERG_Bond | 448 | `1bceba97922f67d50e2718f39696c3f43f21279d971c83381a14ea0334df93b9` | `22268fef788f04e22c1207747560c635fc0dfca701082d2b55aa7cdda1e0812c` |
+| ZC_Token_Bond prototype | 529 | `c3a4acc24e2e9c1647a6b39ebb9adf36ed0e6cf5e2b0b4c14b6421f7b59ef017` | `01dc8c5e62641965839a9b984bb7f73a7a9e24928b8483a6642459ba13dc1181` |
+| ZC_Token_Bond SigUSD example | 529 | `9425199824c3985ccbda2614ebcf4e4f17336e5e8abdb58be0830982f9a507cd` | `01dc8c5e62641965839a9b984bb7f73a7a9e24928b8483a6642459ba13dc1181` |
+| ZC_Order prototype | 673 | `b1a94c32f8aa5297ba8fe6477e281ea75145197d02dc2cdb5c6e00f38a5d3989` | `49dd9de79ddf81c435b42703a884abb7f212b20ad052f2a50d9d779f4171bf4d` |
+| ZC_OrderOnClose prototype | 704 | `e7545cbd6d4b033c8c57058586146612c47a59eea5538ca693cb587dd1516cc4` | `362744a608dc1c7f872a616f1a6ad88c92240500ba5ec9a9498d74ef031bcc52` |
+| MaturityLiquidation compilation tree | 98 | `f162f30a43b941d0d751cc90bfc07bdf05563b36110af3fb0251bc9ec8a26cd2` | `34148160d1c3bc4bfcd502ee103744958077b3cbabf695a469b77b5fdd0325d8` |
 
 ### BondAssetVault
 
@@ -256,40 +270,40 @@ KMzh25p8Gr3oHePavSvfANo7bbWt6XH5YDWFfw76cRK4BipeJ9MVvyhWUjZGYS8i4auKwRdtPdE782Zu
 
 ### ZC_ERG_Bond
 
-Header: `0x1b`; constant count: `11`.
+Header: `0x1b`; constant count: `18`.
 
 Full serialized ErgoTree hex:
 ```text
-1be2020b0400040001000e20ed132c371e35881b1b4fde03f092bc2eb8d9deb96df89cd9a5a32ab4f94b3c6b0500050005000400010004000402d803d601e4e30104d602db6308a7d6038cb272027300000195ec8f72017301927201b1a5d17302d806d604e3000ed605b2a5720100d60693cbc272057303d607c5a7d608ed93e4c67205040e720793e4c67205050e7203d60993dad901090eb0a57304d9010b41639a8c720b01b0db63088c720b027305d9010d414d0ed802d60f8c720d02d6108c720d0195938c720f0172099a72108c720f027210017203730695e67204ea02d19683040193cbe47204e4c6a7080e720672087209d40800d801d60ae4e3020495ecec8f720a730792720ab1a593720a7201d17308d801d60bb2a5720a00d1968309018fa3e4c6a707047206720892c17205b2e4c6a7061173090093cbc2720be4c6a7050e93e4c6720b040e720793db6308720bb47202730ab1720292c1720bc1a77209
+1bbd031204020400040805000580897a040001000e20ed132c371e35881b1b4fde03f092bc2eb8d9deb96df89cd9a5a32ab4f94b3c6b0500050005000201040001000406020004000402d806d601e4c6a70611d602b27201730000d603c1a7d604e4e30104d605db6308a7d6068cb272057301000195ecececec94b1720173028f7202730391720299720373048f72047305927204b1a5d17306d806d607e3000ed608b2a5720400d60993cbc272087307d60ac5a7d60bed93e4c67208040e720a93e4c67208050e7206d60c93dad9010c0eb0a57308d9010e41639a8c720e01b0db63088c720e027309d90110414d0ed802d6128c721002d6138c72100195938c721201720c9a72138c7212027213017206730a95e67207ea02d19683050193cbe47207e4c6a7080e7209720b93e4c672080602730b720cd40800d801d60de4e3020495ecec8f720d730c92720db1a593720d7204d1730dd802d60ec17208d60fb2a5720d00d196830a018f7ea305b27201730e007209720b93e4c672080602730fed92720e72029299720e7202b2720173100093cbc2720fe4c6a7050e93e4c6720f040e720a93db6308720fb472057311b1720592c1720f9972037202720c
 ```
 
 Raw template hex (`ErgoTree.template`, excludes all constants):
 ```text
-d803d601e4e30104d602db6308a7d6038cb272027300000195ec8f72017301927201b1a5d17302d806d604e3000ed605b2a5720100d60693cbc272057303d607c5a7d608ed93e4c67205040e720793e4c67205050e7203d60993dad901090eb0a57304d9010b41639a8c720b01b0db63088c720b027305d9010d414d0ed802d60f8c720d02d6108c720d0195938c720f0172099a72108c720f027210017203730695e67204ea02d19683040193cbe47204e4c6a7080e720672087209d40800d801d60ae4e3020495ecec8f720a730792720ab1a593720a7201d17308d801d60bb2a5720a00d1968309018fa3e4c6a707047206720892c17205b2e4c6a7061173090093cbc2720be4c6a7050e93e4c6720b040e720793db6308720bb47202730ab1720292c1720bc1a77209
+d806d601e4c6a70611d602b27201730000d603c1a7d604e4e30104d605db6308a7d6068cb272057301000195ecececec94b1720173028f7202730391720299720373048f72047305927204b1a5d17306d806d607e3000ed608b2a5720400d60993cbc272087307d60ac5a7d60bed93e4c67208040e720a93e4c67208050e7206d60c93dad9010c0eb0a57308d9010e41639a8c720e01b0db63088c720e027309d90110414d0ed802d6128c721002d6138c72100195938c721201720c9a72138c7212027213017206730a95e67207ea02d19683050193cbe47207e4c6a7080e7209720b93e4c672080602730b720cd40800d801d60de4e3020495ecec8f720d730c92720db1a593720d7204d1730dd802d60ec17208d60fb2a5720d00d196830a018f7ea305b27201730e007209720b93e4c672080602730fed92720e72029299720e7202b2720173100093cbc2720fe4c6a7050e93e4c6720f040e720a93db6308720fb472057311b1720592c1720f9972037202720c
 ```
 
 Mainnet address:
 ```text
-49FQkrJaE2uq53fJW3htDRJ1yNDh8mpjf5HLvSBYW3yeJ88doXT4nozDsJvCBB26CB1DgsDAPRqwpuXF3hxJ3vo5MX8TqfnAUEvX4ssHbAWceXf3wigakme62mBE9GiD4ZsCptUYTg88S1W4MsqSAKyNSwxt1PbzyvE6StPgYSVQozUZckWJz29nJWn2UWGtwH4om8pFY4H9i5VCowmhPuaqMoAok389KKc8TMsxbeWXCsxSBwd3E8AejZkFf9HzSUSkdXUw9mYJh4cLKuDJgbE7nYAw8KQdJ1oMK1CHohnufNES4taU7g5LJC9r4Bvrjh9mEqxrxSs6yNfbf1STsZ3SxdgV2CGTnQbF346GaLirXbDNTL8bgXw1A7rWk25DSpCJqW2kWHFvMTMj79d49pg5s7vqNwRXixgR2Uk13Pcdp19Qip3KFs4T8r3C83bPvPtU1T3jQb9Rt6hNxAeC3mtz62VN3Q25yuW4qhV4AUR8Aj
+AbMVCU6L2xciF5BfFo19UscGtuzpyGTNtPiEWAh84N8h2aP6EGHgfdioSUz9Y4DvPTE59LjSxC5KgKcRskLPoGnmkEGJwroYq5FEzLJoMyRNZdi2D5ZxgupVGuVWzxjwc1cj4hfD4Rh3xSW5Mc2AbdF9XH61URkYYGDHnumNKQhTkzwNNX1b4AWjcn84TJeqD3AUtLiGQHfLVMWcnuNYSynXZPRaaSpWLMn8wE7jkDpKpx6fC4T1wp7cw6SpCbDqxLNcMia8aGCqRMCQKrLRt32toQbV7ZZAVpc21A7ct3Y1Y1CBMmdXqpk6exQATpdt2wMqiedKoshvAke5sMN23mr1BuFAasbRtKSgiiFuYwtXFr5qwS831KytNRH5U4Ts1mWpfzaVoq869NUiveR8cPtdbsVNcp5DvmUUjNofKKyqBjZpp4poZooQCV25fvhrWuGVqG8SftDpg1kAgqTP3Lxn8MnSYJ8rNN9qY64kuk3qCHLgTPrTXmzucPcn5v5T9qpzWPjLARNQByNvxXvP5bCdSUNYMJgz6qCveADLppv2jzBLqSoSxHdF7T6ZMYX2kT43QbQ9oJZCNiUrgztyuGHWpFZr4W72Mp2dPGHfra
 ```
 
 Testnet address:
 ```text
-LKBsnrdyYh1EKntZDHqRsqT2znhfan9JhvfCcib586gZKG5m46Bw5JWUpZ8G7P4F1BGAVbYqMZk8bMicoLJ7p2pnQsyyAa6QrqP5u2qG6o7hbd5JXAUD3PWR6FoCFyeFxrMN284oB5poCYrCfCLJwmNHe5TAMASkD25CdwXXV5w8vL4mCfHR8GtttRWrGXjahyATX4V9uekuKkgJuVgDfV7M4mgubt3tjgUiFx1vAVt8DgRviVxKC8UvZhm2kFS4g8yqpp618J1B8kHMRveEX1JbL13LK5CHo1LcKgv4T6YwcLADSdKPY841pVTJ2mfZTAKQ48G6SBtn4sGq2fQg1qtZ4S9B3pFwcvwtFAcNDHaGU9eHcLFon6yQNYgozqtzB2vK73WBZk5tdEMEaVLMNpqewVqcyM8RW2EkybfynHDz67qLsjSpUXRRxxrUGiRFhnBXAA6D8UZEpFj2ahbNgvUjBSbtEmfVuqbUV4JY8NDzVu
+21y8xon7v4gwBKZQhYaKJYKNefBtqDckQRPjhyeWAsLiS1zQ6kx4xJkrsApfLXesVMsqevktYh74A4Ltq5YTP4zjkgSVrXFFGHM4k6NaRcvt5NeAFmAed3WutNZJPtDzRFXwENVQs1fHqbBcjddHSVBRiNyXjnnepijVMi5a2rmXnuFrSNP4yX9NoDGTsX3qQLtkEFnpZaukzYrtNRDjynd4b382YkBnMHpUzQjjRr9K9oxD3ADCNgCJDqGcqwW1g4QuxEJgEjhV8Zx9oAp6HkgVv9zfAUurhfzHFbbBtcaK6T6EGcqQqrzC9Q39o9MPCjTdK8d4P4GXxJWKeh4nL27Aopwi9EDAUHU2gAVimycWbZ4XTzEvLGchob6m8zZrnt3Aq6yckiTtkEBrFBcQpVZk87M2KB1Ec2XXQ2etNkmS3Rj6fAPmz9c8vDXxoxBr6Z4xCqPAXpT1tHEop1C7QW741vcwMeeBA7D6kmvcwraCVHMBvJiZiCVAoGVVa4zymjwyBxMNAeGzai67C3VhjxCABiSFu6NSC1tChWPTqTQwY8qgwZDc4uzZY3tDrwCrEwvhkaGDrYsEsAi9BakMCJoA2trAvRDkCpnVqsyCrmC
 ```
 
 ### ZC_Token_Bond prototype
 
-Header: `0x1b`; constant count: `16`.
+Header: `0x1b`; constant count: `23`.
 
 Full serialized ErgoTree hex:
 ```text
-1bb303100400040001000e20ed132c371e35881b1b4fde03f092bc2eb8d9deb96df89cd9a5a32ab4f94b3c6b050005000500040001000580897a040204000e207e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e040004000402d803d601e4e30104d602db6308a7d6038cb272027300000195ec8f72017301927201b1a5d17302d806d604e3000ed605b2a5720100d60693cbc272057303d607c5a7d608ed93e4c67205040e720793e4c67205050e7203d60993dad901090eb0a57304d9010b41639a8c720b01b0db63088c720b027305d9010d414d0ed802d60f8c720d02d6108c720d0195938c720f0172099a72108c720f027210017203730695e67204ea02d19683040193cbe47204e4c6a7080e720672087209d40800d801d60ae4e3020495ecec8f720a730792720ab1a593720a7201d17308d802d60bdb63087205d60cb2a5720a00d196830a018fa3e4c6a707047206720892c172057309eded93b1720b730a938cb2720b730b0001730c928cb2720b730d0002b2e4c6a70611730e0093cbc2720ce4c6a7050e93e4c6720c040e720793db6308720cb47202730fb1720292c1720cc1a77209
+1b8e041704020400040805000580897a040001000e20ed132c371e35881b1b4fde03f092bc2eb8d9deb96df89cd9a5a32ab4f94b3c6b050005000500020104000100040602000580897a040204000e207e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e040004000402d806d601e4c6a70611d602b27201730000d603c1a7d604e4e30104d605db6308a7d6068cb272057301000195ecececec94b1720173028f7202730391720299720373048f72047305927204b1a5d17306d806d607e3000ed608b2a5720400d60993cbc272087307d60ac5a7d60bed93e4c67208040e720a93e4c67208050e7206d60c93dad9010c0eb0a57308d9010e41639a8c720e01b0db63088c720e027309d90110414d0ed802d6128c721002d6138c72100195938c721201720c9a72138c7212027213017206730a95e67207ea02d19683050193cbe47207e4c6a7080e7209720b93e4c672080602730b720cd40800d801d60de4e3020495ecec8f720d730c92720db1a593720d7204d1730dd803d60ec17208d60fdb63087208d610b2a5720d00d196830b018f7ea305b27201730e007209720b93e4c672080602730fed92720e72029299720e72027310eded93b1720f7311938cb2720f731200017313928cb2720f73140002b2720173150093cbc27210e4c6a7050e93e4c67210040e720a93db63087210b472057316b1720592c172109972037202720c
 ```
 
 Raw template hex (`ErgoTree.template`, excludes all constants):
 ```text
-d803d601e4e30104d602db6308a7d6038cb272027300000195ec8f72017301927201b1a5d17302d806d604e3000ed605b2a5720100d60693cbc272057303d607c5a7d608ed93e4c67205040e720793e4c67205050e7203d60993dad901090eb0a57304d9010b41639a8c720b01b0db63088c720b027305d9010d414d0ed802d60f8c720d02d6108c720d0195938c720f0172099a72108c720f027210017203730695e67204ea02d19683040193cbe47204e4c6a7080e720672087209d40800d801d60ae4e3020495ecec8f720a730792720ab1a593720a7201d17308d802d60bdb63087205d60cb2a5720a00d196830a018fa3e4c6a707047206720892c172057309eded93b1720b730a938cb2720b730b0001730c928cb2720b730d0002b2e4c6a70611730e0093cbc2720ce4c6a7050e93e4c6720c040e720793db6308720cb47202730fb1720292c1720cc1a77209
+d806d601e4c6a70611d602b27201730000d603c1a7d604e4e30104d605db6308a7d6068cb272057301000195ecececec94b1720173028f7202730391720299720373048f72047305927204b1a5d17306d806d607e3000ed608b2a5720400d60993cbc272087307d60ac5a7d60bed93e4c67208040e720a93e4c67208050e7206d60c93dad9010c0eb0a57308d9010e41639a8c720e01b0db63088c720e027309d90110414d0ed802d6128c721002d6138c72100195938c721201720c9a72138c7212027213017206730a95e67207ea02d19683050193cbe47207e4c6a7080e7209720b93e4c672080602730b720cd40800d801d60de4e3020495ecec8f720d730c92720db1a593720d7204d1730dd803d60ec17208d60fdb63087208d610b2a5720d00d196830b018f7ea305b27201730e007209720b93e4c672080602730fed92720e72029299720e72027310eded93b1720f7311938cb2720f731200017313928cb2720f73140002b2720173150093cbc27210e4c6a7050e93e4c67210040e720a93db63087210b472057316b1720592c172109972037202720c
 ```
 
 Constant registry. Only named terms may change; every `fixed` constant must match this prototype exactly.
@@ -297,45 +311,52 @@ Values below are serialized Sigma constants, including their type prefix; they a
 
 | Zero-based constant index | Role | Sigma type | Serialized constant hex |
 |---:|---|---|---|
-| 0 | `fixed` | `SInt$` | `0400` |
+| 0 | `fixed` | `SInt$` | `0402` |
 | 1 | `fixed` | `SInt$` | `0400` |
-| 2 | `fixed` | `SBoolean` | `0100` |
-| 3 | `fixed` | `Coll[SByte$]` | `0e20ed132c371e35881b1b4fde03f092bc2eb8d9deb96df89cd9a5a32ab4f94b3c6b` |
-| 4 | `fixed` | `SLong$` | `0500` |
-| 5 | `fixed` | `SLong$` | `0500` |
-| 6 | `fixed` | `SLong$` | `0500` |
-| 7 | `fixed` | `SInt$` | `0400` |
-| 8 | `fixed` | `SBoolean` | `0100` |
-| 9 | `fixed` | `SLong$` | `0580897a` |
-| 10 | `fixed` | `SInt$` | `0402` |
-| 11 | `fixed` | `SInt$` | `0400` |
-| 12 | `CONST_TOKEN_ID` | `Coll[SByte$]` | `0e207e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e` |
-| 13 | `fixed` | `SInt$` | `0400` |
-| 14 | `fixed` | `SInt$` | `0400` |
-| 15 | `fixed` | `SInt$` | `0402` |
+| 2 | `fixed` | `SInt$` | `0408` |
+| 3 | `fixed` | `SLong$` | `0500` |
+| 4 | `fixed` | `SLong$` | `0580897a` |
+| 5 | `fixed` | `SInt$` | `0400` |
+| 6 | `fixed` | `SBoolean` | `0100` |
+| 7 | `fixed` | `Coll[SByte$]` | `0e20ed132c371e35881b1b4fde03f092bc2eb8d9deb96df89cd9a5a32ab4f94b3c6b` |
+| 8 | `fixed` | `SLong$` | `0500` |
+| 9 | `fixed` | `SLong$` | `0500` |
+| 10 | `fixed` | `SLong$` | `0500` |
+| 11 | `fixed` | `SByte$` | `0201` |
+| 12 | `fixed` | `SInt$` | `0400` |
+| 13 | `fixed` | `SBoolean` | `0100` |
+| 14 | `fixed` | `SInt$` | `0406` |
+| 15 | `fixed` | `SByte$` | `0200` |
+| 16 | `fixed` | `SLong$` | `0580897a` |
+| 17 | `fixed` | `SInt$` | `0402` |
+| 18 | `fixed` | `SInt$` | `0400` |
+| 19 | `CONST_TOKEN_ID` | `Coll[SByte$]` | `0e207e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e` |
+| 20 | `fixed` | `SInt$` | `0400` |
+| 21 | `fixed` | `SInt$` | `0400` |
+| 22 | `fixed` | `SInt$` | `0402` |
 
 ### ZC_Token_Bond SigUSD example
 
-Header: `0x1b`; constant count: `16`.
+Header: `0x1b`; constant count: `23`.
 
 Full serialized ErgoTree hex:
 ```text
-1bb303100400040001000e20ed132c371e35881b1b4fde03f092bc2eb8d9deb96df89cd9a5a32ab4f94b3c6b050005000500040001000580897a040204000e2003faf2cb329f2e90d6d23b58d91bbb6c046aa143261cc21f52fbe2824bfcbf04040004000402d803d601e4e30104d602db6308a7d6038cb272027300000195ec8f72017301927201b1a5d17302d806d604e3000ed605b2a5720100d60693cbc272057303d607c5a7d608ed93e4c67205040e720793e4c67205050e7203d60993dad901090eb0a57304d9010b41639a8c720b01b0db63088c720b027305d9010d414d0ed802d60f8c720d02d6108c720d0195938c720f0172099a72108c720f027210017203730695e67204ea02d19683040193cbe47204e4c6a7080e720672087209d40800d801d60ae4e3020495ecec8f720a730792720ab1a593720a7201d17308d802d60bdb63087205d60cb2a5720a00d196830a018fa3e4c6a707047206720892c172057309eded93b1720b730a938cb2720b730b0001730c928cb2720b730d0002b2e4c6a70611730e0093cbc2720ce4c6a7050e93e4c6720c040e720793db6308720cb47202730fb1720292c1720cc1a77209
+1b8e041704020400040805000580897a040001000e20ed132c371e35881b1b4fde03f092bc2eb8d9deb96df89cd9a5a32ab4f94b3c6b050005000500020104000100040602000580897a040204000e2003faf2cb329f2e90d6d23b58d91bbb6c046aa143261cc21f52fbe2824bfcbf04040004000402d806d601e4c6a70611d602b27201730000d603c1a7d604e4e30104d605db6308a7d6068cb272057301000195ecececec94b1720173028f7202730391720299720373048f72047305927204b1a5d17306d806d607e3000ed608b2a5720400d60993cbc272087307d60ac5a7d60bed93e4c67208040e720a93e4c67208050e7206d60c93dad9010c0eb0a57308d9010e41639a8c720e01b0db63088c720e027309d90110414d0ed802d6128c721002d6138c72100195938c721201720c9a72138c7212027213017206730a95e67207ea02d19683050193cbe47207e4c6a7080e7209720b93e4c672080602730b720cd40800d801d60de4e3020495ecec8f720d730c92720db1a593720d7204d1730dd803d60ec17208d60fdb63087208d610b2a5720d00d196830b018f7ea305b27201730e007209720b93e4c672080602730fed92720e72029299720e72027310eded93b1720f7311938cb2720f731200017313928cb2720f73140002b2720173150093cbc27210e4c6a7050e93e4c67210040e720a93db63087210b472057316b1720592c172109972037202720c
 ```
 
 Raw template hex (`ErgoTree.template`, excludes all constants):
 ```text
-d803d601e4e30104d602db6308a7d6038cb272027300000195ec8f72017301927201b1a5d17302d806d604e3000ed605b2a5720100d60693cbc272057303d607c5a7d608ed93e4c67205040e720793e4c67205050e7203d60993dad901090eb0a57304d9010b41639a8c720b01b0db63088c720b027305d9010d414d0ed802d60f8c720d02d6108c720d0195938c720f0172099a72108c720f027210017203730695e67204ea02d19683040193cbe47204e4c6a7080e720672087209d40800d801d60ae4e3020495ecec8f720a730792720ab1a593720a7201d17308d802d60bdb63087205d60cb2a5720a00d196830a018fa3e4c6a707047206720892c172057309eded93b1720b730a938cb2720b730b0001730c928cb2720b730d0002b2e4c6a70611730e0093cbc2720ce4c6a7050e93e4c6720c040e720793db6308720cb47202730fb1720292c1720cc1a77209
+d806d601e4c6a70611d602b27201730000d603c1a7d604e4e30104d605db6308a7d6068cb272057301000195ecececec94b1720173028f7202730391720299720373048f72047305927204b1a5d17306d806d607e3000ed608b2a5720400d60993cbc272087307d60ac5a7d60bed93e4c67208040e720a93e4c67208050e7206d60c93dad9010c0eb0a57308d9010e41639a8c720e01b0db63088c720e027309d90110414d0ed802d6128c721002d6138c72100195938c721201720c9a72138c7212027213017206730a95e67207ea02d19683050193cbe47207e4c6a7080e7209720b93e4c672080602730b720cd40800d801d60de4e3020495ecec8f720d730c92720db1a593720d7204d1730dd803d60ec17208d60fdb63087208d610b2a5720d00d196830b018f7ea305b27201730e007209720b93e4c672080602730fed92720e72029299720e72027310eded93b1720f7311938cb2720f731200017313928cb2720f73140002b2720173150093cbc27210e4c6a7050e93e4c67210040e720a93db63087210b472057316b1720592c172109972037202720c
 ```
 
 Mainnet address:
 ```text
-fgUe81JcqHNHUYNHVKpQTqFBdPicEFTB9ypvzuLjjWKttPR5kwkxiraNJnDadLc1JBXsGDyK6HUWKR1bQzADup4y1hRAWRsfoxSiZ4etSm1PTJVqY3UGfoZFrs95cxnKFusNjR7TUgD9RzTT5YWcZ1H4rT9P7ZEgXU738pdSx266Ci3RKJEYFPbsKYwYVF2fmGvmuMrXTWi5B5498n3FzZwZkQSQs93D2K1UAd5dqMp3LFgEcPExp57fJeV9Vi2WdxZKtqbGC5vyhRmJ5aP91s66SszwSW5dHS6octTnF8t5yTsfj354HNqR8YghVHtWicZaXtK551qqm5X9Aq4fVsJva8FeRGLmsGJmHuE5kyKZuvWtTqEhskDK3Rrwvv6c2zkjmggEggSuaCHRgLBJer3Kxn1tHej9EbTonDmTv4YgnFcSaNEGs9xAUpF4ciK2pKXqhrm8b8gzhpEwdVmnbWXrtCRkMvtjYzkcXJyBGcFyKu42fTLmwmkCmXKEvS8EdgSJR3KgSrTibje7A9Xa2fGYmxM2QPVuETmVKXupzKrJor1agWR6QbXo9D9ZTuTwQk3gVfUSxzc8UdbmdzRunFN9GcEU
+335hjjFkLYzyY99TeUyNeUzWBdkxb4ZSLXRwpG6uXJDYefQQrASucVdcJ2B7Aiv5kagCBUoyTzozVmvACff9gEg79YyoPBtKBUt7nYFpCmnKbc2RzFvvsbANvq25kyuwZ3qCYM2ZVnXaVnXduNH3C7GE9wdPn2mwn5SS3fUj8ECAYe3xWEcy5pt94o7aWUPBbdNKxxuWk7pUt2EBNYFWhFaJfxvwqK4Vae3VJHVqoqZNnuGWRm4o615yRnRP67v5AgPbEEyE5CnWAHGd7LQik9CATe8FRq4hDuB9mx1ogMyx9fT8ATURbNY6uYp1QKqo9euSP85RR47SFpjEWbCCGQa9zmY34BYaMjNAaWHc88fjLwZWa3a3qj8aeaq59Zr6CkrgffKF7qXM9NUKrAsa1xa1e86AnV3i6Zzqv2WgHTg1nAqHreRokAJ3xtMRnW5Y4KNFj36PLsXp9yz5bj977aMHcTnSvZesZ5KTNHvPcEkeZyBYUSJhyrxyRhzACJLZZnFXjsxwhcb5LNvNv452P2nap8HEtqSsQmnS23YNXT2RAnUxiFx2cowjdU15dRGTk5kAwx5GCtnWc9tFUscbdHXzufKvzogGGmDm7CxcGyM2KNDYEAeNmwHSuCXC3QxuZezeZuD8zTbpGcYpAL3cq2TyTGvJTaoXzKtVc1fLqVsDbpU88VX2iV18aTjsHtmgS2kVAYLmBk77HWTiSb6eJFWBh
 ```
 
 Testnet address:
 ```text
-56oAMZ1tu2ZcapSNsY4t6K8oD8ajdiaErfPvQ9QhDt51wmYg3SAq6jWMJALjUE8VbWtyL1ceS5PSSf11PLVmuEEuTsG2G9KPh1VHmspkKD6ZEQLc4T6TViKiN5yq7cMPJKjNWENP4TvnVwtMYdbiwRmfkpgNu5U3FstYGF1v6btx1jCsW9XdXAGiqc2Wbh2nM1dWCBCSFdtMbn9GSvbUn1naoDBJXnxdrswhHYNDH9BY6G6VU7BjEYPUdQsT7DAX1MaW1uFqu1LSEjsgGcBm5wc8b9McLC5356FmDKZzF8cw8oczFFQSmaZZx83JpfjSuryjatLSR3uoq326iaqtELsH1wx5RfTfCssK5APfjvrQ96MvoG4N4TpW3yxv9DwsPCSuMN7q4aPoxaXQPP2bmSSbBPFtEqCRftAxv4DRcskuEmWkz5gdU8X9rtiS4AcGebJatS6wUkEpGcoGZ5AETnUq27RZ2GhZcPYk6rf9aNM8DKcSN41EhjM15BQADTnRoXwvaRKyYn7gWqGwaNVKEac5kpce1UxfgfZBTZc5hmgpqey6ygLtLQmxUbzevwW8apGX4PDX68g28gi3VMUw3VcH7rbb6
+DX2zRHKqmjFu95QabVWeqpUnbUPRhCfYrdanFW6ADMZafeRXdptCvb8tXHMD4Lc9obnqj94kbXM97zVQEYQTbLm6orehLDyPKtjGvr9RKhGTjYX8JuxCyi6gWf296Rgen6tR2AcMoTp3CDWqDQFY4u6nsAtTv5yRb7LqAgo79R9RC8DFUcSVs4HhDyJu3i6Fb5Tbuxexmuw12QchCszAg8saNcN74rndykK3oiZMeAujzstXLPcuYAi48k3BgmZaJ2N2rQiAhuyVudkEUZn3HZ7JAZks63qBWnMKehKjwn4GuaiZ1Ex5C9U89seHeH5kcGjZtqHrRn85m2D7QWuH4nnLuFZ1UufvGZH2ji5Xo3aoRUeLdFUaE7BwPbsKZ2QRqhNr6b6384dMBD7C7wrnShRsr4qq7eArfKPhZP9jSe7hTRjuaTRcLBTBPYmgxuTiwds8cM8x4ofnAeNM8vysY3VwkoRmWWgGsJcY8DsL4sPH7ijvp9cnWnStGJpgkzSk6B3bGHLAzXnCMLpeeWppC5VutoFW1aoG8GVKgB5aA7rUwctijyLJtjp2k8dvLsccqjCmnd2sTMDVhgvmUjPzHQb969GPddZgPvp7T6SPPso3mW4Fh29RWCExCq4JVqLaMexbMGZs1XdjLqVKiemvC9EuHe8eMeE3QL88btGm5KZwTHzwMF2S8vhF1ZogAJjL7yB6bmn3Hvqb7k98bctcsLyx8
 ```
 
 Constant registry. Only named terms may change; every `fixed` constant must match this prototype exactly.
@@ -343,35 +364,42 @@ Values below are serialized Sigma constants, including their type prefix; they a
 
 | Zero-based constant index | Role | Sigma type | Serialized constant hex |
 |---:|---|---|---|
-| 0 | `fixed` | `SInt$` | `0400` |
+| 0 | `fixed` | `SInt$` | `0402` |
 | 1 | `fixed` | `SInt$` | `0400` |
-| 2 | `fixed` | `SBoolean` | `0100` |
-| 3 | `fixed` | `Coll[SByte$]` | `0e20ed132c371e35881b1b4fde03f092bc2eb8d9deb96df89cd9a5a32ab4f94b3c6b` |
-| 4 | `fixed` | `SLong$` | `0500` |
-| 5 | `fixed` | `SLong$` | `0500` |
-| 6 | `fixed` | `SLong$` | `0500` |
-| 7 | `fixed` | `SInt$` | `0400` |
-| 8 | `fixed` | `SBoolean` | `0100` |
-| 9 | `fixed` | `SLong$` | `0580897a` |
-| 10 | `fixed` | `SInt$` | `0402` |
-| 11 | `fixed` | `SInt$` | `0400` |
-| 12 | `CONST_TOKEN_ID` | `Coll[SByte$]` | `0e2003faf2cb329f2e90d6d23b58d91bbb6c046aa143261cc21f52fbe2824bfcbf04` |
-| 13 | `fixed` | `SInt$` | `0400` |
-| 14 | `fixed` | `SInt$` | `0400` |
-| 15 | `fixed` | `SInt$` | `0402` |
+| 2 | `fixed` | `SInt$` | `0408` |
+| 3 | `fixed` | `SLong$` | `0500` |
+| 4 | `fixed` | `SLong$` | `0580897a` |
+| 5 | `fixed` | `SInt$` | `0400` |
+| 6 | `fixed` | `SBoolean` | `0100` |
+| 7 | `fixed` | `Coll[SByte$]` | `0e20ed132c371e35881b1b4fde03f092bc2eb8d9deb96df89cd9a5a32ab4f94b3c6b` |
+| 8 | `fixed` | `SLong$` | `0500` |
+| 9 | `fixed` | `SLong$` | `0500` |
+| 10 | `fixed` | `SLong$` | `0500` |
+| 11 | `fixed` | `SByte$` | `0201` |
+| 12 | `fixed` | `SInt$` | `0400` |
+| 13 | `fixed` | `SBoolean` | `0100` |
+| 14 | `fixed` | `SInt$` | `0406` |
+| 15 | `fixed` | `SByte$` | `0200` |
+| 16 | `fixed` | `SLong$` | `0580897a` |
+| 17 | `fixed` | `SInt$` | `0402` |
+| 18 | `fixed` | `SInt$` | `0400` |
+| 19 | `CONST_TOKEN_ID` | `Coll[SByte$]` | `0e2003faf2cb329f2e90d6d23b58d91bbb6c046aa143261cc21f52fbe2824bfcbf04` |
+| 20 | `fixed` | `SInt$` | `0400` |
+| 21 | `fixed` | `SInt$` | `0400` |
+| 22 | `fixed` | `SInt$` | `0402` |
 
 ### ZC_Order prototype
 
-Header: `0x1b`; constant count: `32`.
+Header: `0x1b`; constant count: `36`.
 
 Full serialized ErgoTree hex:
 ```text
-1be20420050005000e206262626262626262626262626262626262626262626262626262626262626262050004000402040204040400050404000400040005020e206161616161616161616161616161616161616161616161616161616161616161040004000400050204020404040005e4b88d9d42040205e6b88d9d4204e8c06c0e20636363636363636363636363636363636363636363636363636363636363636305000580897a040205e2b88d9d420c4d0e01206464646464646464646464646464646464646464646464646464646464646464eab88d9d42d803d601c5a7d602dad901020eb0a57300d9010441639a8c720401b0db63088c7204027301d90106414d0ed802d6088c720602d6098c72060195938c72080172029a72098c7208027209017201d6037302959172027303d805d604b2a5730400d605b2a5730500d606e4c672050611d607b27206730600d608b2a5730700d1ededededededededed937201c5b2a4730800937202730991b1db63087204730a938cb2db63087204730b00017201938cb2db63087204730c0002730dededededed93cbc27205730e91b1db63087205730f938cb2db63087205731000017201938cb2db63087205731100027312d801d609db6308720593b472097313b17209db6308a792c17205c1a7edededededed93e4c67205040e720193e4c67205050e720393b17206731493b27206731500731693b27206731700731893e4c672050704731993e4c67205080e731aed927207731b9299c172057207731c91e4c6720507049aa3731deded93cbc27208720392c17208731e93db63087208731fd1aea4d901046393cbc272047203
+1b9e0524050005000e206262626262626262626262626262626262626262626262626262626262626262050004000402040204040400050404000400040005020e2061616161616161616161616161616161616161616161616161616161616161610400040004000502040205000408040005e4b88d9d420402040405e2b88d9d420c4d0e01206464646464646464646464646464646464646464646464646464646464646464eab88d9d42040605e8c06c0e20636363636363636363636363636363636363636363636363636363636363636305000580897a040605020404d803d601c5a7d602dad901020eb0a57300d9010441639a8c720401b0db63088c7204027301d90106414d0ed802d6088c720602d6098c72060195938c72080172029a72098c7208027209017201d6037302959172027303d806d604b2a5730400d605b2a5730500d606e4e30005d607e4c672050611d608b27207730600d609b2a5730700d1ededededededededed937201c5b2a4730800937202730991b1db63087204730a938cb2db63087204730b00017201938cb2db63087204730c0002730dededededededed93cbc27205730e91b1db63087205730f938cb2db63087205731000017201938cb2db63087205731100027312d801d60adb6308720593b4720a7313b1720adb6308a792c17205c1a792720673149299c17205c1a77206edededededededed93e4c67205040e720193e4c67205050e720393b17207731593b27207731600731793b27207731800720693b27207731900731a93e4c67205070c4d0e731b93b27207731c00731d93e4c67205080e731eed927208731f9299c172057208732091b272077321009a7ea3057322eded93cbc27209720392c17209b2720773230093db63087209e4c67205070c4d0ed1aea4d901046393cbc272047203
 ```
 
 Raw template hex (`ErgoTree.template`, excludes all constants):
 ```text
-d803d601c5a7d602dad901020eb0a57300d9010441639a8c720401b0db63088c7204027301d90106414d0ed802d6088c720602d6098c72060195938c72080172029a72098c7208027209017201d6037302959172027303d805d604b2a5730400d605b2a5730500d606e4c672050611d607b27206730600d608b2a5730700d1ededededededededed937201c5b2a4730800937202730991b1db63087204730a938cb2db63087204730b00017201938cb2db63087204730c0002730dededededed93cbc27205730e91b1db63087205730f938cb2db63087205731000017201938cb2db63087205731100027312d801d609db6308720593b472097313b17209db6308a792c17205c1a7edededededed93e4c67205040e720193e4c67205050e720393b17206731493b27206731500731693b27206731700731893e4c672050704731993e4c67205080e731aed927207731b9299c172057207731c91e4c6720507049aa3731deded93cbc27208720392c17208731e93db63087208731fd1aea4d901046393cbc272047203
+d803d601c5a7d602dad901020eb0a57300d9010441639a8c720401b0db63088c7204027301d90106414d0ed802d6088c720602d6098c72060195938c72080172029a72098c7208027209017201d6037302959172027303d806d604b2a5730400d605b2a5730500d606e4e30005d607e4c672050611d608b27207730600d609b2a5730700d1ededededededededed937201c5b2a4730800937202730991b1db63087204730a938cb2db63087204730b00017201938cb2db63087204730c0002730dededededededed93cbc27205730e91b1db63087205730f938cb2db63087205731000017201938cb2db63087205731100027312d801d60adb6308720593b4720a7313b1720adb6308a792c17205c1a792720673149299c17205c1a77206edededededededed93e4c67205040e720193e4c67205050e720393b17207731593b27207731600731793b27207731800720693b27207731900731a93e4c67205070c4d0e731b93b27207731c00731d93e4c67205080e731eed927208731f9299c172057208732091b272077321009a7ea3057322eded93cbc27209720392c17209b2720773230093db63087209e4c67205070c4d0ed1aea4d901046393cbc272047203
 ```
 
 Constant registry. Only named terms may change; every `fixed` constant must match this prototype exactly.
@@ -399,31 +427,35 @@ Values below are serialized Sigma constants, including their type prefix; they a
 | 17 | `fixed` | `SInt$` | `0400` |
 | 18 | `fixed` | `SLong$` | `0502` |
 | 19 | `fixed` | `SInt$` | `0402` |
-| 20 | `fixed` | `SInt$` | `0404` |
-| 21 | `fixed` | `SInt$` | `0400` |
-| 22 | `CONST_REPAYMENT` | `SLong$` | `05e4b88d9d42` |
-| 23 | `fixed` | `SInt$` | `0402` |
-| 24 | `CONST_BATCHING_FEE` | `SLong$` | `05e6b88d9d42` |
-| 25 | `CONST_MATURITY` | `SInt$` | `04e8c06c` |
-| 26 | `CONST_LIQ_SCRIPT_HASH` | `Coll[SByte$]` | `0e206363636363636363636363636363636363636363636363636363636363636363` |
-| 27 | `fixed` | `SLong$` | `0500` |
-| 28 | `fixed` | `SLong$` | `0580897a` |
-| 29 | `fixed` | `SInt$` | `0402` |
-| 30 | `CONST_PRINCIPAL_ERG` | `SLong$` | `05e2b88d9d42` |
-| 31 | `CONST_PRINCIPAL_TOKENS` | `Coll[(Coll[SByte$],SLong$)]` | `0c4d0e01206464646464646464646464646464646464646464646464646464646464646464eab88d9d42` |
+| 20 | `fixed` | `SLong$` | `0500` |
+| 21 | `fixed` | `SInt$` | `0408` |
+| 22 | `fixed` | `SInt$` | `0400` |
+| 23 | `CONST_REPAYMENT` | `SLong$` | `05e4b88d9d42` |
+| 24 | `fixed` | `SInt$` | `0402` |
+| 25 | `fixed` | `SInt$` | `0404` |
+| 26 | `CONST_PRINCIPAL_ERG` | `SLong$` | `05e2b88d9d42` |
+| 27 | `CONST_PRINCIPAL_TOKENS` | `Coll[(Coll[SByte$],SLong$)]` | `0c4d0e01206464646464646464646464646464646464646464646464646464646464646464eab88d9d42` |
+| 28 | `fixed` | `SInt$` | `0406` |
+| 29 | `CONST_MATURITY` | `SLong$` | `05e8c06c` |
+| 30 | `CONST_LIQ_SCRIPT_HASH` | `Coll[SByte$]` | `0e206363636363636363636363636363636363636363636363636363636363636363` |
+| 31 | `fixed` | `SLong$` | `0500` |
+| 32 | `fixed` | `SLong$` | `0580897a` |
+| 33 | `fixed` | `SInt$` | `0406` |
+| 34 | `fixed` | `SLong$` | `0502` |
+| 35 | `fixed` | `SInt$` | `0404` |
 
 ### ZC_OrderOnClose prototype
 
-Header: `0x1b`; constant count: `33`.
+Header: `0x1b`; constant count: `37`.
 
 Full serialized ErgoTree hex:
 ```text
-1bf30421050005000e207272727272727272727272727272727272727272727272727272727272727272050004000402040204f4887a04040400050404000400040005020e207171717171717171717171717171717171717171717171717171717171717171040004000400050204020404040005f08fdfc04a040205f28fdfc04a0e20737373737373737373737373737373737373737373737373737373737373737305000580897a043c041005ee8fdfc04a0c4d0e01207474747474747474747474747474747474747474747474747474747474747474f68fdfc04ad803d601c5a7d602dad901020eb0a57300d9010441639a8c720401b0db63088c7204027301d90106414d0ed802d6088c720602d6098c72060195938c72080172029a72098c7208027209017201d6037302959172027303d807d604b2a5730400d605b2a5730500d606e4c672050611d607b27206730600d6089aa37307d609e4c672050704d60ab2a5730800d1ededededededededed937201c5b2a4730900937202730a91b1db63087204730b938cb2db63087204730c00017201938cb2db63087204730d0002730eededededed93cbc27205730f91b1db630872057310938cb2db63087205731100017201938cb2db63087205731200027313d801d60bdb6308720593b4720b7314b1720bdb6308a792c17205c1a7ededededed93e4c67205040e720193e4c67205050e720393b17206731593b27206731600731793b27206731800731993e4c67205080e731aed927207731b9299c172057207731ceded92997208a3731d9072097208927209997208731eeded93cbc2720a720392c1720a731f93db6308720a7320d1aea4d901046393cbc272047203
+1bbd0525050005000e207272727272727272727272727272727272727272727272727272727272727272050004000402040205f4887a040604040400050404000400040005020e2071717171717171717171717171717171717171717171717171717171717171710400040004000502040205000408040005f08fdfc04a0402040405ee8fdfc04a0c4d0e01207474747474747474747474747474747474747474747474747474747474747474f68fdfc04a0e20737373737373737373737373737373737373737373737373737373737373737305000580897a053c053c05100404d803d601c5a7d602dad901020eb0a57300d9010441639a8c720401b0db63088c7204027301d90106414d0ed802d6088c720602d6098c72060195938c72080172029a72098c7208027209017201d6037302959172027303d809d604b2a5730400d605b2a5730500d606e4e30005d607e4c672050611d608b27207730600d6097ea305d60a9a72097307d60bb27207730800d60cb2a5730900d1ededededededededed937201c5b2a4730a00937202730b91b1db63087204730c938cb2db63087204730d00017201938cb2db63087204730e0002730fededededededed93cbc27205731091b1db630872057311938cb2db63087205731200017201938cb2db63087205731300027314d801d60ddb6308720593b4720d7315b1720ddb6308a792c17205c1a792720673169299c17205c1a77206ededededededed93e4c67205040e720193e4c67205050e720393b17207731793b27207731800731993b27207731a00720693b27207731b00731c93e4c67205070c4d0e731d93e4c67205080e731eed927208731f9299c1720572087320ededed92720a9a720973219299720a7209732290720b720a92720b99720a7323eded93cbc2720c720392c1720cb2720773240093db6308720ce4c67205070c4d0ed1aea4d901046393cbc272047203
 ```
 
 Raw template hex (`ErgoTree.template`, excludes all constants):
 ```text
-d803d601c5a7d602dad901020eb0a57300d9010441639a8c720401b0db63088c7204027301d90106414d0ed802d6088c720602d6098c72060195938c72080172029a72098c7208027209017201d6037302959172027303d807d604b2a5730400d605b2a5730500d606e4c672050611d607b27206730600d6089aa37307d609e4c672050704d60ab2a5730800d1ededededededededed937201c5b2a4730900937202730a91b1db63087204730b938cb2db63087204730c00017201938cb2db63087204730d0002730eededededed93cbc27205730f91b1db630872057310938cb2db63087205731100017201938cb2db63087205731200027313d801d60bdb6308720593b4720b7314b1720bdb6308a792c17205c1a7ededededed93e4c67205040e720193e4c67205050e720393b17206731593b27206731600731793b27206731800731993e4c67205080e731aed927207731b9299c172057207731ceded92997208a3731d9072097208927209997208731eeded93cbc2720a720392c1720a731f93db6308720a7320d1aea4d901046393cbc272047203
+d803d601c5a7d602dad901020eb0a57300d9010441639a8c720401b0db63088c7204027301d90106414d0ed802d6088c720602d6098c72060195938c72080172029a72098c7208027209017201d6037302959172027303d809d604b2a5730400d605b2a5730500d606e4e30005d607e4c672050611d608b27207730600d6097ea305d60a9a72097307d60bb27207730800d60cb2a5730900d1ededededededededed937201c5b2a4730a00937202730b91b1db63087204730c938cb2db63087204730d00017201938cb2db63087204730e0002730fededededededed93cbc27205731091b1db630872057311938cb2db63087205731200017201938cb2db63087205731300027314d801d60ddb6308720593b4720d7315b1720ddb6308a792c17205c1a792720673169299c17205c1a77206ededededededed93e4c67205040e720193e4c67205050e720393b17207731793b27207731800731993b27207731a00720693b27207731b00731c93e4c67205070c4d0e731d93e4c67205080e731eed927208731f9299c1720572087320ededed92720a9a720973219299720a7209732290720b720a92720b99720a7323eded93cbc2720c720392c1720cb2720773240093db6308720ce4c67205070c4d0ed1aea4d901046393cbc272047203
 ```
 
 Constant registry. Only named terms may change; every `fixed` constant must match this prototype exactly.
@@ -438,45 +470,49 @@ Values below are serialized Sigma constants, including their type prefix; they a
 | 4 | `fixed` | `SInt$` | `0400` |
 | 5 | `fixed` | `SInt$` | `0402` |
 | 6 | `fixed` | `SInt$` | `0402` |
-| 7 | `CONST_DURATION` | `SInt$` | `04f4887a` |
-| 8 | `fixed` | `SInt$` | `0404` |
-| 9 | `fixed` | `SInt$` | `0400` |
-| 10 | `fixed` | `SLong$` | `0504` |
-| 11 | `fixed` | `SInt$` | `0400` |
+| 7 | `CONST_DURATION` | `SLong$` | `05f4887a` |
+| 8 | `fixed` | `SInt$` | `0406` |
+| 9 | `fixed` | `SInt$` | `0404` |
+| 10 | `fixed` | `SInt$` | `0400` |
+| 11 | `fixed` | `SLong$` | `0504` |
 | 12 | `fixed` | `SInt$` | `0400` |
 | 13 | `fixed` | `SInt$` | `0400` |
-| 14 | `fixed` | `SLong$` | `0502` |
-| 15 | `CONST_BOND_HASH` | `Coll[SByte$]` | `0e207171717171717171717171717171717171717171717171717171717171717171` |
-| 16 | `fixed` | `SInt$` | `0400` |
+| 14 | `fixed` | `SInt$` | `0400` |
+| 15 | `fixed` | `SLong$` | `0502` |
+| 16 | `CONST_BOND_HASH` | `Coll[SByte$]` | `0e207171717171717171717171717171717171717171717171717171717171717171` |
 | 17 | `fixed` | `SInt$` | `0400` |
 | 18 | `fixed` | `SInt$` | `0400` |
-| 19 | `fixed` | `SLong$` | `0502` |
-| 20 | `fixed` | `SInt$` | `0402` |
-| 21 | `fixed` | `SInt$` | `0404` |
-| 22 | `fixed` | `SInt$` | `0400` |
-| 23 | `CONST_REPAYMENT` | `SLong$` | `05f08fdfc04a` |
-| 24 | `fixed` | `SInt$` | `0402` |
-| 25 | `CONST_BATCHING_FEE` | `SLong$` | `05f28fdfc04a` |
-| 26 | `CONST_LIQ_SCRIPT_HASH` | `Coll[SByte$]` | `0e207373737373737373737373737373737373737373737373737373737373737373` |
-| 27 | `fixed` | `SLong$` | `0500` |
-| 28 | `fixed` | `SLong$` | `0580897a` |
-| 29 | `fixed` | `SInt$` | `043c` |
-| 30 | `fixed` | `SInt$` | `0410` |
-| 31 | `CONST_PRINCIPAL_ERG` | `SLong$` | `05ee8fdfc04a` |
-| 32 | `CONST_PRINCIPAL_TOKENS` | `Coll[(Coll[SByte$],SLong$)]` | `0c4d0e01207474747474747474747474747474747474747474747474747474747474747474f68fdfc04a` |
+| 19 | `fixed` | `SInt$` | `0400` |
+| 20 | `fixed` | `SLong$` | `0502` |
+| 21 | `fixed` | `SInt$` | `0402` |
+| 22 | `fixed` | `SLong$` | `0500` |
+| 23 | `fixed` | `SInt$` | `0408` |
+| 24 | `fixed` | `SInt$` | `0400` |
+| 25 | `CONST_REPAYMENT` | `SLong$` | `05f08fdfc04a` |
+| 26 | `fixed` | `SInt$` | `0402` |
+| 27 | `fixed` | `SInt$` | `0404` |
+| 28 | `CONST_PRINCIPAL_ERG` | `SLong$` | `05ee8fdfc04a` |
+| 29 | `CONST_PRINCIPAL_TOKENS` | `Coll[(Coll[SByte$],SLong$)]` | `0c4d0e01207474747474747474747474747474747474747474747474747474747474747474f68fdfc04a` |
+| 30 | `CONST_LIQ_SCRIPT_HASH` | `Coll[SByte$]` | `0e207373737373737373737373737373737373737373737373737373737373737373` |
+| 31 | `fixed` | `SLong$` | `0500` |
+| 32 | `fixed` | `SLong$` | `0580897a` |
+| 33 | `fixed` | `SLong$` | `053c` |
+| 34 | `fixed` | `SLong$` | `053c` |
+| 35 | `fixed` | `SLong$` | `0510` |
+| 36 | `fixed` | `SInt$` | `0404` |
 
 ### MaturityLiquidation compilation tree
 
-Header: `0x1b`; constant count: `4`.
+Header: `0x1b`; constant count: `5`.
 
 Full serialized ErgoTree hex:
 ```text
-1b57040400010004020402d801d601e4e3010495ec8f72017300927201b1a5d17301d802d602b2a5720100d603db6308a7d1eded92a3e4c6a7070493db63087202b472037302b1720392c1720299c1a7b2e4c6a70611730300
+1b600504000100040604020402d801d601e4e3010495ec8f72017300927201b1a5d17301d803d602e4c6a70611d603b2a5720100d604db6308a7d1eded927ea305b2720273020093db63087203b472047303b1720492c1720399c1a7b27202730400
 ```
 
 Raw template hex (`ErgoTree.template`, excludes all constants):
 ```text
-d801d601e4e3010495ec8f72017300927201b1a5d17301d802d602b2a5720100d603db6308a7d1eded92a3e4c6a7070493db63087202b472037302b1720392c1720299c1a7b2e4c6a70611730300
+d801d601e4e3010495ec8f72017300927201b1a5d17301d803d602e4c6a70611d603b2a5720100d604db6308a7d1eded927ea305b2720273020093db63087203b472047303b1720492c1720399c1a7b27202730400
 ```
 
 ### MaturityLiquidation runtime expression
@@ -485,10 +521,10 @@ Attach these raw expression bytes to the bond input as context variable 0 of typ
 Do not attach the compilation ErgoTree or a serialized Sigma `Coll[Byte]` constant in their place.
 
 ```text
-d801d601e4e3010495ec8f72010400927201b1a5d10100d802d602b2a5720100d603db6308a7d1eded92a3e4c6a7070493db63087202b472030402b1720392c1720299c1a7b2e4c6a70611040200
+d801d601e4e3010495ec8f72010400927201b1a5d10100d803d602e4c6a70611d603b2a5720100d604db6308a7d1eded927ea305b2720204060093db63087203b472040402b1720492c1720399c1a7b27202040200
 ```
 
-Expression blake2b256 (bond R8 / order `CONST_LIQ_SCRIPT_HASH`): `6b640d3ae3788c1dbe308a4d7f8a8daeddb3ba0c486e773f93ef807e5ccc86d0`.
+Expression blake2b256 (bond R8 / order `CONST_LIQ_SCRIPT_HASH`): `ea301f93d1a806e8fedd21ef0ffae39bdbfc15671c41247c4476ccb942a1485b`.
 
 ### Source fingerprints
 
@@ -496,13 +532,13 @@ blake2b256 over UTF-8 source text after normalizing CRLF to LF; these fingerprin
 
 | Compiler input | Normalized source blake2b256 |
 |---|---|
-| `contracts/bonds/P2P/ZC_ERG_Bond.ergo` | `a380df8b2fd3f1c16826483fa9bc06963f8e3e7fa9493cf6fe8243ea2b39a5f1` |
-| `contracts/bonds/P2P/ZC_Token_Bond.ergo` | `fb1a1c2e01e8f13fa9f4be7027c4c50a6ac4ca942bda5de219bc05f5cfc5654a` |
-| `contracts/bonds/P2P/ZC_Order.ergo` | `f3dfd2d00c9b82e71ab34af3db1d43704079962bfa88d79e78682a3e76b29ca1` |
-| `contracts/bonds/P2P/ZC_OrderOnClose.ergo` | `fc0fb63936762ff15c2bf9472606b8648a3d948ccb2f59e716a1cb80b1adb3d2` |
-| `contracts/bonds/lender-scripts/BondAssetVault.ergo` | `71cd992bf06c84f2fc4de34ec18ad683518d27dbf648b4e9dd3287bbaf06647e` |
-| `contracts/bonds/liquidations/MaturityLiquidation.ergo` | `cfe39325bdbec444c822587848d96aa99af2a6c35b230f2577d5faac38a2ddc0` |
-| `src/main/scala/client/ScriptGenerator.scala` | `c5ad147c4cb04b29b8fc5692ea056be5781539c6b356da331462352a7a372bc3` |
+| `contracts/bonds/P2P/ZC_ERG_Bond.ergo` | `5a331aa821cd0f8af6f3fbf1867c8e3f96f7ecf007e2d53b54e989d167d9d160` |
+| `contracts/bonds/P2P/ZC_Token_Bond.ergo` | `f4e6b8ab7ed2536c9762068ccd265531a54a10192dbcdd4c5d075cd84be2cf27` |
+| `contracts/bonds/P2P/ZC_Order.ergo` | `18ef26f52222f0deb3fe130dd2228caa4d3f39a6acae709c3fa011561fe56a83` |
+| `contracts/bonds/P2P/ZC_OrderOnClose.ergo` | `61209c052c8107b6c3300bdea9e3d3a39dc031019db9360f1d61525818aaca4c` |
+| `contracts/bonds/lender-scripts/BondAssetVault.ergo` | `3297b063e1287b33732e2f6f4bbe0a70a836460aea0af716ce6385010e7e505a` |
+| `contracts/bonds/liquidations/MaturityLiquidation.ergo` | `ba5f0f3647f5f73c3d81a61ffb599119731c89efab5dc1c65d125144520af19e` |
+| `src/main/scala/client/ScriptGenerator.scala` | `4ca08f4fa77b4b12b3a4b28e0d18895c7169192e2daf0d82bea332ed03b12372` |
 | `src/main/scala/work/lithos/mutations/Contract.scala` | `fe1e473783454eab1b759feb7ea3ab9c757d8e26ec0aef615dd45a5573021213` |
 | `build.sbt` | `24bff2ad1f970a11d84ac547b66b8b1e469299c18029476e447f3e16c723b6ef` |
 | `project/build.properties` | `e6023cb99f0ff57fdcb183b400632402e711320ee722372eb7a6a844ba9f4897` |

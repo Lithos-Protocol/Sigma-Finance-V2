@@ -67,7 +67,7 @@ class MaturityLiquidationSpec extends AnyPropSpec with BondSpecBase {
             .withCtxVar(0.toByte, liqVar(matured(ctx))).withCtxVar(1.toByte, ErgoValue.of(i))
         }
         val outs = assets.zip(ins).map { case (asset, in) =>
-          settlement(vault(ctx), collateralErg - batchingFee, in.id, asset, defaultCollateral)
+          settlement(vault(ctx), collateralErg, in.id, asset, defaultCollateral)
         }
         val batcher = executor(ctx)
         val signed = accepts(batcher, buildAt(ctx, maturity, ins, outs, batcher.getAddress, burn = assets.map(Token(_, 1L))))

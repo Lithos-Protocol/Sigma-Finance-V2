@@ -61,14 +61,20 @@ V2 is not deployed. Contract edits change script hashes and addresses.
 |---|---|
 | `tokens(0)` | Bond asset, amount 1; burned on settlement |
 | `tokens(1..)` | Collateral tokens |
-| `value` | Collateral nanoERG |
+| `value` | Borrower collateral nanoERG plus lender-funded batching reserve |
 | R4: `Coll[Byte]` | Originating order id, also the bond asset id |
 | R5: `Coll[Byte]` | Borrower's script hash; collateral returns here on repayment |
-| R6: `Coll[Long]` | Exactly `(repayment, batching fee)`; fee is nanoERG |
-| R7: `Int` | Maturity height; repayment requires `HEIGHT < R7` |
+| R6: `Coll[Long]` | Exactly `(repayment, batchingFee, principalErg, maturityHeight)`; ERG fields are nanoERG |
+| R7: `Coll[(Coll[Byte], Long)]` | Agreed principal token list; empty for an ERG loan |
 | R8: `Coll[Byte]` | Hash of the serialized liquidation expression |
 
-The vault is a compiled constant. This layout replaces the earlier `Generators` layout with vault hash
+R6(3) is a `Long` height; comparisons widen `HEIGHT` to `Long`. R6(2) and R7 record the agreed
+principal terms, not collateral or the fee reserve. An accidental principal overpayment does not change
+these terms. Custom liquidation expressions can read these fields directly, after authenticating the
+bond origin as needed. The borrower collateral ERG is `bond.value - R6(1)`.
+
+The vault is a compiled constant. This layout replaces the earlier two-element R6 / Int-maturity R7
+layout, as well as the `Generators` layout with vault hash
 in R8 and liquidation hash in R9. Builders, readers and scripts must use the matching contract version;
 old boxes are not migrated by these source changes.
 
@@ -80,8 +86,10 @@ at least its entire ERG value must pass into the resulting bond. The terms are:
 - `CONST_BOND_HASH`: full hash of the ERG bond or the token bond for the repayment asset.
 - `CONST_BORROWER_HASH`: principal recipient, collateral recipient and cancellation authority.
 - `CONST_PRINCIPAL_ERG`, `CONST_PRINCIPAL_TOKENS`: principal ERG floor and exact principal tokens.
-- `CONST_REPAYMENT`, `CONST_BATCHING_FEE`, `CONST_LIQ_SCRIPT_HASH`: the bond's repayment and liquidation terms.
-- `CONST_MATURITY` for fixed orders, or `CONST_DURATION` for on-close orders.
+- `CONST_REPAYMENT`, `CONST_LIQ_SCRIPT_HASH`: the bond's repayment and liquidation terms.
+- There is no batching-fee order constant. On fill, context variable 0 on the **order input** is a
+  required `Long` specifying the lender-selected, nonnegative nanoERG fee reserve.
+- `CONST_MATURITY` (`Long`) for fixed orders, or `CONST_DURATION` (`Long`) for on-close orders.
 
 An ERG loan has an empty principal token list; a token loan pays one token plus the box's ERG floor.
 The client checks that principal and repayment asset match. The order contract itself trusts the
@@ -96,7 +104,7 @@ For a fill, the order is `INPUTS(0)` and the lender supplies the principal:
 | Output | Contents |
 |---|---|
 | `OUTPUTS(0)` | Lender's unit: `(order.id, 1)` at tokens(0), to the lender's chosen script |
-| `OUTPUTS(1)` | Bond: `(order.id, 1)`, followed by the order's unchanged tokens, value at least the order's |
+| `OUTPUTS(1)` | Bond: `(order.id, 1)`, followed by the order's unchanged tokens, value at least the order's plus the lender-selected reserve |
 | `OUTPUTS(2)` | Principal to the borrower |
 
 The order pins bond R4-R8 and requires exactly two new units across **all** outputs. The lender unit
@@ -118,8 +126,15 @@ Borrowers should cancel orders left open near maturity. An on-close order requir
 of duration; its bond maturity may trail `HEIGHT + duration` by up to 8 blocks. A fill built at height
 h remains valid through h + 8, then must be rebuilt.
 
-Both order types bound the fee to `0 <= fee <= bond.value - 0.001 ERG`, preserving the existing order
-terms. `MaturityLiquidation` uses this ceiling; a custom expression determines its own payout rule.
+Both order types pin the fee in bond R6(1) to the lender's context variable and require
+`bond.value - order.value >= fee`, with `fee >= 0`. This subtraction avoids addition overflow and
+preserves the entire borrower collateral. The lender supplies the reserve in addition to the principal,
+issuing-unit minimum ERG and miner fee; the reserve is not deducted from the principal. It can exceed
+the collateral value if fully funded. Cancellation does not require the fill context variable.
+
+The CLI accepts `fill-order <order id> --batching-fee <ERG>` (default 0.002 ERG). It rejects
+`--batching-fee` on `create-order`. The fill stores agreed principal ERG/tokens in bond R6(2)/R7,
+pins maturity in R6(3), and uses checked addition when funding the reserve.
 
 The borrower may cancel before fill by co-spending a box guarded by the borrower script, without
 minting the asset. Cancellation leaves outputs unconstrained. Use an appropriate borrower script:
@@ -132,9 +147,10 @@ Set context variable 1 (`Int`) to the settlement output index and variable 2 (`I
 collateral-return output index on each bond input. The indices must be in range and distinct:
 
 - `OUTPUTS(getVar[Int](1).get)` pays the vault, with R4 = bond box id and R5 = bond asset id. ERG bonds pay at least
-  the repayment value. Token bonds pay exactly one token id, `CONST_TOKEN_ID`, at least the repayment
-  quantity, plus at least 0.001 ERG.
-- `OUTPUTS(getVar[Int](2).get)` returns all collateral tokens and at least the bond's value to the borrower, with
+  the repayment value **plus the fee reserve**. Token bonds pay exactly one token id, `CONST_TOKEN_ID`,
+  at least the repayment quantity, plus at least **0.001 ERG + the fee reserve**. Settlement R6 must be
+  `0.toByte`. This refunds the unused lender-funded reserve to the circulating bond asset holder.
+- `OUTPUTS(getVar[Int](2).get)` returns all collateral tokens and at least `bond.value - bond.R6(1)` to the borrower, with
   R4 = bond box id.
 - No output may carry the bond asset: the singleton is burned.
 
@@ -149,17 +165,17 @@ The bytes are an expression, not an ErgoTree; `ContractClient` prints both bytes
 
 Set context variable 1 (`Int`) to the settlement output index on each bond input. The bond always
 requires `OUTPUTS(getVar[Int](1).get)` to use the compiled vault script,
-R4 = bond box id, and R5 = bond asset id. It also requires the singleton to be burned. **The liquidation
+R4 = bond box id, R5 = bond asset id, and R6 = `1.toByte`. It also requires the singleton to be burned. **The liquidation
 expression controls eligibility, vault ERG value and vault tokens.** It can therefore enforce a
 conversion of collateral tokens into ERG or another agreed asset in the same transaction.
 
 `MaturityLiquidation` implements the standard rule:
 
-- `HEIGHT >= R7`.
+- `HEIGHT.toLong >= R6(3)`.
 - Vault tokens exactly equal the collateral tokens after the singleton.
-- Vault value is at least `bond.value - R6(1)`.
+- Vault value is at least `bond.value - R6(1)`, preserving all borrower collateral ERG.
 
-The executor keeps up to the batching fee and pays the miner fee from it. With a zero fee, the executor
+The executor keeps up to the lender-funded reserve and pays the miner fee from it. With a zero fee, the executor
 supplies the miner fee separately. Multiple bonds may liquidate together, each selecting its own
 settlement output through context variable 1. The CLI currently builds only the standard maturity liquidation, including batching.
 Custom swap expressions and their transaction builders require their own review and implementation.
@@ -175,9 +191,12 @@ identity, while the chosen expression protects the economics.
 - Treat context variables as untrusted hints. Require the correct types and validate index bounds
   before indexing outputs. Missing or incorrectly typed required variables must reject the spend.
 - Require `R4[Coll[Byte]] == SELF.id` on every additional bond-specific payout. The bond already
-  enforces this on the settlement, along with vault script, R5 claim asset and singleton burn.
+  enforces this on the settlement, along with vault script, R5 claim asset, R6 = `1.toByte`, and singleton burn.
 - Require distinct indices for obligations that need separate payouts within one bond. R4 prevents
   sharing across different bonds, but cannot distinguish two roles belonging to the same bond.
+- Read principal ERG from bond R6(2), principal tokens from R7, and Long maturity from R6(3).
+  Use `bond.value - bond.R6(1)` when valuing borrower collateral; the lender-funded reserve may be
+  arbitrarily large and must not inflate collateral ratios. Authenticate the bond origin before trusting terms.
 - Enforce eligibility and the required value, assets and recipients of the selected outputs.
   Input-ID tags establish association; they do not establish payout amounts or authorization.
 - Reserve context variable 0 for the serialized expression, 1 for settlement and 2 for the repayment
@@ -185,6 +204,19 @@ identity, while the chosen expression protects the economics.
 
 These mappings change the bond and maturity-expression hashes. Builders and orders must use the
 matching compiled contracts; existing boxes retain their original scripts and mapping rules.
+
+### Settlement registers
+
+| Register | Meaning |
+|---|---|
+| R4: `Coll[Byte]` | Closing bond box id |
+| R5: `Coll[Byte]` | Bond asset that claims the vault |
+| R6: `Byte` | `0` for repayment; `1` for liquidation |
+
+Both bond scripts enforce the path marker, including for custom liquidation expressions. Missing,
+wrongly typed, opposite-path and other marker values reject the bond spend. The vault does not use
+R6 to authorize a claim. Anyone can create arbitrary vault boxes, so a marker alone does not prove a
+genuine bond settlement; verify the closing bond transaction and its provenance.
 
 ## Claim from the vault
 

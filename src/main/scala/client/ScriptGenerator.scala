@@ -101,8 +101,7 @@ object ScriptGenerator {
                         principalErg: Long,
                         principalTokens: Seq[(Array[Byte], Long)],
                         repayment: Long,
-                        batchingFee: Long,
-                        maturity: Int,
+                        maturity: Long,
                         liqScriptHash: Array[Byte]) extends ContractTerms {
 
     def constants: Seq[(String, Any)] = Seq(
@@ -111,7 +110,6 @@ object ScriptGenerator {
       "CONST_PRINCIPAL_ERG" -> principalErg,
       "CONST_PRINCIPAL_TOKENS" -> tokenColl(principalTokens),
       "CONST_REPAYMENT" -> repayment,
-      "CONST_BATCHING_FEE" -> batchingFee,
       "CONST_MATURITY" -> maturity,
       "CONST_LIQ_SCRIPT_HASH" -> Colls.fromArray(liqScriptHash)
     )
@@ -123,8 +121,7 @@ object ScriptGenerator {
                                principalErg: Long,
                                principalTokens: Seq[(Array[Byte], Long)],
                                repayment: Long,
-                               batchingFee: Long,
-                               duration: Int,
+                               duration: Long,
                                liqScriptHash: Array[Byte]) extends ContractTerms {
 
     def constants: Seq[(String, Any)] = Seq(
@@ -133,7 +130,6 @@ object ScriptGenerator {
       "CONST_PRINCIPAL_ERG" -> principalErg,
       "CONST_PRINCIPAL_TOKENS" -> tokenColl(principalTokens),
       "CONST_REPAYMENT" -> repayment,
-      "CONST_BATCHING_FEE" -> batchingFee,
       "CONST_DURATION" -> duration,
       "CONST_LIQ_SCRIPT_HASH" -> Colls.fromArray(liqScriptHash)
     )
@@ -153,8 +149,7 @@ object ScriptGenerator {
     principalErg = 8888888881L,
     principalTokens = Seq(Array.fill(32)(0x64.toByte) -> 8888888885L),
     repayment = 8888888882L,
-    batchingFee = 8888888883L,
-    maturity = 888884,
+    maturity = 888884L,
     liqScriptHash = Array.fill(32)(0x63.toByte))
 
   private val OnCloseOrderSentinels = OnCloseOrderTerms(
@@ -163,8 +158,7 @@ object ScriptGenerator {
     principalErg = 9999999991L,
     principalTokens = Seq(Array.fill(32)(0x74.toByte) -> 9999999995L),
     repayment = 9999999992L,
-    batchingFee = 9999999993L,
-    duration = 999994,
+    duration = 999994L,
     liqScriptHash = Array.fill(32)(0x73.toByte))
 
   /**

@@ -106,3 +106,10 @@ name.
   test the boundary on a *stamped* instance, never only on a direct compile.
 - **A named value in ErgoScript is always evaluated**, so a value belonging to one path still runs
   on the other. Laziness has to live *inside* each named condition, not between them.
+
+The bond suites also cover lender-selected fee witnesses on order fills (including zero, negative,
+missing, incorrectly typed and unfunded fees), preserving borrower collateral, refunding unused
+reserves to the vault on repayment, pinned principal registers, Long maturity/duration arithmetic and
+overflow rejection, and settlement R6 Byte markers (0 repayment / 1 liquidation). The conversion
+expression reads principal data directly from bond R6(2)/R7. Application tests exercise fee funding,
+refund balances, metadata precision and schedules above Int.MaxValue end to end.

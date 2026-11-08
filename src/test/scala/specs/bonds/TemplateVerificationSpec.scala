@@ -38,7 +38,7 @@ class TemplateVerificationSpec extends AnyPropSpec with BondSpecBase {
   property("stamped orders match their templates, whatever their terms") {
     withCtx { ctx =>
       Seq(
-        orderTemplate(ctx) -> Seq(orderTerms(ctx, ErgBond), orderTerms(ctx, TokenBond, fee = 0L)),
+        orderTemplate(ctx) -> Seq(orderTerms(ctx, ErgBond), orderTerms(ctx, TokenBond)),
         onCloseTemplate(ctx) -> Seq(onCloseTerms(ctx, ErgBond), onCloseTerms(ctx, TokenBond, duration = 30))
       ).foreach { case (t, terms) =>
         terms.foreach(term => t.matches(t.withTerms(term)) shouldBe true)
@@ -56,7 +56,7 @@ class TemplateVerificationSpec extends AnyPropSpec with BondSpecBase {
 
       // On chain the forgery behaves as written: a fill with a third unit goes through
       val f = fillScenario(ctx, ErgBond)
-      val forgedIn = inputAt(f.order.setContract(Contract(forged)), ctx, 0)
+      val forgedIn = inputAt(f.order.setContract(Contract(forged)), ctx, 0).withCtxVar(0.toByte, ErgoValue.of(f.fee))
       val asset = forgedIn.id
       val third = UTXO(lenderTree(ctx), minBox, Seq(Token(asset, 1L)))
       accepts(f.prover, fillTx(f)(

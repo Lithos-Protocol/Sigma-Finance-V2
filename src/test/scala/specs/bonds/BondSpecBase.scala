@@ -51,7 +51,12 @@ object BondSpecBase {
         expr("{ sigmaProp(HEIGHT < 0) }"),
         expr("""{
           val payout = OUTPUTS(getVar[Int](1).get)
-          sigmaProp(HEIGHT >= SELF.R7[Int].get && payout.tokens.size == 0 &&
+          val principal = SELF.R7[Coll[(Coll[Byte], Long)]].get
+          val principalERG = SELF.R6[Coll[Long]].get(2)
+          val principalMatches = if (principal.size == 0) principalERG == 6000000000L else
+            principal.size == 1 && principalERG == 1000000L && principal(0)._2 == 600L &&
+            principal(0)._1 == fromBase16("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+          sigmaProp(principalMatches && HEIGHT.toLong >= SELF.R6[Coll[Long]].get(3) && payout.tokens.size == 0 &&
             payout.value >= SELF.value + 2000000000L)
         }"""))
       cache = Some(c)
@@ -138,12 +143,12 @@ trait BondSpecBase extends ContractSpecBase {
                          maturity: Int = -1,
                          liqScript: Contract = null,
                          origin: Array[Byte] = originOrderId): UTXO =
-    UTXO(bondContract(ctx, kind), value, Seq(Token(asset, 1L)) ++ collateral,
+    UTXO(bondContract(ctx, kind), value + fee, Seq(Token(asset, 1L)) ++ collateral,
       Seq(
         bytesValue(origin),
         bytesValue(hashOf(if (borrowerScript == null) borrowerTree(ctx) else borrowerScript)),
-        longsValue(repaymentOf(kind), fee),
-        ErgoValue.of(if (maturity < 0) maturityOf(ctx) else maturity),
+        longsValue(repaymentOf(kind), fee, principalOf(kind)._1, if (maturity < 0) maturityOf(ctx).toLong else maturity.toLong),
+        ksingh.sigmabonds.app.Protocol.tokensValue(principalOf(kind)._2),
         bytesValue((if (liqScript == null) matured(ctx) else liqScript).hashedValueBytes)))
 
   /** A collateral return: names the bond it settles in R4. */
@@ -152,8 +157,8 @@ trait BondSpecBase extends ContractSpecBase {
 
   /** A lender's settlement: names the bond in R4 and, for the vault, the asset that claims it in R5. */
   protected def settlement(to: Contract, value: Long, bondId: ErgoId, asset: ErgoId,
-                           tokens: Seq[Token] = Seq.empty[Token]): UTXO =
-    UTXO(to, value, tokens, Seq(bytesValue(bondId.getBytes), bytesValue(asset.getBytes)))
+                           tokens: Seq[Token] = Seq.empty[Token], path: Byte = 1.toByte): UTXO =
+    UTXO(to, value, tokens, Seq(bytesValue(bondId.getBytes), bytesValue(asset.getBytes), ErgoValue.of(path)))
 
   protected def funding(ctx: BlockchainContext, prover: ErgoProver, index: Int,
                         value: Long = slack, tokens: Seq[Token] = Seq.empty[Token]): InputUTXO =
@@ -167,8 +172,8 @@ trait BondSpecBase extends ContractSpecBase {
 
   protected def repaymentBox(kind: Kind, to: Contract, bondId: ErgoId, asset: ErgoId = bondAsset,
                              short: Long = 0L): UTXO = kind match {
-    case ErgBond => settlement(to, repaymentErg - short, bondId, asset)
-    case TokenBond => settlement(to, minBox, bondId, asset, Seq(Token(stableToken, repaymentTokens - short)))
+    case ErgBond => settlement(to, repaymentErg + batchingFee - short, bondId, asset, path = 0.toByte)
+    case TokenBond => settlement(to, minBox + batchingFee, bondId, asset, Seq(Token(stableToken, repaymentTokens - short)), path = 0.toByte)
   }
 
   // ═══ REPAY ════════════════════════════════════════════════════════════════
@@ -194,7 +199,7 @@ trait BondSpecBase extends ContractSpecBase {
     val bondIn = inputAt(bond, ctx, 0).withCtxVar(1.toByte, ErgoValue.of(0)).withCtxVar(2.toByte, ErgoValue.of(1))
     Repay(ctx, kind, bond, bondIn, funding(ctx, p, 1, slack, repaymentFunds(kind)), vault(ctx),
       repaymentBox(kind, vault(ctx), bondIn.id),
-      tagged(borrowerTree(ctx), bond.value, bondIn.id, collateral),
+      tagged(borrowerTree(ctx), bond.value - batchingFee, bondIn.id, collateral),
       maturityOf(ctx), p)
   }
 
@@ -269,7 +274,6 @@ trait BondSpecBase extends ContractSpecBase {
 
   protected def orderTerms(ctx: BlockchainContext,
                            kind: Kind,
-                           fee: Long = batchingFee,
                            maturity: Int = -1): OrderTerms = {
     val (value, tokens) = principalOf(kind)
     OrderTerms(
@@ -278,7 +282,6 @@ trait BondSpecBase extends ContractSpecBase {
       principalErg = value,
       principalTokens = tokens.map(t => t.id.getBytes -> t.amount),
       repayment = repaymentOf(kind),
-      batchingFee = fee,
       maturity = if (maturity < 0) maturityOf(ctx) else maturity,
       liqScriptHash = matured(ctx).hashedValueBytes)
   }
@@ -293,18 +296,17 @@ trait BondSpecBase extends ContractSpecBase {
 
   protected def onCloseTerms(ctx: BlockchainContext,
                              kind: Kind,
-                             fee: Long = batchingFee,
                              duration: Int = defaultDuration): OnCloseOrderTerms = {
-    val t = orderTerms(ctx, kind, fee)
+    val t = orderTerms(ctx, kind)
     OnCloseOrderTerms(t.bondHash, t.borrowerHash, t.principalErg, t.principalTokens, t.repayment,
-      t.batchingFee, duration, t.liqScriptHash)
+      duration, t.liqScriptHash)
   }
 
   protected def onCloseContract(ctx: BlockchainContext, terms: OnCloseOrderTerms): Contract =
     Contract(onCloseTemplate(ctx).withTerms(terms))
 
   /**
-   * One fill of either order style. `maturity` is what the bond carries in R7, `height` the height the
+   * One fill of either order style. `maturity` is what the bond carries in R6(3), `height` the height the
    * fill runs at: -1 means the mocked context's own, which is all a fixed-height order needs.
    */
   protected case class Fill(ctx: BlockchainContext,
@@ -326,7 +328,7 @@ trait BondSpecBase extends ContractSpecBase {
   /**
    * The borrower's collateral sits in the order; the lender fills it with the order at INPUTS(0), which
    * mints the asset. The lender brings the principal, and keeps a unit with EIP-4 metadata at OUTPUTS(0).
-   * An on-close fill stamps R7 as fill height + duration.
+   * An on-close fill stamps R6(3) as fill height + duration.
    */
   protected def fillScenario(ctx: BlockchainContext,
                              kind: Kind,
@@ -337,14 +339,14 @@ trait BondSpecBase extends ContractSpecBase {
     val liq = if (liqScript == null) matured(ctx) else liqScript
     val (script, maturity, height) = style match {
       case FixedHeight =>
-        val terms = orderTerms(ctx, kind, fee).copy(liqScriptHash = liq.hashedValueBytes)
-        (orderContract(ctx, terms), terms.maturity, -1)
+        val terms = orderTerms(ctx, kind).copy(liqScriptHash = liq.hashedValueBytes)
+        (orderContract(ctx, terms), terms.maturity.toInt, -1)
       case OnClose =>
-        val terms = onCloseTerms(ctx, kind, fee, duration).copy(liqScriptHash = liq.hashedValueBytes)
+        val terms = onCloseTerms(ctx, kind, duration).copy(liqScriptHash = liq.hashedValueBytes)
         (onCloseContract(ctx, terms), fillHeightOf(ctx) + duration, fillHeightOf(ctx))
     }
     val order = UTXO(script, collateralErg, defaultCollateral)
-    val orderIn = inputAt(order, ctx, 0)
+    val orderIn = inputAt(order, ctx, 0).withCtxVar(0.toByte, ErgoValue.of(fee))
     val asset = orderIn.id
     val (value, tokens) = principalOf(kind)
     val l = lender(ctx)

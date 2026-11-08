@@ -37,7 +37,7 @@ class BondProbeSpec extends AnyPropSpec with BondSpecBase {
     withCtx { ctx =>
       val report = ksingh.sigmabonds.client.BondsV2Report.lines(ctx, Seq(stableToken.toString))
       report.foreach(l => println(s"[report] $l"))
-      report.count(_.startsWith("  constant ")) shouldBe 16
+      report.count(_.startsWith("  constant ")) shouldBe 14
       val liq = scorex.util.encode.Base16.encode(matured(ctx).hashedValueBytes)
       report should contain(s"    hash:  $liq")
     }

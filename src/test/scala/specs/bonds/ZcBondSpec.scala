@@ -94,6 +94,50 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
+    property(s"$kind repay: reserve is refunded to the vault and cannot be diverted to borrower") {
+      withCtx { ctx =>
+        val r = repayScenario(ctx, kind)
+        val signed = accepts(r.prover, repayTx(r)())
+        signed.getOutputsToSpend.get(1).getValue shouldBe collateralErg
+        rejectsAtSigning(r.prover, repayTx(r)(settleOut = r.settleOut.subValue(1L),
+          returnOut = r.returnOut.addValue(1L)))
+        rejectsAtSigning(r.prover, repayTx(r)(settleOut = r.settleOut.subValue(batchingFee),
+          returnOut = r.returnOut.addValue(batchingFee)))
+      }
+    }
+
+    property(s"$kind settlement: path markers must be present, typed Byte and match the executed branch") {
+      withCtx { ctx =>
+        val r = repayScenario(ctx, kind)
+        val l = liquidateScenario(ctx, kind)
+        for (bad <- Seq(ErgoValue.of(1.toByte), ErgoValue.of(2.toByte), ErgoValue.of(0))) {
+          rejectsAtSigning(r.prover, repayTx(r)(settleOut = r.settleOut.withRegNum(6, bad)))
+        }
+        for (bad <- Seq(ErgoValue.of(0.toByte), ErgoValue.of(2.toByte), ErgoValue.of(1))) {
+          rejectsAtSigning(l.prover, liquidateTx(l)(settleOut = l.settleOut.withRegNum(6, bad)))
+        }
+        rejectsAtSigning(r.prover, repayTx(r)(settleOut = r.settleOut.setRegs(r.settleOut.registers.take(2): _*)))
+        rejectsAtSigning(l.prover, liquidateTx(l)(settleOut = l.settleOut.setRegs(l.settleOut.registers.take(2): _*)))
+        accepts(r.prover, repayTx(r)()).getOutputsToSpend.get(0).getRegisters.get(2).getValue shouldBe 0.toByte
+        accepts(l.prover, liquidateTx(l)()).getOutputsToSpend.get(0).getRegisters.get(2).getValue shouldBe 1.toByte
+      }
+    }
+
+    property(s"$kind maturity: Long heights above Int.MaxValue do not wrap or narrow") {
+      withCtx { ctx =>
+        val r = repayScenario(ctx, kind)
+        val high = r.bond.withRegNum(6, longsValue(repaymentOf(kind), batchingFee, principalOf(kind)._1, Long.MaxValue))
+        val input = inputAt(high, ctx, 0).withCtxVar(1.toByte, ErgoValue.of(0)).withCtxVar(2.toByte, ErgoValue.of(1))
+        val settle = repaymentBox(kind, vault(ctx), input.id)
+        val ret = tagged(borrowerTree(ctx), collateralErg, input.id, defaultCollateral)
+        accepts(r.prover, repayTx(r)(inputs = Seq(input, r.payerIn), outputs = Seq(settle, ret)))
+        val liquidation = input.setCtxVars(ContextVar.of(0.toByte, liqVar(matured(ctx))), ContextVar.of(1.toByte, ErgoValue.of(0)))
+        val payout = settlement(vault(ctx), collateralErg, input.id, bondAsset, defaultCollateral)
+        rejectsAtSigning(r.prover, liquidateTx(liquidateScenario(ctx, kind))(
+          inputs = Seq(liquidation, r.payerIn), outputs = Seq(payout)))
+      }
+    }
+
     // ═══ LIQUIDATE ══════════════════════════════════════════════════════════
 
     property(s"$kind liquidate: an executor with no inputs of its own keeps the batching fee") {
@@ -277,7 +321,7 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
         val collateral = if (kind == ErgBond) Seq.empty[Token] else Seq(Token(stableToken, repaymentTokens))
         val raw = inputAt(bondUTXO(ctx, kind, borrowerScript = vault(ctx), collateral = collateral), ctx, 0)
         val mapped = raw.withCtxVar(1.toByte, ErgoValue.of(0)).withCtxVar(2.toByte, ErgoValue.of(1))
-        val shared = settlement(vault(ctx), collateralErg, raw.id, bondAsset, collateral)
+        val shared = settlement(vault(ctx), collateralErg, raw.id, bondAsset, collateral, path = 0.toByte)
         val fund = funding(ctx, p, 1, slack, repaymentFunds(kind))
         accepts(p, build(ctx, Seq(mapped, fund), Seq(shared, shared), p.getAddress, burn = Seq(Token(bondAsset, 1L))))
         rejectsAtSigning(p, build(ctx, Seq(raw.withCtxVar(1.toByte, ErgoValue.of(0)).withCtxVar(2.toByte, ErgoValue.of(0)), fund),
@@ -295,7 +339,7 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
             .withCtxVar(0.toByte, liqVar(matured(ctx))).withCtxVar(1.toByte, ErgoValue.of(i))
         }
         val outs = Seq(bondAsset, otherBondAsset).zip(ins).map { case (asset, in) =>
-          settlement(vault(ctx), collateralErg - batchingFee, in.id, asset, defaultCollateral)
+          settlement(vault(ctx), collateralErg, in.id, asset, defaultCollateral)
         }
         val ex = executor(ctx)
         rejectsAtSigning(ex, buildAt(ctx, maturity,

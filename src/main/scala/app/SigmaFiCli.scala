@@ -41,7 +41,8 @@ object SigmaFiCli {
       |  claims                             bond assets in your wallet whose bond has paid the vault
       |
       |Lender:
-      |  fill-order <order box id>          mint the named bond asset with its terms as JSON metadata
+      |  fill-order <order box id> [--batching-fee <ERG>]  mint the named bond asset with its terms as JSON metadata
+      |  --batching-fee <ERG>              lender-funded reserve on fill (default 0.002)
       |  claim <bond asset id>               collect a repaid or liquidated bond from the vault
       |
       |Borrower:
@@ -59,7 +60,6 @@ object SigmaFiCli {
       |  --repayment <amount>              ERG for an ERG loan, token units for a token loan
       |  --collateral-erg <ERG>
       |  --collateral-token <token id>:<n> repeat for each collateral token
-      |  --batching-fee <ERG>              the most a liquidator may keep (default 0.002)
       |  --liquidation <name>              default MaturityLiquidation
       |""".stripMargin
 
@@ -127,10 +127,12 @@ object SigmaFiCli {
       case "bonds" => listBonds(app, node, a.flag("mine"), a.flag("liquidatable"))
       case "claims" => listClaims(app, node)
 
-      case "fill-order" => app.submit(app.fillOrder(one("order box id")))
+      case "fill-order" => app.submit(app.fillOrder(one("order box id"), parseErg(a.opt("batching-fee").getOrElse(DefaultBatchingFee))))
       case "claim" => app.submit(app.claim(one("bond asset id")))
 
-      case "create-order" => app.submit(app.createOrder(loan(a), schedule(a, app)))
+      case "create-order" =>
+        if (a.opt("batching-fee").isDefined) throw CliError("--batching-fee is chosen by the lender on fill-order")
+        app.submit(app.createOrder(loan(a), schedule(a, app)))
       case "cancel-order" => app.submit(app.cancelOrder(one("order box id")))
       case "repay" => app.submit(app.repay(one("bond box id")))
 
@@ -176,7 +178,7 @@ object SigmaFiCli {
         case OnClose(d) => s"$d blocks after the fill"
       }))
       println(s"  collateral:  ${Fmt.contents(o.box.value, o.box.tokens)}")
-      println(s"  batching fee ${Fmt.erg(o.batchingFee)}; liquidation ${liqName(app, o.liqScriptHash)}")
+      println(s"  liquidation: ${liqName(app, o.liqScriptHash)}; fee reserve chosen and funded by lender on fill")
       if (bond.isEmpty) println("  WARNING: its bond contract does not match its principal; fill-order refuses it")
       if (app.isOwnHash(o.borrowerHash)) println("  (your order)")
     }
@@ -184,7 +186,7 @@ object SigmaFiCli {
 
   private def listBonds(app: SigmaFiApp, node: NodeApi, mine: Boolean, liquidatable: Boolean): Unit = {
     indexStatus(node).foreach(System.err.println)
-    def matured(b: BondInfo) = app.height + 1 >= b.maturity
+    def matured(b: BondInfo) = app.height.toLong + 1L >= b.maturity
     val bonds = app.bonds()
       .filter(b => !liquidatable || matured(b) && app.protocol.liquidationOf(b.liqScriptHash).nonEmpty)
       .filter(b => !mine || app.isWalletHash(b.borrowerHash) || app.walletHolds(b.asset))
@@ -194,7 +196,8 @@ object SigmaFiCli {
       println(s"  repay:       ${Fmt.amount(b.repayment, b.repayToken)} " + (
         if (matured(b)) s"(matured at ${b.maturity}: liquidatable by ${liqName(app, b.liqScriptHash)})"
         else s"before height ${b.maturity} (${b.maturity - app.height} blocks left)"))
-      println(s"  collateral:  ${Fmt.contents(b.box.value, b.collateral)}; batching fee ${Fmt.erg(b.batchingFee)}")
+      println(s"  principal:   ${Fmt.principal(b.principalErg, b.principalTokens)}")
+      println(s"  collateral:  ${Fmt.contents(b.collateralErg, b.collateral)}; batching fee ${Fmt.erg(b.batchingFee)}")
       if (app.isOwnHash(b.borrowerHash)) println("  (you are its borrower)")
       if (mine && app.walletHolds(b.asset)) println("  (you hold its bond asset)")
     }
@@ -238,7 +241,6 @@ object SigmaFiCli {
       principalErg = principalErg,
       principalToken = token,
       repayment = if (token.isDefined) parseLong(repayment, "--repayment") else parseErg(repayment),
-      batchingFee = parseErg(a.opt("batching-fee").getOrElse(DefaultBatchingFee)),
       collateralErg = parseErg(a.need("collateral-erg")),
       collateralTokens = a.opts("collateral-token").map(parseToken),
       liquidation = a.opt("liquidation").getOrElse("MaturityLiquidation"))
@@ -246,9 +248,9 @@ object SigmaFiCli {
 
   private def schedule(a: Args, app: SigmaFiApp): Schedule =
     Seq("maturity", "term", "duration").flatMap(k => a.opt(k).map(k -> _)) match {
-      case Seq(("maturity", h)) => FixedMaturity(parseInt(h, "--maturity"))
-      case Seq(("term", n)) => FixedMaturity(app.height + parseInt(n, "--term"))
-      case Seq(("duration", n)) => OnClose(parseInt(n, "--duration"))
+      case Seq(("maturity", h)) => FixedMaturity(parseLong(h, "--maturity"))
+      case Seq(("term", n)) => FixedMaturity(Try(Math.addExact(app.height.toLong, parseLong(n, "--term"))).getOrElse(throw CliError("--term overflows a Long")))
+      case Seq(("duration", n)) => OnClose(parseLong(n, "--duration"))
       case _ => throw CliError("give exactly one of --maturity <height>, --term <blocks> or --duration <blocks>")
     }
 

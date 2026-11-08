@@ -13,8 +13,8 @@ object BondAssetMetadata {
   /** Match LithosDex's LD-NFT convention: the first six hexadecimal characters of the token id. */
   def name(asset: ErgoId): String = NamePrefix + asset.toString.take(6)
 
-  def description(order: OrderInfo, repayToken: Option[ErgoId], maturity: Int, buildHeight: Int,
-                   liquidation: String): String = {
+  def description(order: OrderInfo, repayToken: Option[ErgoId], maturity: Long, buildHeight: Int,
+                   liquidation: String, batchingFee: Long): String = {
     def contents(value: Long, tokens: Seq[Token]): Json = Json.obj(
       "nanoErgs" -> Json.fromLong(value),
       "tokens" -> Json.fromValues(tokens.map(t => Json.obj(
@@ -24,17 +24,17 @@ object BondAssetMetadata {
       "type" -> Json.fromString("SigmaFi ZC-Bond"),
       "bondAsset" -> Json.fromString(order.box.id.toString),
       "borrowerHash" -> Json.fromString(Base16.encode(order.borrowerHash)),
-      "principal" -> contents(math.max(order.principalErg, Protocol.MinBox), order.principalTokens),
+      "principal" -> contents(order.principalErg, order.principalTokens),
       "repayment" -> Json.fromLong(order.repayment),
       "repayToken" -> Json.fromString(repayToken.fold("ERG")(_.toString)),
-      "maturity" -> Json.fromInt(maturity),
+      "maturity" -> Json.fromLong(maturity),
       "collateral" -> contents(order.box.value, order.box.tokens),
-      "batchingFee" -> Json.fromLong(order.batchingFee),
+      "batchingFee" -> Json.fromLong(batchingFee),
       "liquidation" -> Json.fromString(liquidation),
       "liquidationHash" -> Json.fromString(Base16.encode(order.liqScriptHash)),
       "height" -> Json.fromInt(buildHeight))
     val duration = order.schedule match {
-      case OnClose(blocks) => Seq("durationBlocks" -> Json.fromInt(blocks))
+      case OnClose(blocks) => Seq("durationBlocks" -> Json.fromLong(blocks))
       case FixedMaturity(_) => Seq.empty
     }
     Json.obj((fields ++ duration): _*).noSpaces

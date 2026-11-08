@@ -11,7 +11,7 @@ import org.ergoplatform.sdk.ErgoId
 import scorex.crypto.hash.Blake2b256
 import scorex.util.encode.Base16
 import sigma.ast.SCollection.SByteArray
-import sigma.ast.{Constant, ErgoTree, SCollection, SInt, SLong, SType}
+import sigma.ast.{Constant, ErgoTree, SCollection, SInt, SLong, STuple, SType}
 import sigma.{Coll, Colls}
 import work.lithos.mutations.{Contract, InputUTXO, Token}
 
@@ -19,8 +19,8 @@ import scala.collection.mutable
 
 /** When a bond matures: at a fixed height, or a number of blocks after the order is filled. */
 sealed trait Schedule
-case class FixedMaturity(height: Int) extends Schedule
-case class OnClose(duration: Int) extends Schedule
+case class FixedMaturity(height: Long) extends Schedule
+case class OnClose(duration: Long) extends Schedule
 
 /** A borrower's order, of either style. The box's whole contents are the collateral. */
 case class OrderInfo(box: InputUTXO,
@@ -30,7 +30,6 @@ case class OrderInfo(box: InputUTXO,
                      principalErg: Long,
                      principalTokens: Seq[Token],
                      repayment: Long,
-                     batchingFee: Long,
                      liqScriptHash: Array[Byte])
 
 /** A live bond. `repayToken` is None for an ERG bond, or CONST_TOKEN_ID for a token bond. */
@@ -40,10 +39,13 @@ case class BondInfo(box: InputUTXO,
                     borrowerHash: Array[Byte],
                     repayment: Long,
                     batchingFee: Long,
-                    maturity: Int,
+                    principalErg: Long,
+                    principalTokens: Seq[Token],
+                    maturity: Long,
                     liqScriptHash: Array[Byte]) {
   def asset: ErgoId = box.tokens.head.id
   def collateral: Seq[Token] = box.tokens.drop(1)
+  def collateralErg: Long = box.value - batchingFee
 }
 
 /**
@@ -121,10 +123,11 @@ class Protocol(ctx: BlockchainContext) {
       if box.tokens.nonEmpty && box.tokens.head.amount == 1L
       origin <- bytesReg(box, 4)
       borrower <- bytesReg(box, 5)
-      amounts <- longsReg(box, 6) if amounts.length == 2
-      maturity <- intReg(box, 7)
+      amounts <- longsReg(box, 6) if amounts.length == 4
+      if amounts(0) > 0L && amounts(1) >= 0L && amounts(1) <= box.value - MinBox && amounts(2) >= MinBox && amounts(3) > 0L
+      principal <- tokensReg(box, 7)
       liq <- bytesReg(box, 8)
-    } yield BondInfo(box, token, origin, borrower, amounts(0), amounts(1), maturity, liq)
+    } yield BondInfo(box, token, origin, borrower, amounts(0), amounts(1), amounts(2), principal, amounts(3), liq)
   }
 
   // ─── orders ──────────────────────────────────────────────────────────────
@@ -134,15 +137,14 @@ class Protocol(ctx: BlockchainContext) {
     val styled = Seq(orderTemplate, onCloseTemplate).find(_.matches(tree))
     styled.map { t =>
       val schedule =
-        if (t eq orderTemplate) FixedMaturity(intTerm(t, tree, "CONST_MATURITY"))
-        else OnClose(intTerm(t, tree, "CONST_DURATION"))
+        if (t eq orderTemplate) FixedMaturity(longTerm(t, tree, "CONST_MATURITY"))
+        else OnClose(longTerm(t, tree, "CONST_DURATION"))
       OrderInfo(box, schedule,
         bondHash = bytesTerm(t, tree, "CONST_BOND_HASH"),
         borrowerHash = bytesTerm(t, tree, "CONST_BORROWER_HASH"),
         principalErg = longTerm(t, tree, "CONST_PRINCIPAL_ERG"),
         principalTokens = tokensTerm(t, tree, "CONST_PRINCIPAL_TOKENS").map { case (id, n) => Token(new ErgoId(id), n) },
         repayment = longTerm(t, tree, "CONST_REPAYMENT"),
-        batchingFee = longTerm(t, tree, "CONST_BATCHING_FEE"),
         liqScriptHash = bytesTerm(t, tree, "CONST_LIQ_SCRIPT_HASH"))
     }
   }
@@ -203,6 +205,13 @@ object Protocol {
   def longsReg(box: InputUTXO, r: Int): Option[Array[Long]] =
     register(box, r).filter(_.tpe == SCollection(SLong)).map(_.value.asInstanceOf[Coll[Long]].toArray)
 
+  def tokensReg(box: InputUTXO, r: Int): Option[Seq[Token]] =
+    register(box, r).filter(_.tpe == SCollection(STuple(SByteArray, SLong)))
+      .map(_.value.asInstanceOf[Coll[(Coll[Byte], Long)]].toArray.toSeq)
+      .filter(_.forall { case (id, n) => id.length == 32 && n > 0L })
+      .filter(ts => ts.map(_._1).distinct.size == ts.size)
+      .map(_.map { case (id, n) => Token(new ErgoId(id.toArray), n) })
+
   def intReg(box: InputUTXO, r: Int): Option[Int] =
     register(box, r).filter(_.tpe == SInt).map(_.value.asInstanceOf[Int])
 
@@ -222,6 +231,12 @@ object Protocol {
   def longsValue(v: Long*): ErgoValue[_] = ErgoValue.of(Colls.fromArray(v.toArray), scalaLongType)
   def intValue(v: Int): ErgoValue[_] = ErgoValue.of(v)
   def longValue(v: Long): ErgoValue[_] = ErgoValue.of(v)
+
+  def tokensValue(tokens: Seq[Token]): ErgoValue[_] =
+    ErgoValue.of(
+      Colls.fromArray(tokens.map(t => (Colls.fromArray(t.id.getBytes), t.amount)).toArray)(
+        sigma.data.RType.pairRType(sigma.collRType(sigma.ByteType), sigma.LongType)),
+      ErgoType.pairType(ErgoType.collType(scalaByteType), scalaLongType))
 
   /** A hint register: `Coll[Coll[Byte]]`, each entry an ErgoTree's bytes. */
   def treesValue(trees: ErgoTree*): ErgoValue[_] =
