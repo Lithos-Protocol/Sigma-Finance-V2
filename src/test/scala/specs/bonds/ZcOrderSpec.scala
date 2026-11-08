@@ -294,7 +294,7 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
         val f = fillScenario(ctx, kind, style = style, liqScript = script)
         val filled = accepts(f.prover, fillTx(f)())
         val lenderUnit = spendOutput(filled, 0)
-        val bondIn = spendOutput(filled, 1).withCtxVar(0.toByte, liqVar(script))
+        val bondIn = spendOutput(filled, 1).withCtxVar(0.toByte, liqVar(script)).withCtxVar(1.toByte, ErgoValue.of(0))
         val buyer = executor(ctx)
         val proceeds = settlement(vault(ctx), bondIn.value + 2 * Parameters.OneErg, bondIn.id, f.asset)
         val inputs = Seq(bondIn, funding(ctx, buyer, 1))
@@ -317,7 +317,7 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
       withCtx { ctx =>
         val (f, lenderUnit, bondIn) = fill(ctx)
         val b = borrower(ctx)
-        val repaid = accepts(b, buildAt(ctx, f.maturity - 1, Seq(bondIn, funding(ctx, b, 1, slack, repaymentFunds(kind))),
+        val repaid = accepts(b, buildAt(ctx, f.maturity - 1, Seq(bondIn.withCtxVar(1.toByte, ErgoValue.of(0)).withCtxVar(2.toByte, ErgoValue.of(1)), funding(ctx, b, 1, slack, repaymentFunds(kind))),
           Seq(repaymentBox(kind, vault(ctx), bondIn.id, f.asset),
             tagged(borrowerTree(ctx), bondIn.value, bondIn.id, defaultCollateral)),
           b.getAddress, burn = Seq(Token(f.asset, 1L))))
@@ -328,7 +328,7 @@ class ZcOrderSpec extends AnyPropSpec with BondSpecBase {
     property(s"$name chain: order, fill, a batcher liquidates at maturity for its fee, and the lender's unit claims") {
       withCtx { ctx =>
         val (f, lenderUnit, bond) = fill(ctx)
-        val bondIn = bond.withCtxVar(0.toByte, liqVar(matured(ctx)))
+        val bondIn = bond.withCtxVar(0.toByte, liqVar(matured(ctx))).withCtxVar(1.toByte, ErgoValue.of(0))
         val batcher = executor(ctx)
         val settle = settlement(vault(ctx), bondIn.value - batchingFee, bondIn.id, f.asset, defaultCollateral)
         rejectsAtSigning(batcher, buildAt(ctx, f.maturity - 1, Seq(bondIn), Seq(settle), batcher.getAddress,

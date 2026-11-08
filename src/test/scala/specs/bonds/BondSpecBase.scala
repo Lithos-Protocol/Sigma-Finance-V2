@@ -50,7 +50,7 @@ object BondSpecBase {
         expr("{ sigmaProp(HEIGHT > 0) }"),
         expr("{ sigmaProp(HEIGHT < 0) }"),
         expr("""{
-          val payout = OUTPUTS(CONTEXT.selfBoxIndex)
+          val payout = OUTPUTS(getVar[Int](1).get)
           sigmaProp(HEIGHT >= SELF.R7[Int].get && payout.tokens.size == 0 &&
             payout.value >= SELF.value + 2000000000L)
         }"""))
@@ -184,14 +184,14 @@ trait BondSpecBase extends ContractSpecBase {
                              maturity: Int,
                              prover: ErgoProver)
 
-  /** No context variable: its absence is what selects the repay path. */
+  /** No var 0: its absence selects repayment; vars 1 and 2 map outputs. */
   protected def repayScenario(ctx: BlockchainContext,
                               kind: Kind,
                               collateral: Seq[Token] = defaultCollateral,
                               payer: ErgoProver = null): Repay = {
     val p = if (payer == null) borrower(ctx) else payer
     val bond = bondUTXO(ctx, kind, collateral = collateral)
-    val bondIn = inputAt(bond, ctx, 0)
+    val bondIn = inputAt(bond, ctx, 0).withCtxVar(1.toByte, ErgoValue.of(0)).withCtxVar(2.toByte, ErgoValue.of(1))
     Repay(ctx, kind, bond, bondIn, funding(ctx, p, 1, slack, repaymentFunds(kind)), vault(ctx),
       repaymentBox(kind, vault(ctx), bondIn.id),
       tagged(borrowerTree(ctx), bond.value, bondIn.id, collateral),
@@ -234,7 +234,7 @@ trait BondSpecBase extends ContractSpecBase {
     val maturity = maturityOf(ctx)
     val listedScript = if (listed == null) matured(ctx) else listed
     val bond = bondUTXO(ctx, kind, collateral = collateral, fee = fee, maturity = maturity, liqScript = listedScript)
-    val bondIn = inputAt(bond, ctx, 0).withCtxVar(0.toByte, liqVar(if (ran == null) listedScript else ran))
+    val bondIn = inputAt(bond, ctx, 0).withCtxVar(0.toByte, liqVar(if (ran == null) listedScript else ran)).withCtxVar(1.toByte, ErgoValue.of(0))
     Liquidate(ctx, kind, bond, bondIn, vault(ctx),
       settlement(vault(ctx), bond.value - fee, bondIn.id, bondAsset, collateral), maturity, executor(ctx))
   }

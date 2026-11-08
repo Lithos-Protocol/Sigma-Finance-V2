@@ -16,7 +16,7 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
 
     // ═══ REPAY ══════════════════════════════════════════════════════════════
 
-    property(s"$kind repay: the borrower repays before maturity, with no context variable") {
+    property(s"$kind repay: the borrower repays before maturity, without liquidation context variable 0") {
       withCtx { ctx =>
         val r = repayScenario(ctx, kind)
         accepts(r.prover, repayTx(r)())
@@ -223,6 +223,68 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
+    property(s"$kind mapping: repayment outputs can be reversed independently of input position") {
+      withCtx { ctx =>
+        val r = repayScenario(ctx, kind)
+        val mapped = r.bondIn.setCtxVars(ContextVar.of(1.toByte, ErgoValue.of(1)), ContextVar.of(2.toByte, ErgoValue.of(0)))
+        accepts(r.prover, repayTx(r)(inputs = Seq(r.payerIn, mapped), outputs = Seq(r.returnOut, r.settleOut)))
+      }
+    }
+
+    property(s"$kind mapping: liquidation checks the selected vault economics, not the input position") {
+      withCtx { ctx =>
+        val l = liquidateScenario(ctx, kind)
+        val mapped = l.bondIn.setCtxVars(ContextVar.of(0.toByte, liqVar(matured(ctx))), ContextVar.of(1.toByte, ErgoValue.of(1)))
+        val filler = UTXO(contractOf(l.prover), minBox)
+        val fund = funding(ctx, l.prover, 1, slack, defaultCollateral)
+        accepts(l.prover, liquidateTx(l)(inputs = Seq(mapped, fund), outputs = Seq(filler, l.settleOut)))
+        // A correctly funded decoy at selfBoxIndex must not cover an underpaid selected vault.
+        val decoy = l.settleOut.setContract(contractOf(l.prover))
+        rejectsAtSigning(l.prover, liquidateTx(l)(inputs = Seq(mapped, fund),
+          outputs = Seq(decoy, l.settleOut.subValue(1L))))
+      }
+    }
+
+    property(s"$kind mapping: missing, mistyped and out-of-range required indices reject") {
+      withCtx { ctx =>
+        val r = repayScenario(ctx, kind)
+        val valid = Seq(ContextVar.of(1.toByte, ErgoValue.of(0)), ContextVar.of(2.toByte, ErgoValue.of(1)))
+        for (tag <- Seq(1.toByte, 2.toByte)) {
+          val others = valid.filterNot(_.getId == tag)
+          val invalid = Seq(None, Some(ErgoValue.of(-1)), Some(ErgoValue.of(1000)), Some(ErgoValue.of(0L)))
+          invalid.foreach { value =>
+            val vars = others ++ value.map(v => ContextVar.of(tag, v))
+            rejectsAtSigning(r.prover, repayTx(r)(inputs = Seq(r.bondIn.setCtxVars(vars: _*), r.payerIn)))
+          }
+        }
+      }
+    }
+
+    property(s"$kind mapping: liquidation rejects missing, mistyped and out-of-range settlement indices") {
+      withCtx { ctx =>
+        val l = liquidateScenario(ctx, kind)
+        val expr = ContextVar.of(0.toByte, liqVar(matured(ctx)))
+        for (value <- Seq(None, Some(ErgoValue.of(-1)), Some(ErgoValue.of(1000)), Some(ErgoValue.of(0L)))) {
+          val vars = Seq(expr) ++ value.map(v => ContextVar.of(1.toByte, v))
+          rejectsAtSigning(l.prover, liquidateTx(l)(inputs = Seq(l.bondIn.setCtxVars(vars: _*))))
+        }
+      }
+    }
+
+    property(s"$kind mapping: one bond cannot share its settlement and collateral-return output") {
+      withCtx { ctx =>
+        val p = executor(ctx)
+        val collateral = if (kind == ErgBond) Seq.empty[Token] else Seq(Token(stableToken, repaymentTokens))
+        val raw = inputAt(bondUTXO(ctx, kind, borrowerScript = vault(ctx), collateral = collateral), ctx, 0)
+        val mapped = raw.withCtxVar(1.toByte, ErgoValue.of(0)).withCtxVar(2.toByte, ErgoValue.of(1))
+        val shared = settlement(vault(ctx), collateralErg, raw.id, bondAsset, collateral)
+        val fund = funding(ctx, p, 1, slack, repaymentFunds(kind))
+        accepts(p, build(ctx, Seq(mapped, fund), Seq(shared, shared), p.getAddress, burn = Seq(Token(bondAsset, 1L))))
+        rejectsAtSigning(p, build(ctx, Seq(raw.withCtxVar(1.toByte, ErgoValue.of(0)).withCtxVar(2.toByte, ErgoValue.of(0)), fund),
+          Seq(shared), p.getAddress, burn = Seq(Token(bondAsset, 1L))))
+      }
+    }
+
     // ═══ BATCHING / DOUBLE SATISFACTION ═════════════════════════════════════
 
     property(s"$kind batch: one executor liquidates two bonds and keeps both fees") {
@@ -230,12 +292,15 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
         val maturity = maturityOf(ctx)
         val ins = Seq(bondAsset, otherBondAsset).zipWithIndex.map { case (asset, i) =>
           inputAt(bondUTXO(ctx, kind, asset = asset, maturity = maturity), ctx, i)
-            .withCtxVar(0.toByte, liqVar(matured(ctx)))
+            .withCtxVar(0.toByte, liqVar(matured(ctx))).withCtxVar(1.toByte, ErgoValue.of(i))
         }
         val outs = Seq(bondAsset, otherBondAsset).zip(ins).map { case (asset, in) =>
           settlement(vault(ctx), collateralErg - batchingFee, in.id, asset, defaultCollateral)
         }
         val ex = executor(ctx)
+        rejectsAtSigning(ex, buildAt(ctx, maturity,
+          ins.map(_.setCtxVars(ContextVar.of(0.toByte, liqVar(matured(ctx))), ContextVar.of(1.toByte, ErgoValue.of(0)))), outs, ex.getAddress,
+          burn = Seq(Token(bondAsset, 1L), Token(otherBondAsset, 1L))))
         val signed = accepts(ex, buildAt(ctx, maturity, ins, outs, ex.getAddress,
           burn = Seq(Token(bondAsset, 1L), Token(otherBondAsset, 1L))))
         signed.getOutputsToSpend.asScala.filter(_.getErgoTree == contractOf(ex).ergoTree)
@@ -243,18 +308,18 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
       }
     }
 
-    property(s"$kind batch: two repayments in one transaction, with a filler input between them") {
+    property(s"$kind batch: two adjacent bond inputs repay without filler inputs") {
       withCtx { ctx =>
         val payer = other(ctx)
-        val a = inputAt(bondUTXO(ctx, kind, asset = bondAsset), ctx, 0)
+        val a = inputAt(bondUTXO(ctx, kind, asset = bondAsset), ctx, 0).withCtxVar(1.toByte, ErgoValue.of(0)).withCtxVar(2.toByte, ErgoValue.of(1))
         val filler = funding(ctx, payer, 1, slack, repaymentFunds(kind).map(t => Token(t.id, 2 * t.amount)))
-        val b = inputAt(bondUTXO(ctx, kind, asset = otherBondAsset, collateral = Seq(Token(secondCollateral, 5L))), ctx, 2)
+        val b = inputAt(bondUTXO(ctx, kind, asset = otherBondAsset, collateral = Seq(Token(secondCollateral, 5L))), ctx, 2).withCtxVar(1.toByte, ErgoValue.of(2)).withCtxVar(2.toByte, ErgoValue.of(3))
         val outs = Seq(
           repaymentBox(kind, vault(ctx), a.id),
           tagged(borrowerTree(ctx), collateralErg, a.id, defaultCollateral),
           repaymentBox(kind, vault(ctx), b.id, otherBondAsset),
           tagged(borrowerTree(ctx), collateralErg, b.id, Seq(Token(secondCollateral, 5L))))
-        accepts(payer, build(ctx, Seq(a, filler, b), outs, payer.getAddress,
+        accepts(payer, build(ctx, Seq(a, b, filler), outs, payer.getAddress,
           burn = Seq(Token(bondAsset, 1L), Token(otherBondAsset, 1L))))
       }
     }
@@ -269,9 +334,9 @@ class ZcBondSpec extends AnyPropSpec with BondSpecBase {
           case ErgBond => defaultCollateral
           case TokenBond => Seq(Token(stableToken, repaymentTokens)) // so one box can look like both
         }
-        val a = inputAt(bondUTXO(ctx, kind, asset = bondAsset, borrowerScript = vault(ctx), collateral = aCollateral), ctx, 0)
+        val a = inputAt(bondUTXO(ctx, kind, asset = bondAsset, borrowerScript = vault(ctx), collateral = aCollateral), ctx, 0).withCtxVar(1.toByte, ErgoValue.of(0)).withCtxVar(2.toByte, ErgoValue.of(1))
         val b = inputAt(bondUTXO(ctx, kind, asset = otherBondAsset, borrowerScript = bob,
-          collateral = Seq(Token(secondCollateral, 5L))), ctx, 1)
+          collateral = Seq(Token(secondCollateral, 5L))), ctx, 1).withCtxVar(1.toByte, ErgoValue.of(1)).withCtxVar(2.toByte, ErgoValue.of(2))
         val fund = funding(ctx, payer, 2, slack, repaymentFunds(kind))
         val outs = Seq(
           repaymentBox(kind, vault(ctx), a.id),

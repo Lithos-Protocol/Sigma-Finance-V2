@@ -128,16 +128,17 @@ if anyone can spend that script, anyone can satisfy the cancellation authorizati
 ## Repay a bond
 
 Repayment is permissionless and must occur strictly below maturity. Leave context variable 0 unset.
-For the bond at `INPUTS(i)`:
+Set context variable 1 (`Int`) to the settlement output index and variable 2 (`Int`) to the
+collateral-return output index on each bond input. The indices must be in range and distinct:
 
-- `OUTPUTS(i)` pays the vault, with R4 = bond box id and R5 = bond asset id. ERG bonds pay at least
+- `OUTPUTS(getVar[Int](1).get)` pays the vault, with R4 = bond box id and R5 = bond asset id. ERG bonds pay at least
   the repayment value. Token bonds pay exactly one token id, `CONST_TOKEN_ID`, at least the repayment
   quantity, plus at least 0.001 ERG.
-- `OUTPUTS(i + 1)` returns all collateral tokens and at least the bond's value to the borrower, with
+- `OUTPUTS(getVar[Int](2).get)` returns all collateral tokens and at least the bond's value to the borrower, with
   R4 = bond box id.
 - No output may carry the bond asset: the singleton is burned.
 
-Multiple repayments need filler inputs between bond inputs, since each bond requires two outputs.
+Multiple repayments can use adjacent bond inputs without filler inputs; each maps its own two outputs.
 Bond-specific R4 tags prevent one output from satisfying two different settlements or returns.
 
 ## Liquidate a bond
@@ -146,7 +147,8 @@ Attach the agreed serialized liquidation **expression** as context variable 0 on
 Its `blake2b256` must match R8, and the bond runs it through `executeFromVar[SigmaProp](0)`.
 The bytes are an expression, not an ErgoTree; `ContractClient` prints both bytes and hash.
 
-For the bond at `INPUTS(i)`, the bond always requires `OUTPUTS(i)` to use the compiled vault script,
+Set context variable 1 (`Int`) to the settlement output index on each bond input. The bond always
+requires `OUTPUTS(getVar[Int](1).get)` to use the compiled vault script,
 R4 = bond box id, and R5 = bond asset id. It also requires the singleton to be burned. **The liquidation
 expression controls eligibility, vault ERG value and vault tokens.** It can therefore enforce a
 conversion of collateral tokens into ERG or another agreed asset in the same transaction.
@@ -158,13 +160,31 @@ conversion of collateral tokens into ERG or another agreed asset in the same tra
 - Vault value is at least `bond.value - R6(1)`.
 
 The executor keeps up to the batching fee and pays the miner fee from it. With a zero fee, the executor
-supplies the miner fee separately. Multiple bonds may liquidate together with bond input i settling
-into output i. The CLI currently builds only the standard maturity liquidation, including batching.
+supplies the miner fee separately. Multiple bonds may liquidate together, each selecting its own
+settlement output through context variable 1. The CLI currently builds only the standard maturity liquidation, including batching.
 Custom swap expressions and their transaction builders require their own review and implementation.
 
 Both parties must inspect the liquidation expression: an always-true expression can liquidate
 immediately and permit any vault payout value or tokens. The bond protects the destination and claim
 identity, while the chosen expression protects the economics.
+
+### Rules for liquidation expressions
+
+- Read the settlement index from `getVar[Int](1)`, exactly as the bond does. Do not use
+  `CONTEXT.selfBoxIndex` or an independent mapping when checking its payout economics.
+- Treat context variables as untrusted hints. Require the correct types and validate index bounds
+  before indexing outputs. Missing or incorrectly typed required variables must reject the spend.
+- Require `R4[Coll[Byte]] == SELF.id` on every additional bond-specific payout. The bond already
+  enforces this on the settlement, along with vault script, R5 claim asset and singleton burn.
+- Require distinct indices for obligations that need separate payouts within one bond. R4 prevents
+  sharing across different bonds, but cannot distinguish two roles belonging to the same bond.
+- Enforce eligibility and the required value, assets and recipients of the selected outputs.
+  Input-ID tags establish association; they do not establish payout amounts or authorization.
+- Reserve context variable 0 for the serialized expression, 1 for settlement and 2 for the repayment
+  collateral return. Additional liquidation-specific variables must document their types and meanings.
+
+These mappings change the bond and maturity-expression hashes. Builders and orders must use the
+matching compiled contracts; existing boxes retain their original scripts and mapping rules.
 
 ## Claim from the vault
 

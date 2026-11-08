@@ -316,7 +316,7 @@ class SigmaFiAppSpec extends AnyPropSpec with ContractSpecBase with LoneElement 
       val json = NodeJson.unsignedTx(tx)
       val decoded = NodeJson.v6(JsonCodecsWrapper.unsignedErgoLikeTransactionDecoder.decodeJson(json)).toOption.get
       decoded.id shouldBe tx.getId
-      decoded.inputs.head.extension.values.keySet shouldBe Set(0.toByte)
+      decoded.inputs.head.extension.values.keySet shouldBe Set(0.toByte, 1.toByte)
       decoded.outputCandidates.map(_.bytesWithNoRef.toSeq) shouldBe
         tx.asInstanceOf[UnsignedTransactionImpl].getTx.outputCandidates.map(_.bytesWithNoRef.toSeq)
     }

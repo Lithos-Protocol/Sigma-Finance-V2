@@ -260,14 +260,14 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
       s"collateral back: ${Fmt.contents(bond.box.value, bond.collateral)}" +
         (if (sameTree(borrower, myTree) || isWalletHash(hashOf(borrower))) " to this wallet" else s" to ${addressOf(borrower)}"),
       s"maturity: height ${bond.maturity} (${bond.maturity - height} blocks left)")
-    prepare(s"Repay bond $bondId", plan(Seq(bond.box), Seq(settlement, collateral), burn = Seq(Token(bond.asset, 1L))), notes)
+    prepare(s"Repay bond $bondId", plan(Seq(bond.box.withCtxVar(1.toByte, intValue(0)).withCtxVar(2.toByte, intValue(1))), Seq(settlement, collateral), burn = Seq(Token(bond.asset, 1L))), notes)
   }
 
   // ═══ EXECUTOR ═════════════════════════════════════════════════════════════
 
   /**
-   * Tx 6: liquidate bonds in one batch. Bond i is INPUTS(i), runs its liquidation script from context var 0,
-   * and settles into the vault at OUTPUTS(i). This wallet keeps the batching fees, less the miner fee.
+   * Tx 6: liquidate bonds in one batch. Each bond runs its liquidation script from context var 0,
+   * and selects its vault output using context var 1. This wallet keeps the batching fees, less the miner fee.
    */
   def liquidate(bondIds: Seq[String]): Prepared = {
     if (bondIds.isEmpty) fail("name at least one bond box id")
@@ -279,7 +279,9 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
         fail(s"bond ${b.box.id} matures at height ${b.maturity}; it can be liquidated from then on")
       liq
     }
-    val inputs = bonds.zip(scripts).map { case (b, liq) => b.box.withCtxVar(0.toByte, bytesValue(liq.bytes)) }
+    val inputs = bonds.zip(scripts).zipWithIndex.map { case ((b, liq), i) =>
+      b.box.withCtxVar(0.toByte, bytesValue(liq.bytes)).withCtxVar(1.toByte, intValue(i))
+    }
     val outputs = bonds.map(b => UTXO(protocol.vault, b.box.value - b.batchingFee, b.collateral,
       Seq(bytesValue(b.box.id.getBytes), bytesValue(b.asset.getBytes))))
 

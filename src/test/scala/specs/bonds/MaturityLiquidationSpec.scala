@@ -64,7 +64,7 @@ class MaturityLiquidationSpec extends AnyPropSpec with BondSpecBase {
         val assets = Seq(bondAsset, otherBondAsset, org.ergoplatform.sdk.ErgoId.create("f22d" * 16))
         val ins = assets.zipWithIndex.map { case (asset, i) =>
           inputAt(bondUTXO(ctx, kind, asset = asset, maturity = maturity), ctx, i)
-            .withCtxVar(0.toByte, liqVar(matured(ctx)))
+            .withCtxVar(0.toByte, liqVar(matured(ctx))).withCtxVar(1.toByte, ErgoValue.of(i))
         }
         val outs = assets.zip(ins).map { case (asset, in) =>
           settlement(vault(ctx), collateralErg - batchingFee, in.id, asset, defaultCollateral)
