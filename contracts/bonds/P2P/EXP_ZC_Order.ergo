@@ -1,0 +1,167 @@
+{
+    // EXPERIMENTAL SigmaFi V2 order. No corresponding off-chain code exists.
+    // Use with EXP_ZC_ERG_Bond or EXP_ZC_Token_Bond compiled with EXP_BondAssetVault.
+    // Production contracts do not implement this dynamic-supply state machine.
+    //
+    // CONSTANTS (borrower terms)
+    // CONST_BOND_HASH: Coll[Byte] - hash of the matching experimental bond ErgoTree
+    // CONST_BORROWER_HASH: Coll[Byte] - borrower script hash; receives principal, authorizes cancel
+    // CONST_PRINCIPAL_ERG: Long - minimum principal nanoERG
+    // CONST_PRINCIPAL_TOKENS: Coll[(Coll[Byte], Long)] - exact principal token list
+    // CONST_REPAYMENT: Long - repayment amount in the bond's repayment asset
+    // CONST_REPAYMENT_ERG_FLOOR: Long - minimum repayment nanoERG EXCLUDING the fee refund;
+    //   normally CONST_REPAYMENT for an ERG bond, 1000000 for a token bond. This is a binding
+    //   loan term, not a hint: the bond enforces it in addition to its normal repayment conditions.
+    // CONST_MATURITY: Long - absolute maturity in bond R6(3)
+    // CONST_LIQ_SCRIPT_HASH: Coll[Byte] - hash of the serialized liquidation expression
+    //
+    // CONTEXT VARS ON THIS ORDER INPUT (fill only; cancel requires neither)
+    // 0: Long - nonnegative lender-funded liquidation fee reserve
+    // 1: Boolean - false: whole position, true: fractionalized position
+    //
+    // EXACT SUPPLY, IN RAW INTEGER UNITS
+    // Whole: mint 2; bond holds 1; lender receives 1; EIP-4 decimals is UTF-8 "0"; bond R9(0)=1.
+    // Fractional: let N = min(1000000000, SELF.value, each SELF token amount, repayment amount,
+    //                         repayment ERG floor + lender fee reserve). Require N >= 1.
+    // Circulating C = N * 1000000000; mint exactly 2*C + 1; bond locks exactly C + 1.
+    // R6 on OUTPUTS(0) enforces EIP-4 decimals UTF-8 "9". Thus N WHOLE displayed tokens
+    // circulate; the extra 0.000000001 token is locked with the other N tokens in the bond.
+    // N is a raw-unit granularity limit, not a price/decimals conversion across collateral assets.
+    // The cap preserves the original maximum (2,000,000,000.000000001 displayed tokens) and
+    // keeps all issuance arithmetic in Long. Fee reserve is excluded from collateral balances.
+    // With 100 raw collateral units, at most 100 whole bond tokens circulate. An NFT caps N at 1;
+    // sub-token claims can still round to zero, as explicitly allowed by this experiment.
+    //
+    // PAYOUT GUARANTEE
+    // Bond R9: Coll[Long] = (N, repayment ERG floor). The order pins both fields.
+    // On BOTH settlement paths the bond requires >= N nanoERG and >= N raw units of EACH
+    // payout token, including assets introduced by a custom liquidation rule. Such rules must
+    // support this minimum; a conversion to fewer units is rejected, not silently underpaid.
+    // In the vault, A*1000000000 >= remaining raw shares for each asset. Proportional rounding
+    // preserves this invariant: burning one WHOLE displayed token pays >= 1 raw unit per asset.
+    // Smaller claims may round to zero. Fees/minimum-box top-ups remain externally funded.
+    //
+    // FILL SHAPE
+    // INPUTS(0) is SELF: mint id = order id, one order fill per transaction.
+    // OUTPUTS(0) has a positive lender allocation at tokens(0), at any lender-chosen script.
+    // R4/R5 are EIP-4 name/description (Coll[Byte]); R6 is the enforced decimals string.
+    // OUTPUTS(1) is the bond: exact reserve at tokens(0), then SELF.tokens unchanged;
+    // all order value plus lender reserve, production R4-R8 terms, and the new R9 pair.
+    // OUTPUTS(2) pays principal. Lender may split circulating shares across extra outputs/change.
+    //
+    // AUTHENTICATION LIMITS FOR FUTURE CONSUMING CONTRACTS
+    // The fractional reserve C+1 is strictly more than half the verified mint supply 2*C+1.
+    // Circulating shares cannot create a second box with that reserve. The bond burns its reserve
+    // on settlement. A consumer can read protected N from R9(0), derive C and the exact mint cap,
+    // and check the reserve. The equation's inputs and mint origin must ALSO be authenticated:
+    // amount/R9 alone do not prove SigmaFi origin. Authenticate the order/mint or a trusted asset
+    // id, complete bond script/constants and R4 == asset id. Template hashes omit constants;
+    // verify all non-term literals, including scale/cap. Whole mode lacks a strict majority.
+    // Storage-rent extraction can invalidate the locked-reserve argument; no rent-proof origin
+    // scheme exists. Consumers must account for box age/rent and target node rules.
+    //
+    // ASSUMPTIONS
+    // Borrower pins a compatible experimental bond/vault and inspects the liquidation rule.
+    // A script hash is a commitment, not proof of safety or liquidation liveness. Lender chooses
+    // text/destinations; never send shares into a vault. R6: (repayment, fee, principal ERG,
+    // maturity), all Long; R7: principal tokens. Fee is funded ABOVE all borrower collateral.
+    // Principal/repayment asset consistency remains the borrower's responsibility. Cancel mints
+    // nothing and co-spends a borrower-script box; anyone-spend borrower scripts allow anyone to cancel.
+    // Fixed maturity leaves at least one full block to repay after fill.
+
+    // Helper Methods
+    def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
+        OUTPUTS.fold(0L, {
+            (a: Long, b: Box) =>
+                val totalTokens = b.tokens.fold(0L, {
+                    (z: Long, t: (Coll[Byte], Long)) => if(t._1 == tokenId) z + t._2 else z
+                })
+                a + totalTokens
+        })
+    }
+
+    val minted     = numTokenInOutputs(SELF.id)
+
+    if (minted > 0L) {
+        // Fill
+        val fractionalized = getVar[Boolean](1).get
+        val decimals = if (fractionalized) fromBase16("39") else fromBase16("30")
+        val lenderUnit   = OUTPUTS(0)
+        val bondBox      = OUTPUTS(1)
+        val principalBox = OUTPUTS(2)
+        val bondAmounts  = bondBox.R6[Coll[Long]].get
+        val batchingFee  = getVar[Long](0).get
+
+        val shareTerms = bondBox.R9[Coll[Long]].get
+        // Clamp before addition: only a minimum capped at 1e9 is needed, and a huge fee/floor
+        // must not overflow a Long sum. The positive floor and fee are checked below.
+        val repaymentERG = if (shareTerms(1) >= 1000000000L || batchingFee >= 1000000000L) {
+            1000000000L
+        } else shareTerms(1) + batchingFee
+        val collateralLimit = SELF.tokens.fold(SELF.value, { (a: Long, t: (Coll[Byte], Long)) =>
+            if (t._2 < a) t._2 else a
+        })
+        val repaymentLimit = if (bondAmounts(0) < repaymentERG) bondAmounts(0) else repaymentERG
+        val assetLimit = if (collateralLimit < repaymentLimit) collateralLimit else repaymentLimit
+        val dynamicN = if (assetLimit < 1000000000L) assetLimit else 1000000000L
+        val wholeTokens = if (fractionalized) dynamicN else 1L
+        val circulating = if (fractionalized) wholeTokens * 1000000000L else 1L
+        val lockedAmount = if (fractionalized) circulating + 1L else 1L
+        val mintAmount = circulating + lockedAmount
+
+        val verifiedMint =
+            SELF.id == INPUTS(0).id &&
+            minted == mintAmount &&
+            lenderUnit.tokens.size > 0 &&
+            lenderUnit.tokens(0)._1 == SELF.id &&
+            lenderUnit.tokens(0)._2 > 0L &&
+            lenderUnit.R4[Coll[Byte]].isDefined &&
+            lenderUnit.R5[Coll[Byte]].isDefined &&
+            lenderUnit.R6[Coll[Byte]].get == decimals
+
+        val validBond =
+            blake2b256(bondBox.propositionBytes) == CONST_BOND_HASH &&
+            bondBox.tokens.size > 0 &&
+            bondBox.tokens(0)._1 == SELF.id &&
+            bondBox.tokens(0)._2 == lockedAmount &&
+            bondBox.tokens.slice(1, bondBox.tokens.size) == SELF.tokens &&
+            bondBox.value >= SELF.value &&
+            batchingFee >= 0L &&
+            bondBox.value - SELF.value >= batchingFee
+
+        val validTerms =
+            bondBox.R4[Coll[Byte]].get == SELF.id &&
+            bondBox.R5[Coll[Byte]].get == CONST_BORROWER_HASH &&
+            bondAmounts.size == 4 &&
+            bondAmounts(0) == CONST_REPAYMENT &&
+            bondAmounts(1) == batchingFee &&
+            bondAmounts(2) == CONST_PRINCIPAL_ERG &&
+            bondBox.R7[Coll[(Coll[Byte], Long)]].get == CONST_PRINCIPAL_TOKENS &&
+            bondAmounts(3) == CONST_MATURITY &&
+            bondBox.R8[Coll[Byte]].get == CONST_LIQ_SCRIPT_HASH &&
+            shareTerms.size == 2 &&
+            shareTerms(0) == wholeTokens &&
+            wholeTokens >= 1L &&
+            shareTerms(1) > 0L &&
+            shareTerms(1) == CONST_REPAYMENT_ERG_FLOOR
+
+        // Read off the bond, not the constants, so the compiler cannot fold these and change the template
+        val feeBounded =
+            bondAmounts(1) >= 0L &&
+            bondBox.value - bondAmounts(1) >= 1000000L
+        val maturityAhead = bondAmounts(3) > HEIGHT.toLong + 1L
+
+        val principalPaid =
+            blake2b256(principalBox.propositionBytes) == CONST_BORROWER_HASH &&
+            principalBox.value >= bondAmounts(2) &&
+            principalBox.tokens == bondBox.R7[Coll[(Coll[Byte], Long)]].get
+
+        sigmaProp(verifiedMint && validBond && validTerms && feeBounded && maturityAhead && principalPaid)
+    } else {
+        // Cancel
+        val borrowerAuth = INPUTS.exists { (b: Box) =>
+            blake2b256(b.propositionBytes) == CONST_BORROWER_HASH
+        }
+        sigmaProp(borrowerAuth)
+    }
+}
