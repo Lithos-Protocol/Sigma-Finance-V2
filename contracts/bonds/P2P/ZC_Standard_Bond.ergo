@@ -1,12 +1,15 @@
 {
     // Standard SigmaFi V2 zero-coupon bond. No off-chain code exists yet.
     // Use only with ZC_Standard_Order and ZC_Standard_BondVault. One script serves ERG and token repayment: the
-    // repayment asset is a register, so every bond of this protocol sits at ONE address.
+    // repayment asset is a constant, so each repayment asset has its own bond address and all of
+    // them share one template. An indexed node lists one market by ErgoTree and every bond by
+    // template hash; a consuming contract pins the tree hash of the asset it expects.
     // The bond is always a single claim (an NFT-style asset). Fractional shares are a separate
     // layer: ZC_Standard_FractionalMint / ZC_Standard_FractionalVault hold the circulating unit.
     //
     // CONSTANTS
     // CONST_VAULT_HASH: Coll[Byte] - blake2b256 of ZC_Standard_BondVault; every settlement pays it
+    // CONST_REPAYMENT_TOKEN: Coll[Byte] - repayment token id; EMPTY for ERG repayment
     //
     // TOKENS
     // tokens(0): (bond asset, 2) - the reserve. It is NEVER burned here: it moves to the vault on
@@ -14,7 +17,7 @@
     // tokens(1..): collateral tokens
     //
     // REGISTERS (all pinned by ZC_Standard_Order)
-    // R4: Coll[Byte] - repayment token id; EMPTY for ERG repayment
+    // R4: Coll[Byte] - originating order id, which is also the bond asset id
     // R5: Coll[Byte] - blake2b256 of the borrower script
     // R6: Coll[Long] - exact copy of the order's borrower values (7..64 Longs):
     //   0 repayment amount; 1 principal nanoERG; 2 repayment ERG floor excluding fee refund;
@@ -91,10 +94,14 @@
                     } else {
                         val returnBox = OUTPUTS(returnIndex)
                         val repayment = borrower(0)
-                        val repaymentToken = SELF.R4[Coll[Byte]].get
+                        val repaymentToken = CONST_REPAYMENT_TOKEN
+                        // An empty collection taken from the box, not written as a literal. Testing the
+                        // constant alone (its size) is folded at compile time, which gives the ERG and
+                        // token bonds different templates and breaks listing every bond by template hash.
+                        val noToken = SELF.id.slice(0, 0)
                         // Subtract the fee refund rather than add to the terms, to avoid overflow.
                         val ergPaid = settlement.value >= fee && settlement.value - fee >= borrower(2)
-                        val assetPaid = if (repaymentToken.size == 0) {
+                        val assetPaid = if (repaymentToken == noToken) {
                             settlement.tokens.size == 1 && settlement.value - fee >= repayment
                         } else {
                             settlement.tokens.size == 2 &&

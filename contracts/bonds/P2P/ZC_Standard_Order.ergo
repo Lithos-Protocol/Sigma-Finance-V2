@@ -2,14 +2,16 @@
     // Standard SigmaFi V2 order. No off-chain code exists yet.
     // Use only with ZC_Standard_Bond and ZC_Standard_BondVault. One order script serves ERG and token repayment,
     // fixed and on-close maturity: every term is in a register, so every open order of this
-    // protocol sits at ONE address and is read without parsing ErgoTree constants.
+    // repayment asset sits at ONE address and is read without parsing ErgoTree constants.
     //
     // CONSTANTS
-    // CONST_BOND_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Bond ErgoTree
+    // CONST_BOND_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Bond ErgoTree. The bond compiles
+    //   in its repayment token, so this hash also fixes the repayment asset: orders split into one
+    //   address per repayment asset, all sharing one template.
     //
     // ORDER REGISTERS -> BOND REGISTERS (copied exactly; the lender cannot alter them)
     // R4: Coll[Long] -> bond R6: borrower values, length 7..64:
-    //   0 repayment amount, in the repayment asset named by R8
+    //   0 repayment amount, in the repayment asset of the bond named by CONST_BOND_HASH
     //   1 principal nanoERG
     //   2 repayment ERG floor, excluding the lender-fee refund. For ERG repayment the bond requires
     //     the larger of this floor and R4(0); for token repayment it is the nanoERG paid beside
@@ -23,8 +25,8 @@
     // R5: Coll[(Coll[Byte], Long)] -> bond R7: exact principal tokens
     // R6: Coll[Byte] -> bond R5: blake2b256 of the borrower script
     // R7: Coll[Byte] -> bond R8: blake2b256 of the serialized liquidation expression
-    // R8: Coll[Byte] -> bond R4: repayment token id; EMPTY for ERG repayment
-    // Bond R9: Coll[Long] = (lender liquidation fee reserve, start height, maturity height).
+    // Bond R4 = this order's id. Bond R9: Coll[Long] = (lender liquidation fee reserve, start height,
+    // maturity height).
     //
     // VALUE AND EXPIRY
     // Order value = collateral nanoERG + expiry fee; SELF.tokens are the collateral tokens.
@@ -116,7 +118,7 @@
                     bond.tokens.slice(1, bond.tokens.size) == SELF.tokens &&
                     fee >= 0L && bond.value >= collateralERG && bond.value - collateralERG >= fee &&
                     bond.value - fee >= 1000000L &&
-                    bond.R4[Coll[Byte]].get == SELF.R8[Coll[Byte]].get &&
+                    bond.R4[Coll[Byte]].get == SELF.id &&
                     bond.R5[Coll[Byte]].get == borrowerHash &&
                     bond.R6[Coll[Long]].get == borrower &&
                     bond.R7[Coll[(Coll[Byte], Long)]].get == principalTokens &&
