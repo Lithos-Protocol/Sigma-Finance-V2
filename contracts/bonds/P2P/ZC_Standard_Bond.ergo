@@ -1,0 +1,158 @@
+{
+    // Standard SigmaFi V2 zero-coupon bond. No off-chain code exists yet.
+    // Use only with ZC_Standard_Order and ZC_Standard_BondVault. One script serves ERG and token repayment: the
+    // repayment asset is a register, so every bond of this protocol sits at ONE address.
+    // The bond is always a single claim (an NFT-style asset). Fractional shares are a separate
+    // layer: ZC_Standard_FractionalMint / ZC_Standard_FractionalVault hold the circulating unit.
+    //
+    // CONSTANTS
+    // CONST_VAULT_HASH: Coll[Byte] - blake2b256 of ZC_Standard_BondVault; every settlement pays it
+    //
+    // TOKENS
+    // tokens(0): (bond asset, 2) - the reserve. It is NEVER burned here: it moves to the vault on
+    //   settlement, so the box holding 2 units stays the asset's state box (see ZC_Standard_Order).
+    // tokens(1..): collateral tokens
+    //
+    // REGISTERS (all pinned by ZC_Standard_Order)
+    // R4: Coll[Byte] - repayment token id; EMPTY for ERG repayment
+    // R5: Coll[Byte] - blake2b256 of the borrower script
+    // R6: Coll[Long] - exact copy of the order's borrower values (7..64 Longs):
+    //   0 repayment amount; 1 principal nanoERG; 2 repayment ERG floor excluding fee refund;
+    //   3 requested maturity height or on-close duration; 4 order expiry height (historical);
+    //   5 expiry fee (already refunded); 6 maturity mode; 7.. liquidation payload
+    // R7: Coll[(Coll[Byte], Long)] - agreed principal tokens
+    // R8: Coll[Byte] - blake2b256 of the serialized liquidation expression
+    // R9: Coll[Long] - (lender liquidation fee reserve, start height, maturity height)
+    // Value minus R9(0) is collateral nanoERG.
+    //
+    // PATHS AND CONTEXT VARS
+    // Liquidation: 0 Coll[Byte] liquidation expression; 1 Int settlement output index.
+    // Repayment:   1 Int settlement output index; 2 Int collateral-return output index. Vars 0, 3 absent.
+    // Recollateralize:      3 Int successor output index. Var 0 absent.
+    //
+    // SETTLEMENT BOX (both paths), at ZC_Standard_BondVault
+    // tokens(0) = this bond's reserve (asset, 2); R4 = SELF.id; R5: Byte = 0 repaid / 1 liquidated.
+    // Repayment: tokens are exactly the reserve, plus (repayment token, >= R6(0)) for a token bond;
+    //   value >= fee reserve + ERG floor, and >= fee reserve + R6(0) for an ERG bond.
+    //   Collateral returns to the borrower script, tagged R4 = SELF.id. Requires HEIGHT < maturity.
+    // Liquidation: the agreed expression decides eligibility and the vault's value and tokens(1..).
+    //
+    // RECOLLATERALIZE
+    // The borrower adds collateral before maturity, e.g. to stay above an oracle ratio. The successor
+    // has this script, identical registers and token ids, and no amount lower. It needs a borrower-
+    // script co-spend: an open path would let anyone re-spend the bond every block and invalidate
+    // pending repayments. At least one collateral asset must grow by >= 1% (and >= 1 unit), so the
+    // borrower cannot dodge a pending liquidation for free. The box id changes; the asset does not.
+    //
+    // ASSUMPTIONS
+    // A hand-made box with this script proves nothing: authenticate the asset's order (ZC_Standard_Order).
+    // The liquidation expression controls the vault's contents; both parties must inspect it.
+    // Anyone may repay in full. Liquidation may run before maturity if the expression allows it.
+    // Storage rent, live-node serialization and maximum cost are unverified.
+
+    val borrower = SELF.R6[Coll[Long]].get
+    val lender = SELF.R9[Coll[Long]].get
+
+    if (borrower.size < 7 || borrower.size > 64 || lender.size != 3) {
+        sigmaProp(false)
+    } else {
+        val fee = lender(0)
+        val maturity = lender(2)
+        val borrowerHash = SELF.R5[Coll[Byte]].get
+        val collateral = SELF.tokens.slice(1, SELF.tokens.size)
+        val liquidationScript = getVar[Coll[Byte]](0)
+        val recollateralizeIndex = getVar[Int](3)
+
+        if (fee < 0L || fee > SELF.value - 1000000L) {
+            sigmaProp(false)
+        } else if (liquidationScript.isDefined || !recollateralizeIndex.isDefined) {
+            // Settlement: liquidation or repayment
+            val settlementIndex = getVar[Int](1).get
+            if (settlementIndex < 0 || settlementIndex >= OUTPUTS.size) {
+                sigmaProp(false)
+            } else {
+                val settlement = OUTPUTS(settlementIndex)
+                val toVault =
+                    blake2b256(settlement.propositionBytes) == CONST_VAULT_HASH &&
+                    settlement.tokens.size > 0 &&
+                    settlement.tokens(0) == SELF.tokens(0) &&
+                    settlement.R4[Coll[Byte]].get == SELF.id
+
+                if (liquidationScript.isDefined) {
+                    val liquidated =
+                        blake2b256(liquidationScript.get) == SELF.R8[Coll[Byte]].get &&
+                        toVault &&
+                        settlement.R5[Byte].get == 1.toByte
+                    sigmaProp(liquidated) && executeFromVar[SigmaProp](0)
+                } else {
+                    val returnIndex = getVar[Int](2).get
+                    if (returnIndex < 0 || returnIndex >= OUTPUTS.size || returnIndex == settlementIndex) {
+                        sigmaProp(false)
+                    } else {
+                        val returnBox = OUTPUTS(returnIndex)
+                        val repayment = borrower(0)
+                        val repaymentToken = SELF.R4[Coll[Byte]].get
+                        // Subtract the fee refund rather than add to the terms, to avoid overflow.
+                        val ergPaid = settlement.value >= fee && settlement.value - fee >= borrower(2)
+                        val assetPaid = if (repaymentToken.size == 0) {
+                            settlement.tokens.size == 1 && settlement.value - fee >= repayment
+                        } else {
+                            settlement.tokens.size == 2 &&
+                            settlement.tokens(1)._1 == repaymentToken &&
+                            settlement.tokens(1)._2 >= repayment
+                        }
+                        val repaid =
+                            HEIGHT.toLong < maturity &&
+                            toVault &&
+                            settlement.R5[Byte].get == 0.toByte &&
+                            ergPaid && assetPaid &&
+                            blake2b256(returnBox.propositionBytes) == borrowerHash &&
+                            returnBox.R4[Coll[Byte]].get == SELF.id &&
+                            returnBox.tokens == collateral &&
+                            returnBox.value >= SELF.value - fee
+                        sigmaProp(repaid)
+                    }
+                }
+            }
+        } else {
+            // Recollateralize
+            val index = recollateralizeIndex.get
+            if (index < 0 || index >= OUTPUTS.size) {
+                sigmaProp(false)
+            } else {
+                val next = OUTPUTS(index)
+                if (next.tokens.size != SELF.tokens.size) {
+                    sigmaProp(false)
+                } else {
+                    val borrowerAuth = INPUTS.exists { (b: Box) =>
+                        b.id != SELF.id && blake2b256(b.propositionBytes) == borrowerHash
+                    }
+                    val sameTerms =
+                        next.propositionBytes == SELF.propositionBytes &&
+                        next.R4[Coll[Byte]].get == SELF.R4[Coll[Byte]].get &&
+                        next.R5[Coll[Byte]].get == borrowerHash &&
+                        next.R6[Coll[Long]].get == borrower &&
+                        next.R7[Coll[(Coll[Byte], Long)]].get == SELF.R7[Coll[(Coll[Byte], Long)]].get &&
+                        next.R8[Coll[Byte]].get == SELF.R8[Coll[Byte]].get &&
+                        next.R9[Coll[Long]].get == lender
+                    val noneLower =
+                        next.value >= SELF.value &&
+                        next.tokens(0) == SELF.tokens(0) &&
+                        SELF.tokens.indices.forall { (j: Int) =>
+                            next.tokens(j)._1 == SELF.tokens(j)._1 && next.tokens(j)._2 >= SELF.tokens(j)._2
+                        }
+                    val ergAdded = next.value - SELF.value
+                    val ergGrown = ergAdded >= 1L && ergAdded >= (SELF.value - fee) / 100L
+                    val tokenGrown = SELF.tokens.indices.exists { (j: Int) =>
+                        val added = next.tokens(j)._2 - SELF.tokens(j)._2
+                        j >= 1 && added >= 1L && added >= SELF.tokens(j)._2 / 100L
+                    }
+                    sigmaProp(
+                        HEIGHT.toLong < maturity && borrowerAuth && sameTerms && noneLower &&
+                        (ergGrown || tokenGrown)
+                    )
+                }
+            }
+        }
+    }
+}

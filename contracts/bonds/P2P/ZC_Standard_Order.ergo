@@ -1,0 +1,166 @@
+{
+    // Standard SigmaFi V2 order. No off-chain code exists yet.
+    // Use only with ZC_Standard_Bond and ZC_Standard_BondVault. One order script serves ERG and token repayment,
+    // fixed and on-close maturity: every term is in a register, so every open order of this
+    // protocol sits at ONE address and is read without parsing ErgoTree constants.
+    //
+    // CONSTANTS
+    // CONST_BOND_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Bond ErgoTree
+    //
+    // ORDER REGISTERS -> BOND REGISTERS (copied exactly; the lender cannot alter them)
+    // R4: Coll[Long] -> bond R6: borrower values, length 7..64:
+    //   0 repayment amount, in the repayment asset named by R8
+    //   1 principal nanoERG
+    //   2 repayment ERG floor, excluding the lender-fee refund. For ERG repayment the bond requires
+    //     the larger of this floor and R4(0); for token repayment it is the nanoERG paid beside
+    //     the tokens.
+    //   3 maturity: an absolute height (mode 0) or a duration in blocks, at least 30 (mode 1)
+    //   4 absolute order expiry height
+    //   5 borrower-funded expiry batching fee, >= 2000000 nanoERG
+    //   6 maturity mode: 0 fixed height, 1 on-close (start height + duration)
+    //   7.. opaque borrower payload, interpreted only by the agreed liquidation expression.
+    //     ZC_Standard_ERG_SigUSD_Liquidation reads 7: minimum ratio in basis points, 8: maximum oracle age.
+    // R5: Coll[(Coll[Byte], Long)] -> bond R7: exact principal tokens
+    // R6: Coll[Byte] -> bond R5: blake2b256 of the borrower script
+    // R7: Coll[Byte] -> bond R8: blake2b256 of the serialized liquidation expression
+    // R8: Coll[Byte] -> bond R4: repayment token id; EMPTY for ERG repayment
+    // Bond R9: Coll[Long] = (lender liquidation fee reserve, start height, maturity height).
+    //
+    // VALUE AND EXPIRY
+    // Order value = collateral nanoERG + expiry fee; SELF.tokens are the collateral tokens.
+    // Fill requires HEIGHT < R4(4) and returns the unused expiry fee with the principal.
+    // Expiry refund requires HEIGHT >= R4(4): all tokens and >= value - fee go back to the borrower.
+    // A borrower-script co-spend cancels at any height.
+    //
+    // FILL SHAPE (no context vars)
+    // INPUTS(0) = SELF, so the bond asset id is this order's id and one order fills per transaction.
+    // Exactly 3 units are minted: 2 locked in the bond, 1 circulating.
+    // OUTPUTS(0): the circulating unit at tokens(0), at any lender-chosen script (a wallet, a lend
+    //   offer, ZC_Standard_FractionalMint...). R4/R5: EIP-4 name/description; R6: UTF-8 "0".
+    // OUTPUTS(1): the bond. tokens(0) = (asset, 2), then SELF.tokens unchanged. Value = collateral
+    //   nanoERG + lender fee reserve bond R9(0), funded by the lender above the collateral.
+    // OUTPUTS(2): principal + expiry-fee refund, at the borrower script.
+    //
+    // START AND MATURITY
+    // Bond R9(1), the start height, must lie in [HEIGHT - 8, HEIGHT]: a script cannot pin HEIGHT
+    // exactly without making the transaction valid in a single block. Consumers use it to accrue
+    // value between start and maturity. Mode 0: maturity = R4(3). Mode 1: maturity = start + R4(3).
+    // Either way maturity > HEIGHT + 1, leaving at least one full block to repay.
+    //
+    // STATE-BOX RULE (the reason for 3 units)
+    // Supply is exactly 3 and 2 stay together for the asset's whole life: in the bond, then in the
+    // vault. The holder of the 1 circulating unit can never assemble 2. So for a genuine asset X,
+    // "the box holding 2 units of X" IS the bond's state box, before and after settlement: one
+    // unspent-by-token-id lookup off-chain, one data-input check on-chain. No ancestry walk.
+    // Genuineness of X itself is a separate, one-time check: the box with id X must have been
+    // spent as an order with this exact script (and CONST_BOND_HASH). Storage-rent collection
+    // is outside script evaluation and is not modelled.
+    //
+    // ASSUMPTIONS
+    // The borrower inspects the liquidation expression; its hash is a commitment, not a proof of
+    // safety or liveness. Principal/repayment asset consistency is the borrower's responsibility.
+    // Anyone-can-spend borrower scripts let anyone cancel.
+
+    def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
+        OUTPUTS.fold(0L, { (a: Long, b: Box) =>
+            val count = b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                if (t._1 == tokenId) z + t._2 else z
+            })
+            a + count
+        })
+    }
+
+    val borrowerHash = SELF.R6[Coll[Byte]].get
+    val minted = numTokenInOutputs(SELF.id)
+
+    if (minted > 0L) {
+        // Fill
+        val borrower = SELF.R4[Coll[Long]].get
+        if (borrower.size < 7 || borrower.size > 64 || OUTPUTS.size < 3) {
+            sigmaProp(false)
+        } else {
+            val lenderOut = OUTPUTS(0)
+            val bond = OUTPUTS(1)
+            val principal = OUTPUTS(2)
+            val lender = bond.R9[Coll[Long]].get
+            if (lender.size != 3) {
+                sigmaProp(false)
+            } else {
+                val expiryFee = borrower(5)
+                val mode = borrower(6)
+                val collateralERG = SELF.value - expiryFee
+                val fee = lender(0)
+                val start = lender(1)
+                val maturity = lender(2)
+                val principalTokens = SELF.R5[Coll[(Coll[Byte], Long)]].get
+                val decimals = fromBase16("30")
+
+                val borrowerValid =
+                    borrower(0) > 0L && borrower(1) >= 0L && borrower(2) > 0L &&
+                    (mode == 0L || mode == 1L) &&
+                    expiryFee >= 2000000L && expiryFee <= SELF.value - 1000000L &&
+                    HEIGHT.toLong < borrower(4)
+
+                val mintValid =
+                    SELF.id == INPUTS(0).id && minted == 3L &&
+                    lenderOut.tokens.size > 0 &&
+                    lenderOut.tokens(0)._1 == SELF.id && lenderOut.tokens(0)._2 == 1L &&
+                    lenderOut.R4[Coll[Byte]].isDefined &&
+                    lenderOut.R5[Coll[Byte]].isDefined &&
+                    lenderOut.R6[Coll[Byte]].get == decimals
+
+                val bondValid =
+                    blake2b256(bond.propositionBytes) == CONST_BOND_HASH &&
+                    bond.tokens.size > 0 &&
+                    bond.tokens(0)._1 == SELF.id && bond.tokens(0)._2 == 2L &&
+                    bond.tokens.slice(1, bond.tokens.size) == SELF.tokens &&
+                    fee >= 0L && bond.value >= collateralERG && bond.value - collateralERG >= fee &&
+                    bond.value - fee >= 1000000L &&
+                    bond.R4[Coll[Byte]].get == SELF.R8[Coll[Byte]].get &&
+                    bond.R5[Coll[Byte]].get == borrowerHash &&
+                    bond.R6[Coll[Long]].get == borrower &&
+                    bond.R7[Coll[(Coll[Byte], Long)]].get == principalTokens &&
+                    bond.R8[Coll[Byte]].get == SELF.R7[Coll[Byte]].get
+
+                val startValid = start <= HEIGHT.toLong && start >= HEIGHT.toLong - 8L
+                val maturityValid = maturity > HEIGHT.toLong + 1L && (
+                    if (mode == 0L) maturity == borrower(3)
+                    else borrower(3) >= 30L && maturity == start + borrower(3)
+                )
+
+                val principalPaid =
+                    blake2b256(principal.propositionBytes) == borrowerHash &&
+                    principal.value >= expiryFee && principal.value - expiryFee >= borrower(1) &&
+                    principal.tokens == principalTokens
+
+                sigmaProp(borrowerValid && mintValid && bondValid && startValid && maturityValid && principalPaid)
+            }
+        }
+    } else {
+        // Cancel: an independent borrower-authorized co-spend, valid even for malformed terms.
+        val borrowerAuth = INPUTS.exists { (b: Box) =>
+            b.id != SELF.id && blake2b256(b.propositionBytes) == borrowerHash
+        }
+        if (borrowerAuth) {
+            sigmaProp(true)
+        } else {
+            // Expiry refund, by anyone. Context var 0: Int refund output index.
+            val borrower = SELF.R4[Coll[Long]].get
+            val refundIndex = getVar[Int](0).get
+            if (borrower.size < 7 || borrower.size > 64 || refundIndex < 0 || refundIndex >= OUTPUTS.size) {
+                sigmaProp(false)
+            } else {
+                val fee = borrower(5)
+                val refund = OUTPUTS(refundIndex)
+                sigmaProp(
+                    HEIGHT.toLong >= borrower(4) &&
+                    fee >= 2000000L && fee <= SELF.value - 1000000L &&
+                    blake2b256(refund.propositionBytes) == borrowerHash &&
+                    refund.R4[Coll[Byte]].get == SELF.id &&
+                    refund.value >= SELF.value - fee &&
+                    refund.tokens == SELF.tokens
+                )
+            }
+        }
+    }
+}

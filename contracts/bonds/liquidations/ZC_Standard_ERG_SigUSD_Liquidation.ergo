@@ -1,0 +1,94 @@
+{
+    // Standard ERG/SigUSD liquidation expression. No off-chain code exists yet.
+    // For ZC_Standard_Bond only, executed via host context var 0 with the bond as SELF.
+    // Borrower R6(7): minimum collateral / PRINCIPAL ratio in basis points (15000 = 150%).
+    // Borrower R6(8): maximum oracle age in blocks (1..100000). Further borrower data are ignored.
+    // R6(1) / R7 are the agreed principal nanoERG / tokens, excluding expiry-fee refund.
+    // Lender R9 = (liquidation fee reserve, start height, maturity); exclude the fee from collateral.
+    // tokens(0) is the bond's 2-unit asset reserve, never collateral; tokens(1..) are collateral.
+    //
+    // ELIGIBILITY
+    // At or after actual maturity: no oracle or ratio parameters required.
+    // Before maturity: strictly BELOW the borrower ratio using one fresh USD Oracle v2 data input.
+    // Find that input by its singleton NFT anywhere in its tokens; its data-input index is arbitrary.
+    // Oracle R4 Long = nanoERG per USD; R5 Int = epoch. Reject bootstrap/invalid/nonpositive rate,
+    // future/stale creation height, missing NFT, non-singleton NFT, or multiple matching data inputs.
+    // Identity is the NFT; the pool's governance/upgrade authority remains trusted for feed semantics.
+    // Mainnet USD v2 NFT: 6a2b...7c66 (also used by the Lithos oracle registry).
+    // NFT source: https://gist.github.com/kushti/e021c00933b2cff1c549a7687afcaf36
+    // Rate convention: https://github.com/ergoplatform/ergo-jde/blob/main/kiosk/src/test/scala/kiosk/dexy/DexySpec.scala
+    // Oracle implementation: https://github.com/ergoplatform/oracle-core
+    //
+    // VALUATION
+    // SigUSD is assumed $1, with 100 raw units per USD (2 decimals). Other collateral tokens
+    // are valued at zero, but ALL are paid to the vault. Before maturity this rule supports only
+    // ERG/SigUSD principal assets, rejecting unpriced principal tokens rather than omitting debt.
+    // With oracle P nanoERG/USD, compare without division or price rounding:
+    // C = 100*collateralNanoERG + P*collateralSigUSDRaw
+    // L = 100*principalNanoERG  + P*principalSigUSDRaw
+    // liquidate iff C*10000 < L*borrowerRatioBps, with positive L. Widen BEFORE multiplication.
+    // Products fit BigInt's 256-bit domain for Long inputs, including Long ratio/price extremes.
+    //
+    // PAYOUT / COMPOSITION
+    // Context var 1 Int selects settlement. Send every bond token (reserve, then all collateral)
+    // and >= collateral ERG. The host bond additionally enforces the vault script, the reserve at
+    // tokens(0), the per-bond tag and the path marker. Other positions are unconstrained.
+    // The borrower can restore the ratio before maturity with the bond's recollateralize path.
+    // This expression supplies no conversion/DEX, oracle fallback, depeg model, or loss insurance.
+    // NFT identity/rate convention were source-checked; live-node execution and max cost unverified.
+
+    val borrower = SELF.R6[Coll[Long]].get
+    val lender = SELF.R9[Coll[Long]].get
+    val settlementIndex = getVar[Int](1).get
+    if (borrower.size < 7 || borrower.size > 64 || lender.size != 3 ||
+        settlementIndex < 0 || settlementIndex >= OUTPUTS.size) {
+        sigmaProp(false)
+    } else {
+        val fee = lender(0)
+        val settlement = OUTPUTS(settlementIndex)
+        val collateral = SELF.tokens.slice(1, SELF.tokens.size)
+        val payoutValid = fee >= 0L && fee <= SELF.value &&
+            settlement.value >= SELF.value - fee && settlement.tokens == SELF.tokens
+
+        val eligible = if (HEIGHT.toLong >= lender(2)) {
+            true
+        } else {
+            if (borrower.size < 9) {
+                false
+            } else {
+                val ratioBps = borrower(7)
+                val maxAge = borrower(8)
+                val oracleNFT = fromBase16("6a2b821b5727e85beb5e78b4efb9f0250d59cd48481d2ded2c23e91ba1d07c66")
+                val sigUSD = fromBase16("03faf2cb329f2e90d6d23b58d91bbb6c046aa143261cc21f52fbe2824bfcbf04")
+                val pools = CONTEXT.dataInputs.filter { (b: Box) =>
+                    b.tokens.exists { (t: (Coll[Byte], Long)) => t._1 == oracleNFT && t._2 == 1L }
+                }
+                if (ratioBps <= 0L || maxAge < 1L || maxAge > 100000L || pools.size != 1) {
+                    false
+                } else {
+                    val pool = pools(0)
+                    val price = pool.R4[Long].get
+                    val epoch = pool.R5[Int].get
+                    val created = pool.creationInfo._1.toLong
+                    val fresh = created >= 0L && created <= HEIGHT.toLong && HEIGHT.toLong - created <= maxAge
+                    val principal = SELF.R7[Coll[(Coll[Byte], Long)]].get
+                    val principalSupported = principal.size == 0 ||
+                        (principal.size == 1 && principal(0)._1 == sigUSD && principal(0)._2 > 0L)
+                    val collateralUSD = collateral.fold(0L, { (a: Long, t: (Coll[Byte], Long)) =>
+                        if (t._1 == sigUSD) a + t._2 else a
+                    })
+                    val principalUSD = principal.fold(0L, { (a: Long, t: (Coll[Byte], Long)) =>
+                        if (t._1 == sigUSD) a + t._2 else a
+                    })
+                    val collateralValue = (SELF.value - fee).toBigInt * 100L.toBigInt +
+                        price.toBigInt * collateralUSD.toBigInt
+                    val principalValue = borrower(1).toBigInt * 100L.toBigInt +
+                        price.toBigInt * principalUSD.toBigInt
+                    fresh && price > 0L && epoch >= 0 && borrower(1) >= 0L && principalSupported &&
+                        principalValue > 0L && collateralValue * 10000L.toBigInt < principalValue * ratioBps.toBigInt
+                }
+            }
+        }
+        sigmaProp(payoutValid && eligible)
+    }
+}

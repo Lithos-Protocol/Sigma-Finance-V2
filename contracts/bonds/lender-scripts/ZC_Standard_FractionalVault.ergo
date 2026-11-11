@@ -1,0 +1,146 @@
+{
+    // Standard fractional vault. No off-chain code exists yet.
+    // Created only by ZC_Standard_FractionalMint. Holds one circulating bond unit on behalf of N shares,
+    // pulls the bond's settlement out of ZC_Standard_BondVault, and pays share holders pro rata.
+    // No constants.
+    //
+    // TOKENS
+    // tokens(0): (share, N+1) - the reserve, kept through every transition and burned only by the
+    //   final claim. Supply is 2*N+1, so for a known (share, N) the box holding N+1 units is the
+    //   share's state box: found by token id, authenticated by amount, usable as a data input.
+    // tokens(1..): before the pull exactly (bond asset, 1); after it, the settlement proceeds
+    //
+    // REGISTERS
+    // R4: Coll[Byte] - bond asset id
+    // R5: Coll[Long] - (N, outstanding shares, pull fee). Outstanding starts at N and falls with
+    //   each claim. The pull fee, >= 0.002 ERG, was funded into this box's value at mint.
+    // R6: Byte - bond settlement path, 0 repaid / 1 liquidated. Present only after the pull.
+    // State is read from the tokens: the vault is "holding" while tokens(1..) contains the bond asset.
+    //
+    // PATHS, selected by the shares burned = transaction-wide share inputs minus share outputs
+    // PULL (burned = 0, anyone). Context var 0: Int continuation index.
+    //   Spends this box with the one other input carrying the bond asset, which is the settled
+    //   ZC_Standard_BondVault: only it can hold the other 2 units, at tokens(0). All 3 bond units are
+    //   burned. The continuation keeps this script, R4, R5 and the reserve, takes ALL of the bond
+    //   vault's tokens(1..) and value, and records the bond vault's path in R6. The puller may
+    //   keep up to the pull fee R5(2) out of the combined value as its batching fee.
+    // PARTIAL CLAIM (0 < burned < outstanding, after the pull only).
+    //   Context var 0: Int continuation index; 1: Int payout index, distinct.
+    //   Pays floor(balance * burned / outstanding) of nanoERG and of EACH token; the rest stays
+    //   under this script with outstanding reduced. Products use BigInt before division.
+    // FINAL CLAIM (burned = outstanding + N + 1). Context var 1: Int payout index.
+    //   Every outstanding share AND the reserve are burned; the payout takes everything. Before
+    //   the pull this returns the bond unit itself: holding all shares un-fractionalizes the bond.
+    // Payout outputs carry R4 = SELF.id, so one output cannot serve two vaults.
+    //
+    // ASSUMPTIONS AND LIMITS
+    // - N is free and unrelated to the proceeds' raw units, so a small claim can round to zero for
+    //   an asset. Rounding dust stays for later claimants; the final claim takes it all.
+    // - Claimants fund fees and minimum-box top-ups. Payouts and continuations may receive extra
+    //   ERG; tokens are exact. Claims on one vault serialize; different vaults may share a transaction.
+    // - The payout destination is chosen by whoever supplies the shares. Joint claimants must agree.
+    // - The proceeds are assumed not to contain this vault's own share token: the bond's collateral
+    //   is fixed before the share id exists. A liquidation expression that injects it is unsupported.
+    // - Shares lost or burned outside these paths strand their entitlement. No sweep authority.
+    // - A hand-made box with this script cannot hold a genuine reserve; see ZC_Standard_FractionalMint for
+    //   share verification. Storage rent, serialization and maximum cost are unverified.
+
+    def numTokenInInputs(tokenId: Coll[Byte]): Long = {
+        INPUTS.fold(0L, { (a: Long, b: Box) =>
+            val count = b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                if (t._1 == tokenId) z + t._2 else z
+            })
+            a + count
+        })
+    }
+
+    def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
+        OUTPUTS.fold(0L, { (a: Long, b: Box) =>
+            val count = b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                if (t._1 == tokenId) z + t._2 else z
+            })
+            a + count
+        })
+    }
+
+    val shareId = SELF.tokens(0)._1
+    val reserve = SELF.tokens(0)._2
+    val bondAsset = SELF.R4[Coll[Byte]].get
+    val supply = SELF.R5[Coll[Long]].get
+    val assets = SELF.tokens.slice(1, SELF.tokens.size)
+    val holding = assets.exists { (t: (Coll[Byte], Long)) => t._1 == bondAsset }
+    val burned = numTokenInInputs(shareId) - numTokenInOutputs(shareId)
+
+    if (supply.size != 3 || supply(0) < 1L || supply(0) > 1000000000L || reserve != supply(0) + 1L ||
+        supply(1) < 1L || supply(1) > supply(0) || burned < 0L) {
+        sigmaProp(false)
+    } else {
+        val outstanding = supply(1)
+
+        if (burned == 0L) {
+            // Pull the settled bond vault into this box
+            val nextIndex = getVar[Int](0).get
+            val sources = INPUTS.filter { (b: Box) =>
+                b.id != SELF.id && b.tokens.exists { (t: (Coll[Byte], Long)) => t._1 == bondAsset }
+            }
+            val pullFee = supply(2)
+            if (!holding || assets.size != 1 || sources.size != 1 || pullFee < 0L || pullFee > SELF.value ||
+                nextIndex < 0 || nextIndex >= OUTPUTS.size) {
+                sigmaProp(false)
+            } else {
+                val source = sources(0)
+                val next = OUTPUTS(nextIndex)
+                val pulled =
+                    source.tokens(0)._1 == bondAsset &&
+                    numTokenInOutputs(bondAsset) == 0L &&
+                    next.propositionBytes == SELF.propositionBytes &&
+                    next.value >= SELF.value - pullFee &&
+                    next.value - (SELF.value - pullFee) >= source.value &&
+                    next.tokens == SELF.tokens.slice(0, 1).append(source.tokens.slice(1, source.tokens.size)) &&
+                    next.R4[Coll[Byte]].get == bondAsset &&
+                    next.R5[Coll[Long]].get == supply &&
+                    next.R6[Byte].get == source.R5[Byte].get
+                sigmaProp(pulled)
+            }
+        } else {
+            val payoutIndex = getVar[Int](1).get
+            if (payoutIndex < 0 || payoutIndex >= OUTPUTS.size) {
+                sigmaProp(false)
+            } else {
+                val payout = OUTPUTS(payoutIndex)
+                val payoutTagged = payout.R4[Coll[Byte]].get == SELF.id
+
+                if (burned == outstanding + reserve) {
+                    // Final claim: all outstanding shares and the reserve are gone
+                    sigmaProp(payoutTagged && payout.value >= SELF.value && payout.tokens == assets)
+                } else {
+                    val nextIndex = getVar[Int](0).get
+                    if (holding || burned >= outstanding ||
+                        nextIndex < 0 || nextIndex >= OUTPUTS.size || nextIndex == payoutIndex) {
+                        sigmaProp(false)
+                    } else {
+                        val next = OUTPUTS(nextIndex)
+                        val paidERG = (SELF.value.toBigInt * burned.toBigInt / outstanding.toBigInt).toLong
+                        val paidTokens = assets.map { (t: (Coll[Byte], Long)) =>
+                            (t._1, (t._2.toBigInt * burned.toBigInt / outstanding.toBigInt).toLong)
+                        }.filter { (t: (Coll[Byte], Long)) => t._2 > 0L }
+                        val retainedTokens = assets.map { (t: (Coll[Byte], Long)) =>
+                            (t._1, t._2 - (t._2.toBigInt * burned.toBigInt / outstanding.toBigInt).toLong)
+                        }.filter { (t: (Coll[Byte], Long)) => t._2 > 0L }
+
+                        val paid = payoutTagged && payout.value >= paidERG && payout.tokens == paidTokens
+                        val continued =
+                            next.propositionBytes == SELF.propositionBytes &&
+                            next.value >= SELF.value - paidERG &&
+                            next.tokens == SELF.tokens.slice(0, 1).append(retainedTokens) &&
+                            next.R4[Coll[Byte]].get == bondAsset &&
+                            next.R5[Coll[Long]].get == Coll(supply(0), outstanding - burned, supply(2)) &&
+                            next.R6[Byte].get == SELF.R6[Byte].get
+
+                        sigmaProp(paid && continued)
+                    }
+                }
+            }
+        }
+    }
+}

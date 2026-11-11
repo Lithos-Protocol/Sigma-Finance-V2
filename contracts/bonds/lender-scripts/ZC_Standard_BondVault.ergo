@@ -1,0 +1,50 @@
+{
+    // Standard SigmaFi V2 bond vault. No off-chain code exists yet.
+    // Receives every ZC_Standard_Bond settlement. One vault serves every bond: it has no constants.
+    // The holder of the circulating bond unit claims the whole box by burning all 3 units.
+    //
+    // TOKENS
+    // tokens(0): (bond asset, 2) - the reserve the bond carried here. Because supply is exactly 3,
+    //   this is the only box that can hold 2 units: it is found by token id and it authenticates
+    //   itself, off-chain and as a data input. A fake vault naming the asset cannot hold the reserve.
+    // tokens(1..): settlement proceeds
+    //
+    // REGISTERS (enforced by the bond, not read here)
+    // R4: Coll[Byte] - id of the bond box this settles
+    // R5: Byte - settlement path: 0 repaid, 1 liquidated
+    //
+    // SPENDING
+    // More of the asset than this box's reserve must be spent, and none may survive: the circulating
+    // unit is presented and all 3 units are burned. Outputs are otherwise unconstrained, so a holder
+    // may sweep any number of settled bonds in one transaction, and a consuming contract such as
+    // ZC_Standard_FractionalVault can direct the proceeds into itself.
+    //
+    // ASSUMPTIONS
+    // - The asset came from a verified ZC_Standard_Order mint: supply 3, reserve 2. For any other token the
+    //   rule still only releases a box to someone who burns more of tokens(0) than the box holds.
+    // - Value sent here outside a bond settlement is a gift to that asset's holder.
+    // - A lost circulating unit strands the proceeds. No timeout or sweep authority exists.
+    // - Storage-rent collection is outside script evaluation and is not modelled.
+
+    def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
+        OUTPUTS.fold(0L, { (a: Long, b: Box) =>
+            val count = b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                if (t._1 == tokenId) z + t._2 else z
+            })
+            a + count
+        })
+    }
+
+    def numTokenInInputs(tokenId: Coll[Byte]): Long = {
+        INPUTS.fold(0L, { (a: Long, b: Box) =>
+            val count = b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                if (t._1 == tokenId) z + t._2 else z
+            })
+            a + count
+        })
+    }
+
+    val asset = SELF.tokens(0)._1
+    val reserve = SELF.tokens(0)._2
+    sigmaProp(numTokenInInputs(asset) > reserve && numTokenInOutputs(asset) == 0L)
+}

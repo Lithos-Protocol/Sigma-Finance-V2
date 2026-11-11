@@ -1,0 +1,21 @@
+{
+    // Standard maturity liquidation expression. No off-chain code exists yet.
+    // For ZC_Standard_Bond only, executed through the bond's context var 0 with the bond as SELF.
+    // Bond R9 = (lender liquidation fee reserve, start height, maturity height).
+    // At or after maturity, send every bond token (the reserve, then all collateral) and at least
+    // SELF.value minus the fee reserve to the settlement output named by context var 1.
+    // The host bond pins the vault script, the reserve at tokens(0), the R4 tag and the path marker.
+    val lender = SELF.R9[Coll[Long]].get
+    val index = getVar[Int](1).get
+    if (lender.size != 3 || index < 0 || index >= OUTPUTS.size) {
+        sigmaProp(false)
+    } else {
+        val settlement = OUTPUTS(index)
+        sigmaProp(
+            HEIGHT.toLong >= lender(2) &&
+            lender(0) >= 0L && lender(0) <= SELF.value &&
+            settlement.value >= SELF.value - lender(0) &&
+            settlement.tokens == SELF.tokens
+        )
+    }
+}
