@@ -1,9 +1,11 @@
 {
     // Standard fractionalization request. No off-chain code exists yet.
-    // Holds one circulating bond unit and turns it into N fungible shares backed by an
+    // Holds one circulating bond unit and turns it into N fungible shares backed by a
     // ZC_Standard_FractionalVault. Fractionalization is optional and separate from the bond: an order
     // fill can name this script as its OUTPUTS(0), or a holder can deposit the unit at any later
     // time. The bond, its terms and its liquidation expression never learn the share count.
+    // The owner is never assumed to be online after creating this box: everything the mint needs is
+    // committed here, so any batcher can run it for the mint fee.
     //
     // CONSTANTS
     // CONST_FRACTIONAL_VAULT_HASH: Coll[Byte] - blake2b256 of ZC_Standard_FractionalVault
@@ -13,35 +15,38 @@
     //
     // REGISTERS
     // R4-R6: free. When this box is an order's OUTPUTS(0) they hold the bond asset's EIP-4 data.
-    // R7: Coll[Byte] - blake2b256 of the owner script: authorizes mint and cancel, receives the shares
-    // R8: Long - N, the number of shares, 1 <= N <= 1000000000
-    // R9: Long - pull batching fee, >= 2000000 nanoERG (0.002 ERG). It is part of this box's value,
-    //   funded above at least 1000000 nanoERG, and pays whoever later pulls the settled bond
-    //   into the fractional vault.
+    // R7: Coll[Byte] - blake2b256 of the owner script: receives the shares, may cancel
+    // R8: Coll[Long] - (N, pull fee, mint fee):
+    //   0 N, the number of shares, 1 <= N <= 1000000000
+    //   1 pull batching fee, >= 2000000 nanoERG. It moves into the fractional vault and pays whoever
+    //     later pulls the settled bond into it.
+    //   2 mint batching fee, >= 2000000 nanoERG. It pays whoever runs the mint.
+    // R9: Coll[Coll[Byte]] - the share token's EIP-4 (name, description, decimals), exactly 3 items.
+    //   The owner's free choice, fixed here so the minter cannot pick them. Decimals are display
+    //   only: every amount on-chain is in raw share units, and no payout granularity is guaranteed.
     //
-    // MINT (owner-authorized; no context vars)
+    // VALUE
+    // This box funds four things: the fractional vault (at least 1000000 nanoERG plus the pull fee),
+    // the share output (at least 1000000 nanoERG), and the mint fee. The vault and the share output
+    // together receive at least SELF.value minus the mint fee.
+    //
+    // MINT (anyone; no context vars)
     // A transaction mints one token id, INPUTS(0).id, and an order fill already uses it for the
     // bond asset. Shares therefore need this second, chainable transaction.
     // INPUTS(0) = SELF: the share id is this box's id. Exactly 2*N+1 shares are minted.
-    // OUTPUTS(0): N shares at tokens(0), at the owner script. R4/R5: EIP-4 name/description;
-    //   R6: EIP-4 decimals. All three are the owner's free choice. Decimals are display only: every
-    //   amount on-chain is in raw share units, and no payout granularity is guaranteed.
-    // OUTPUTS(1): ZC_Standard_FractionalVault with tokens ((share, N+1), (bond asset, 1)), value >= SELF.value,
+    // OUTPUTS(0): N shares at tokens(0), at the owner script. R4, R5, R6 = the three items of R9.
+    // OUTPUTS(1): ZC_Standard_FractionalVault with tokens ((share, N+1), (bond asset, 1)),
     //   R4 = bond asset id, R5: Coll[Long] = (N, N, pull fee).
     //
     // CANCEL
-    // Nothing is minted: the owner co-spend alone releases this box.
-    //
-    // OWNER AUTHORIZATION
-    // Both paths need a co-spent box guarded by the owner script. Minting is not open to anyone,
-    // because the minter picks the share token's name, description and decimals.
+    // Nothing is minted, and a co-spent box guarded by the owner script releases this box.
     //
     // VERIFYING A SHARE
     // Share id Y is genuine iff the box with id Y was spent under this exact script and constant.
     // The script then guarantees supply 2*N+1 with N+1 locked in the fractional vault, so for a
     // known (Y, N) "the box holding N+1 units of Y" is the share's state box. Its R4 names the bond
-    // asset X; verify X as described in ZC_Standard_Order. This script does not check that X is a genuine
-    // bond: the depositor answers for what they wrap, and share buyers verify it.
+    // asset X; verify X as described in ZC_Standard_Order. This script does not check that X is a
+    // genuine bond: the depositor answers for what they wrap, and share buyers verify it.
 
     def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
         OUTPUTS.fold(0L, { (a: Long, b: Box) =>
@@ -54,44 +59,53 @@
 
     val ownerHash = SELF.R7[Coll[Byte]].get
     val minted = numTokenInOutputs(SELF.id)
-    val ownerAuth = INPUTS.exists { (b: Box) =>
-        b.id != SELF.id && blake2b256(b.propositionBytes) == ownerHash
-    }
 
     if (minted > 0L) {
-        val shares = SELF.R8[Long].get
-        if (shares < 1L || shares > 1000000000L || OUTPUTS.size < 2 || SELF.tokens.size != 1) {
+        val terms = SELF.R8[Coll[Long]].get
+        val metadata = SELF.R9[Coll[Coll[Byte]]].get
+        if (terms.size != 3 || metadata.size != 3 || OUTPUTS.size < 2 || SELF.tokens.size != 1) {
             sigmaProp(false)
         } else {
+            val shares = terms(0)
+            val pullFee = terms(1)
+            val mintFee = terms(2)
             val shareOut = OUTPUTS(0)
             val vault = OUTPUTS(1)
             val bondUnit = SELF.tokens(0)
-            val pullFee = SELF.R9[Long].get
+
+            val termsValid =
+                shares >= 1L && shares <= 1000000000L &&
+                pullFee >= 2000000L && mintFee >= 2000000L &&
+                pullFee <= SELF.value && mintFee <= SELF.value - pullFee
 
             val mintValid =
                 SELF.id == INPUTS(0).id &&
-                pullFee >= 2000000L && pullFee <= SELF.value - 1000000L &&
                 minted == 2L * shares + 1L &&
                 bondUnit._2 == 1L
 
             val sharesPaid =
                 blake2b256(shareOut.propositionBytes) == ownerHash &&
+                shareOut.value >= 1000000L &&
                 shareOut.tokens.size > 0 &&
                 shareOut.tokens(0)._1 == SELF.id && shareOut.tokens(0)._2 == shares &&
-                shareOut.R4[Coll[Byte]].isDefined &&
-                shareOut.R5[Coll[Byte]].isDefined &&
-                shareOut.R6[Coll[Byte]].isDefined
+                shareOut.R4[Coll[Byte]].get == metadata(0) &&
+                shareOut.R5[Coll[Byte]].get == metadata(1) &&
+                shareOut.R6[Coll[Byte]].get == metadata(2)
 
             val vaultValid =
                 blake2b256(vault.propositionBytes) == CONST_FRACTIONAL_VAULT_HASH &&
-                vault.value >= SELF.value &&
+                vault.value - pullFee >= 1000000L &&
+                vault.value + shareOut.value >= SELF.value - mintFee &&
                 vault.tokens == Coll((SELF.id, shares + 1L), bondUnit) &&
                 vault.R4[Coll[Byte]].get == bondUnit._1 &&
                 vault.R5[Coll[Long]].get == Coll(shares, shares, pullFee)
 
-            sigmaProp(ownerAuth && mintValid && sharesPaid && vaultValid)
+            sigmaProp(termsValid && mintValid && sharesPaid && vaultValid)
         }
     } else {
+        val ownerAuth = INPUTS.exists { (b: Box) =>
+            b.id != SELF.id && blake2b256(b.propositionBytes) == ownerHash
+        }
         sigmaProp(ownerAuth)
     }
 }

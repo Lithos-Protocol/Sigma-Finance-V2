@@ -2,8 +2,10 @@ package org.lithosprotocol.sigmafi
 package specs.bonds
 
 import org.ergoplatform.appkit._
+import org.ergoplatform.appkit.scalaapi._
 import org.ergoplatform.sdk.ErgoId
 import org.scalatest.propspec.AnyPropSpec
+import sigma.Colls
 import work.lithos.mutations.{InputUTXO, Token, UTXO}
 
 /** ZC_Standard_FractionalMint and ZC_Standard_FractionalVault, layered on a standard bond. */
@@ -12,40 +14,55 @@ class ZcStandardFractionalSpec extends AnyPropSpec with ZcStandardSpecBase {
   import ZcStandardSpecBase._
 
   private val pullFee: Long = 2000000L
+  private val mintFee: Long = 2000000L
+  private val shareName = "Bond shares"
+  private val shareDescription = "Shares of one bond"
 
   /** A fill whose circulating unit goes straight into a fractionalization request owned by the lender. */
-  private case class Wrapped(f: Flow, shares: Long, fee: Long, fill: SignedTransaction, request: InputUTXO) {
+  private case class Wrapped(f: Flow, shares: Long, fee: Long, mintFee: Long, decimals: String,
+                             fill: SignedTransaction, request: InputUTXO) {
     def shareId: ErgoId = request.id
   }
 
-  private def requestBox(f: Flow, shares: Long, fee: Long, owner: Array[Byte] = null): UTXO =
-    UTXO(scripts(f.ctx).fractionalMint, minBox + fee, Seq(Token(f.asset, 1L)),
-      eip4() ++ Seq(bytesValue(if (owner == null) hashOf(lenderTree(f.ctx)) else owner),
-        ErgoValue.of(shares), ErgoValue.of(fee)))
+  private def metadataValue(parts: String*): ErgoValue[_] =
+    ErgoValue.of(Colls.fromArray(parts.map(p => Colls.fromArray(p.getBytes("UTF-8"))).toArray)(
+      sigma.collRType(sigma.ByteType)), ErgoType.collType(scalaByteType))
+
+  /** Funds the fractional vault (a minimum box plus the pull fee), the share box and the mint fee. */
+  private def requestBox(f: Flow, shares: Long, fee: Long, mint: Long, decimals: String): UTXO =
+    UTXO(scripts(f.ctx).fractionalMint, minBox + fee + minBox + mint, Seq(Token(f.asset, 1L)),
+      eip4() ++ Seq(bytesValue(hashOf(lenderTree(f.ctx))), longsValue(shares, fee, mint),
+        metadataValue(shareName, shareDescription, decimals)))
 
   private def wrap(ctx: BlockchainContext, kind: Kind = TokenBond, shares: Long = 1000L,
-                   fee: Long = pullFee): Wrapped = {
+                   fee: Long = pullFee, mint: Long = mintFee, decimals: String = "2"): Wrapped = {
     val f = flow(ctx, kind)
-    val fill = accepts(f.holder, standardFillTx(f, unit = requestBox(f, shares, fee)))
-    Wrapped(f, shares, fee, fill, spendOutput(fill, 0))
+    val fill = accepts(f.holder, standardFillTx(f, unit = requestBox(f, shares, fee, mint, decimals)))
+    Wrapped(f, shares, fee, mint, decimals, fill, spendOutput(fill, 0))
   }
 
-  private def shareBox(w: Wrapped, decimals: String = "2"): UTXO =
-    UTXO(lenderTree(w.f.ctx), minBox, Seq(Token(w.shareId, w.shares)), eip4("Bond shares", "Shares of one bond", decimals))
+  private def shareBox(w: Wrapped, decimals: String = null): UTXO =
+    UTXO(lenderTree(w.f.ctx), minBox, Seq(Token(w.shareId, w.shares)),
+      eip4(shareName, shareDescription, if (decimals == null) w.decimals else decimals))
 
   private def freshVault(w: Wrapped): UTXO =
-    UTXO(scripts(w.f.ctx).fractionalVault, w.request.value,
+    UTXO(scripts(w.f.ctx).fractionalVault, w.request.value - w.mintFee - minBox,
       Seq(Token(w.shareId, w.shares + 1L), Token(w.f.asset, 1L)),
       Seq(bytesValue(w.f.asset.getBytes), longsValue(w.shares, w.shares, w.fee)))
 
-  /** The request is INPUTS(0), so the share id is its box id. Outputs: 0 the shares, 1 the fractional vault. */
-  private def mintTx(w: Wrapped, shares: UTXO = null, vault: UTXO = null, by: ErgoProver = null): UnsignedTransaction = {
-    val p = if (by == null) w.f.holder else by
-    build(w.f.ctx, Seq(w.request, funding(w.f.ctx, p, 5)),
-      Seq(if (shares == null) shareBox(w) else shares, if (vault == null) freshVault(w) else vault), p.getAddress)
-  }
+  /**
+   * Run by a batcher with the request as its only input, so the share id is the request's box id and
+   * the mint fee is the batcher's miner fee and reward. Outputs: 0 the shares, 1 the fractional vault.
+   */
+  private def mintTx(w: Wrapped, shares: UTXO = null, vault: UTXO = null,
+                     funded: Boolean = false): UnsignedTransaction =
+    // `funded` adds an executor box, so a negative that shifts value is refused by the script and
+    // not by a dust change box.
+    build(w.f.ctx, if (funded) Seq(w.request, funding(w.f.ctx, executor(w.f.ctx), 5)) else Seq(w.request),
+      Seq(if (shares == null) shareBox(w) else shares, if (vault == null) freshVault(w) else vault),
+      executor(w.f.ctx).getAddress)
 
-  private def minted(w: Wrapped): SignedTransaction = accepts(w.f.holder, mintTx(w))
+  private def minted(w: Wrapped): SignedTransaction = accepts(executor(w.f.ctx), mintTx(w))
 
   /** Repay the bond, so its vault is ready to be pulled. */
   private def bondVault(w: Wrapped): InputUTXO =
@@ -119,45 +136,57 @@ class ZcStandardFractionalSpec extends AnyPropSpec with ZcStandardSpecBase {
     }
   }
 
-  property("mint: the owner alone mints, and chooses the share token's EIP-4 decimals") {
+  property("mint: any batcher mints for the mint fee, with the metadata the owner committed") {
     withCtx { ctx =>
+      Seq("0", "2", "9").foreach { d =>
+        val w = wrap(ctx, decimals = d)
+        val tx = accepts(executor(ctx), mintTx(w))
+        tx.getOutputsToSpend.get(0).getRegisters.get(2) shouldBe utf8(d)
+        tx.getOutputsToSpend.get(0).getErgoTree shouldBe lenderTree(ctx).ergoTree
+      }
       val w = wrap(ctx)
-      Seq("0", "2", "9").foreach(d => accepts(w.f.holder, mintTx(w, shares = shareBox(w, d))))
-      rejectsAtSigning(other(ctx), mintTx(w, by = other(ctx)))
-      rejectsAtSigning(w.f.holder, mintTx(w, shares = shareBox(w).setRegs(utf8("name"), utf8("description"))))
-      rejectsAtSigning(w.f.holder, mintTx(w, shares = shareBox(w).setContract(otherTree(ctx))))
+      rejectsAtSigning(executor(ctx), mintTx(w, shares = shareBox(w, "9")))
+      rejectsAtSigning(executor(ctx), mintTx(w, shares = shareBox(w).withRegNum(4, utf8("Renamed"))))
+      rejectsAtSigning(executor(ctx), mintTx(w, shares = shareBox(w).withRegNum(5, utf8("Other text"))))
+      rejectsAtSigning(executor(ctx), mintTx(w, shares = shareBox(w).setRegs(utf8(shareName), utf8(shareDescription))))
+      rejectsAtSigning(executor(ctx), mintTx(w, shares = shareBox(w).setContract(otherTree(ctx))))
     }
   }
 
-  property("mint: supply, reserve, vault registers and value are exact") {
+  property("mint: supply, reserve and vault registers are exact, and the batcher keeps only the mint fee") {
     withCtx { ctx =>
       val w = wrap(ctx)
       val vault = freshVault(w)
       def supply(circulating: Long, reserve: Long): UnsignedTransaction = mintTx(w,
         shares = shareBox(w).setTokens(Token(w.shareId, circulating)),
         vault = vault.setTokens(Token(w.shareId, reserve), Token(w.f.asset, 1L)))
-      accepts(w.f.holder, supply(w.shares, w.shares + 1L))
+      accepts(executor(ctx), supply(w.shares, w.shares + 1L))
       Seq((w.shares, w.shares), (w.shares, w.shares + 2L), (w.shares + 1L, w.shares + 1L),
-        (w.shares - 1L, w.shares + 1L)).foreach { case (c, r) => rejectsAtSigning(w.f.holder, supply(c, r)) }
+        (w.shares - 1L, w.shares + 1L)).foreach { case (c, r) => rejectsAtSigning(executor(ctx), supply(c, r)) }
       val bad = Seq(vault.subValue(1L), vault.setContract(otherTree(ctx)),
         vault.withRegNum(4, bytesValue(otherBondAsset.getBytes)),
         vault.withRegNum(5, longsValue(w.shares, w.shares - 1L, w.fee)),
         vault.withRegNum(5, longsValue(w.shares, w.shares, w.fee - 1L)),
         vault.withRegNum(5, longsValue(w.shares, w.shares)))
-      bad.foreach(v => rejectsAtSigning(w.f.holder, mintTx(w, vault = v)))
+      bad.foreach(v => rejectsAtSigning(executor(ctx), mintTx(w, vault = v)))
+      // Value may move between the two owner-side boxes, but neither may drop below its floor.
+      accepts(executor(ctx), mintTx(w, shares = shareBox(w).addValue(1L), vault = vault, funded = true))
+      rejectsAtSigning(executor(ctx), mintTx(w, shares = shareBox(w).subValue(1L), vault = vault.addValue(1L), funded = true))
+      rejectsAtSigning(executor(ctx), mintTx(w, shares = shareBox(w).addValue(1L), vault = vault.subValue(1L), funded = true))
     }
   }
 
-  property("mint: the pull fee has a 0.002 ERG minimum and the share count is bounded") {
+  property("mint: both fees have a 0.002 ERG minimum and the share count is bounded") {
     withCtx { ctx =>
-      accepts(lender(ctx), mintTx(wrap(ctx, fee = 2000000L)))
-      val low = wrap(ctx, fee = 1999999L)
-      rejectsAtSigning(low.f.holder, mintTx(low))
-      accepts(lender(ctx), mintTx(wrap(ctx, shares = 1L)))
-      accepts(lender(ctx), mintTx(wrap(ctx, shares = 1000000000L)))
+      accepts(executor(ctx), mintTx(wrap(ctx, fee = 2000000L, mint = 2000000L)))
+      Seq(wrap(ctx, fee = 1999999L), wrap(ctx, mint = 1999999L)).foreach { low =>
+        rejectsAtSigning(executor(ctx), mintTx(low, funded = true))
+      }
+      accepts(executor(ctx), mintTx(wrap(ctx, shares = 1L)))
+      accepts(executor(ctx), mintTx(wrap(ctx, shares = 1000000000L)))
       Seq(0L, 1000000001L).foreach { n =>
         val w = wrap(ctx, shares = n)
-        rejects(w.f.holder, mintTx(w))
+        rejects(executor(ctx), mintTx(w))
       }
     }
   }
