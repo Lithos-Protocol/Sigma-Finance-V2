@@ -203,7 +203,8 @@ unit. As with the bond, the box holding N+1 shares is the shares' state box.
 - **Final claim**: burn every outstanding share and the reserve, and take everything. Before the pull,
   holding all shares returns the bond unit itself.
 
-Share count N is free and decimals are display only.
+Share count N is free and decimals are display only. The off-chain rules set N = 1,000,000 with 6
+decimals (see "Off-chain rules").
 
 ## Dutch auction shares
 
@@ -328,6 +329,29 @@ of 7,030,268 and a size of 1,271,009 bytes.
 | Wallet-to-wallet payment, for scale | 12,205 | 166 |
 
 The heaviest match uses 2.5% of the per-transaction limit. A block holds about 200 of them by size.
+
+## Off-chain rules
+
+The contracts fix what must hold for a box to move. What clients write, how batchers find and serve
+work, and how tokens are displayed is set by the off-chain profile in
+[docs/ZC_STANDARD_OFFCHAIN.md](./docs/ZC_STANDARD_OFFCHAIN.md) (draft, `zcs1`). Off-chain rules cover
+user experience and batching only; prices and risk terms are always the user's input. In brief:
+
+- **Script disclosure** (required). A transaction that creates a box naming a borrower, owner or
+  seller by hash puts that script's ErgoTree in context variable 64 of `INPUTS(0)`, unless an input or
+  output already carries it. Any batcher then finds every script in one lookup. Batchers skip boxes
+  that do not do this. Variables 64 to 127 are reserved for off-chain data.
+- **Token metadata** (recommended). One name and description template for bond units and shares,
+  such as `ZCS-SigUSD-B-1733600-3fa2c1`, built only from chain data, so any client writes the same
+  bytes and readers can flag a mismatch. Shares minted through a lend offer omit the bond, which
+  the offer cannot know when it is posted.
+- **Share count** (recommended). N = 1,000,000 with 6 decimals, so `1.000000` is one bond, and share
+  prices are quoted as a percentage of face. It stays off-chain: it protects no value, and enforcing
+  it would change both mints and the lend offer.
+- **Maturity grid** (recommended). Fixed maturities snap to multiples of 21,600 blocks (about 30
+  days), so bonds of a market maturing in the same month share one height.
+- **Batching.** Pack refunds and liquidations into one transaction, chain fills through
+  continuations in one block, use one published matching order, and price NAV asks 3 blocks ahead.
 
 ## Limits and assumptions
 

@@ -9,7 +9,9 @@ with a tradeable bond asset, pluggable liquidation, fractional shares, a Dutch a
 collateral, and an exchange where a lender's yield bid buys new and existing bonds. It is not
 deployed. Every contract has offline specs, and the CLI below builds all of it: the bond lifecycle,
 fractional and Dutch auction shares, asks and lend offers, plus a batch scan for the work that pays
-whoever runs it.
+whoever runs it. [docs/ZC_STANDARD_OFFCHAIN.md](./docs/ZC_STANDARD_OFFCHAIN.md) sets the off-chain rules
+that clients and batchers follow: script disclosure, token names and descriptions, share count, the
+maturity grid, batching and defaults.
 
 | Folder (`contracts/bonds/`) | Contracts (`ZC_Standard_*`) |
 |---|---|
