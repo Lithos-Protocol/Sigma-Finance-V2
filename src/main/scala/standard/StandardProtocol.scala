@@ -71,6 +71,69 @@ case class StdSettlement(box: InputUTXO, asset: ErgoId, bondId: Array[Byte], liq
 case class OracleState(box: InputUTXO, price: Long, epoch: Int, created: Int)
 
 /**
+ * A request to turn one bond unit into shares: ZC_Standard_FractionalMint, or a market's
+ * ZC_Standard_DutchAuctionMint (`dutch`). R8 is (N, pull fee, mint fee), then for a Dutch request the
+ * auction's (opening bps, floor bps, length).
+ */
+case class StdShareRequest(box: InputUTXO, dutch: Option[Market], ownerHash: Array[Byte], terms: Seq[Long],
+                           metadata: Seq[Array[Byte]]) {
+  def bondAsset: ErgoId = box.tokens.head.id
+  def shares: Long = terms(0)
+  def pullFee: Long = terms(1)
+  def mintFee: Long = terms(2)
+  def auction: Seq[Long] = terms.drop(3)
+  def shareId: ErgoId = box.id
+}
+
+/**
+ * A share vault: ZC_Standard_FractionalVault or ZC_Standard_DutchAuctionVault. It holds the share's
+ * N+1 reserve, then the bond unit until the pull, then the settlement's proceeds. For a Dutch vault,
+ * `auction` is (repayment, opening bps, floor bps, length, start height) and `state` is 0 repaid, 1 auction
+ * open, 2 sold or nothing to sell, 3 paid in kind (meaningful only after the pull).
+ */
+case class StdShareVault(box: InputUTXO, dutch: Boolean, bondAsset: ErgoId, n: Long, outstanding: Long,
+                         pullFee: Long, state: Option[Byte], auction: Seq[Long], currency: Option[Array[Byte]]) {
+  def shareId: ErgoId = box.tokens.head.id
+  def assets: Seq[Token] = box.tokens.drop(1)
+  def holding: Boolean = assets.exists(_.id == bondAsset)
+  def auctionOpen: Boolean = dutch && !holding && state.contains(1.toByte)
+  def currencyToken: Option[ErgoId] = currency.filter(_.length == 32).map(new ErgoId(_))
+}
+
+/** An ask: a ZC_Standard_SaleOrder, or a ZC_Standard_NavAsk (`nav`) priced by its R6 expression. */
+case class StdAsk(box: InputUTXO, market: Market, nav: Boolean, sellerHash: Array[Byte], terms: Seq[Long],
+                  pricingHash: Option[Array[Byte]], navAsset: Option[ErgoId]) {
+  def token: Token = box.tokens.head
+  def numerator: Long = terms(0)
+  def denominator: Long = terms(1)
+  def minFill: Long = terms(2)
+  def expiry: Long = terms(3)
+  def margin: Long = if (nav) terms(4) else 0L
+  def wholeUnits: Long = if (nav) terms(5) else 1L
+  /** The fixed price (a sale order's price, a NAV ask's floor) of `units` raw units. */
+  def fixedPrice(units: Long): BigInt = (BigInt(units) * numerator + denominator - 1) / denominator
+}
+
+/**
+ * A lend offer. R5 terms: 0 yield bps, 1 min and 2 max blocks to maturity, 3 batcher fee, 4 new-bond fee
+ * reserve, 5 collateral floor bps, 6 expiry, 7 minimum price, 8 oracle age, 9 min auction floor, 10 max
+ * auction length. R7, R8, R9: a fractional delivery's terms, metadata and mint script hash, or empty.
+ */
+case class StdOffer(box: InputUTXO, market: Market, ownerHash: Array[Byte], terms: Seq[Long],
+                    policyHash: Array[Byte], fractional: Seq[Long], metadata: Seq[Array[Byte]], mintHash: Array[Byte]) {
+  def yieldBps: Long = terms(0)
+  def batcherFee: Long = terms(3)
+  def feeReserve: Long = terms(4)
+  def floorBps: Long = terms(5)
+  def expiry: Long = terms(6)
+  def minPrice: Long = terms(7)
+  def maxAge: Long = terms(8)
+  /** Capital in the market's unit: the box's nanoERG, or its repayment token. */
+  def capital: Long = market.token.fold(box.value)(id => box.tokens.filter(_.id == id).map(_.amount).sum)
+  def delivers: Boolean = fractional.nonEmpty
+}
+
+/**
  * The ZC Standard as a client sees it, over the pinned trees: which boxes are orders, bonds and settlements,
  * and their terms. Recognizing a box's script and shape does not prove its asset genuine; see `originOf` in
  * the app for that.
@@ -126,6 +189,61 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
       bondId <- bytesReg(box, 4) if bondId.length == 32
       path <- byteReg(box, 5) if path == 0.toByte || path == 1.toByte
     } yield StdSettlement(box, box.tokens.head.id, bondId, path == 1.toByte)
+
+  val askTemplateHash: Array[Byte] = templateHash(market(Market.Erg).saleOrder.ergoTree)
+  val navAskTemplateHash: Array[Byte] = templateHash(market(Market.Erg).navAsk.ergoTree)
+  val offerTemplateHash: Array[Byte] = templateHash(market(Market.Erg).offer.ergoTree)
+  val dutchMintTemplateHash: Array[Byte] = templateHash(market(Market.Erg).dutchMint.ergoTree)
+
+  def asShareRequest(box: InputUTXO): Option[StdShareRequest] = {
+    val tree = box.input.getErgoTree
+    val dutch = marketWhere(tree, _.dutchMint)
+    for {
+      _ <- if (dutch.isDefined || sameTree(tree, contracts.fractionalMint.ergoTree)) Some(()) else None
+      if box.tokens.size == 1 && box.tokens.head.amount == 1L
+      owner <- bytesReg(box, 7) if owner.length == 32
+      terms <- longsReg(box, 8) if terms.length == (if (dutch.isDefined) 6 else 3)
+      metadata <- bytesListReg(box, 9) if metadata.size == 3
+    } yield StdShareRequest(box, dutch, owner, terms.toSeq, metadata)
+  }
+
+  def asShareVault(box: InputUTXO): Option[StdShareVault] = {
+    val tree = box.input.getErgoTree
+    val dutch = sameTree(tree, contracts.dutchVault.ergoTree)
+    for {
+      _ <- if (dutch || sameTree(tree, contracts.fractionalVault.ergoTree)) Some(()) else None
+      if box.tokens.nonEmpty
+      asset <- bytesReg(box, 4) if asset.length == 32
+      supply <- longsReg(box, 5) if supply.length == 3 && box.tokens.head.amount == supply(0) + 1L
+      auction <- if (dutch) longsReg(box, 7).filter(_.length == 5).map(_.toSeq) else Some(Seq.empty[Long])
+      currency <- if (dutch) bytesReg(box, 8).map(Some(_)) else Some(None)
+    } yield StdShareVault(box, dutch, new ErgoId(asset), supply(0), supply(1), supply(2), byteReg(box, 6), auction, currency)
+  }
+
+  def asAsk(box: InputUTXO): Option[StdAsk] = {
+    val tree = box.input.getErgoTree
+    val sale = marketWhere(tree, _.saleOrder)
+    val nav = marketWhere(tree, _.navAsk)
+    for {
+      m <- sale.orElse(nav)
+      if box.tokens.size == 1
+      seller <- bytesReg(box, 4) if seller.length == 32
+      terms <- longsReg(box, 5) if (if (nav.isDefined) terms.length >= 6 && terms.length <= 64 else terms.length == 4)
+      if terms(0) > 0L && terms(1) > 0L
+      pricing <- if (nav.isDefined) bytesReg(box, 6).map(Some(_)) else Some(None)
+      asset <- if (nav.isDefined) bytesReg(box, 7).filter(_.length == 32).map(a => Some(new ErgoId(a))) else Some(None)
+    } yield StdAsk(box, m, nav.isDefined, seller, terms.toSeq, pricing, asset)
+  }
+
+  def asOffer(box: InputUTXO): Option[StdOffer] = for {
+    m <- marketWhere(box.input.getErgoTree, _.offer)
+    owner <- bytesReg(box, 4) if owner.length == 32
+    terms <- longsReg(box, 5) if terms.length == 11
+    policy <- bytesReg(box, 6)
+    fractional <- longsReg(box, 7)
+    metadata <- bytesListReg(box, 8)
+    mint <- bytesReg(box, 9)
+  } yield StdOffer(box, m, owner, terms.toSeq, policy, fractional.toSeq, metadata, mint)
 
   /** A short name for a script this client knows, for transaction summaries. */
   def nameOf(tree: ErgoTree): Option[String] =

@@ -8,9 +8,10 @@ a lend offer that buys them on a yield target.
 
 Status: the set is **not deployed**. Every contract has offline specs (see [TESTING.md](./TESTING.md)),
 and its compiled trees are pinned in [docs/ZC_STANDARD_REFERENCE.md](./docs/ZC_STANDARD_REFERENCE.md).
-The CLI builds the core lifecycle from those pinned trees: orders, fills, repayment (also from
-collateral), recollateralization, liquidation, expiry refunds and claims. The exchange, fractional
-shares and the Dutch auction have no off-chain code yet. The CLI's `--old` commands still serve the
+The CLI builds every contract from those pinned trees: the bond lifecycle (orders, fills, repayment
+also from collateral, recollateralization, liquidation, expiry refunds, claims), fractional and Dutch
+auction shares, both asks and the lend offer, and a `batch` scan that lists, and with `--run` performs,
+every mint, pull, refund, liquidation and offer match that pays its runner. The CLI's `--old` commands still serve the
 first-generation contracts in `contracts/old/`, described in [docs/SIGMABONDS_OLD.md](./docs/SIGMABONDS_OLD.md).
 
 Each contract's header comment is its authoritative schema: registers, context variables and every

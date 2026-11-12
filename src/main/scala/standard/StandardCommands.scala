@@ -15,7 +15,11 @@ object StandardCommands {
   val DefaultExpiryFee = "0.005"
   val DefaultOracleAge = 60L
 
-  def dispatch(app: StandardApp, node: NodeApi, a: Args, hasApiKey: Boolean): Unit = a.command.get match {
+  /** `run` executes a follow-up command line in the same session (used by `batch --run`). */
+  def dispatch(app: StandardApp, node: NodeApi, a: Args, hasApiKey: Boolean,
+               run: String => Boolean = _ => false): Unit = a.command.get match {
+    case c if ExchangeCommands.Commands.contains(c) => ExchangeCommands.dispatch(app, a, run)
+
     case "info" => info(app, node, hasApiKey)
     case "orders" => listOrders(app, node, a.flag("mine"))
     case "bonds" => listBonds(app, node, a.flag("mine"), a.flag("liquidatable"))

@@ -37,7 +37,7 @@ shared with c-bonds; anything in this file or the repository takes precedence ov
 | `src/test/scala/specs/<product>/` | one `<Product>SpecBase` plus one suite per contract |
 | `src/test/scala/specs/bonds/` | `BondSpecBase`; suites for the first-generation bonds, orders, `MaturityLiquidation`, `BondAssetVault`, template verification and collateral conversion |
 | `src/test/scala/specs/bonds/ZcStandard*` | `ZcStandardSpecBase`, which views `StandardContracts.compile` per market (`scripts`, `exchange`, `marketOf`) and builds an order-to-bond `Flow`; suites for the bond, order and vault, the fractional pair, the asks, the lend offer and the Dutch auction pair; `ZcStandardProbeSpec` and `ZcStandardReference` for the pins |
-| `src/test/scala/specs/app/` | `SigmaFiAppSpec` (first generation) and `StandardAppSpec` (ZC Standard): the CLI's apps end to end, over `FakeNode`, an in-memory chain served as the node's index and wallet JSON; `SigmaFiCliSpec` for argument and shell-line parsing |
+| `src/test/scala/specs/app/` | `SigmaFiAppSpec` (first generation), and `StandardAppSpec` (bond lifecycle) and `StandardExchangeAppSpec` (shares, asks, lend offers, the batch scan) for the ZC Standard: the CLI's apps end to end, over `FakeNode`, an in-memory chain served as the node's index and wallet JSON. `StandardSpecSupport` holds the standard specs' world and seeding helpers. `SigmaFiCliSpec` covers argument and shell-line parsing |
 
 The mutations package keeps its Lithos name rather than the `org.lithosprotocol.sigmafi` prefix so
 it can be re-synced with Lithos and c-bonds by copying. `BoxLoader`, `UTXOSelector` and

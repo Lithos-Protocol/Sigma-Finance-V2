@@ -33,6 +33,9 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
   /** The last block's height. A transaction built now lands at a later one. */
   def height: Int = ctx.getHeight
 
+  /** The node, for code mixed into a subclass. */
+  protected def nodeApi: NodeApi = node
+
   def networkType: NetworkType = ctx.getNetworkType
 
   /** A short name for a script this app knows, for transaction summaries. */

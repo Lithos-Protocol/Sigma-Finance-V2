@@ -7,8 +7,9 @@ Sigma Finance V2 is an open standard for decentralized P2P contracts on Ergo.
 [SigmaBonds.MD](./SigmaBonds.MD) describes the ZC Standard: P2P zero-coupon bonds on any collateral,
 with a tradeable bond asset, pluggable liquidation, fractional shares, a Dutch auction for liquidated
 collateral, and an exchange where a lender's yield bid buys new and existing bonds. It is not
-deployed. Every contract has offline specs, and the CLI below builds its core lifecycle; the exchange,
-fractional shares and the Dutch auction have no off-chain code yet.
+deployed. Every contract has offline specs, and the CLI below builds all of it: the bond lifecycle,
+fractional and Dutch auction shares, asks and lend offers, plus a batch scan for the work that pays
+whoever runs it.
 
 | Folder (`contracts/bonds/`) | Contracts (`ZC_Standard_*`) |
 |---|---|
@@ -70,6 +71,18 @@ sbt "runMain ksingh.sigmabonds.app.SigmaFiCli help"
 - Lender: `fill-order [--fee-reserve <ERG>]` (CLI minimum and default 0.05 ERG), `claim`
 - Anyone: `liquidate`, which keeps the bonds' fee reserves, and `refund-order`, which returns an expired
   order to its borrower for its expiry fee
+- Shares: `shares`, `fractionalize` (fractional, or `--dutch` with an auction of a liquidated bond's
+  collateral), `mint-shares` and `pull` (anyone, for the fees the owner committed), `buy-lot` (anyone,
+  at an open auction's current price), `claim-shares`, `cancel-share-request`
+- Asks: `asks`, `sell` (a fixed `--price`, or `--nav` at a bond's accrued value plus a margin), `buy`,
+  `cancel-ask`, `refund-ask`
+- Lend offers: `offers`, `create-offer` (a yearly yield, a maturity window, a collateral floor, and
+  optionally delivery into fractional or Dutch shares), `cancel-offer`, `refund-offer`, and
+  `match-offer --order | --ask`, which anyone runs for the offer's batcher fee. An offer's policy buys
+  only bonds with the oracle liquidation rule, since it measures their collateral at the oracle price.
+- `batch` lists every mint, pull, expiry refund, liquidation and offer match that pays its runner more
+  than the miner fee, with the command for each; `batch --run` builds them all, skipping any that would
+  spend a box an earlier one spent, and submits them with `--send`
 
 `create-order` writes an R8 hint that no contract reads: the borrower's ErgoTree, whose hash is an
 order term, so any lender can pay the principal without asking for it. A fill mints three bond-asset

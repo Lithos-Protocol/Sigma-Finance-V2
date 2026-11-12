@@ -76,6 +76,44 @@ object SigmaFiCli {
       |  liquidate <bond box id> [...]       keeps each bond's fee reserve
       |  refund-order <order box id>        return an expired order to its borrower; keeps its expiry fee
       |
+      |  Shares (fractional, or with a Dutch auction of a liquidated bond's collateral):
+      |  shares [--mine]                    share requests and vaults, with any open auction's price
+      |  fractionalize <bond asset id> --shares <N> [--share-name <s>] [--share-description <s>]
+      |               [--decimals <d>] [--pull-fee <ERG>] [--mint-fee <ERG>]
+      |               [--dutch --auction-opening <percent> --auction-floor <percent> --auction-length <blocks>]
+      |      deposits a bond unit you hold; any batcher mints the shares to you. Fees default to 0.005 ERG.
+      |  mint-shares <request box id>       anyone: mint a request's shares; keeps the mint fee
+      |  cancel-share-request <request box id>
+      |  pull <share vault box id>          anyone: pull a settled bond into its share vault; keeps the pull fee
+      |  buy-lot <Dutch vault box id>       anyone: buy an open auction's lot at its current price
+      |  claim-shares <share id> [--amount <n>]   all outstanding shares make a final claim
+      |
+      |  Asks (sell any token, paid in a market's asset):
+      |  asks [--mine]
+      |  sell <token id> --amount <n> [--market ERG|SigUSD] (--price <total> | --nav [--margin <percent>]
+      |               [--price <floor total>]) [--min-fill <n>] [--expires-in <blocks>] [--refund-fee <ERG>]
+      |      --nav prices a bond unit or its shares at the bond's accrued value plus --margin (may be negative)
+      |  buy <ask box id> [--amount <n>]
+      |  cancel-ask <ask box id>
+      |  refund-ask <ask box id>            anyone, after expiry; keeps the refund fee
+      |
+      |  Lend offers (a yield bid that batchers fill from orders and asks):
+      |  offers [--mine]
+      |  create-offer --capital <amount> --yield <percent a year> --collateral-floor <percent>
+      |               [--market ERG|SigUSD] [--min-blocks <n>] [--max-blocks <n>] [--min-price <amount>]
+      |               [--batcher-fee <ERG>] [--fee-reserve <ERG>] [--oracle-age <blocks>] [--expires-in <blocks>]
+      |               [--fees <ERG>] [--min-auction-floor <percent> --max-auction-length <blocks>]
+      |               [--deliver-shares <N> [share and --dutch options as for fractionalize]]
+      |      Buys only bonds with the oracle liquidation rule: its policy measures their collateral. --fees is the
+      |      ERG a SigUSD offer carries for fees and box minimums (default 0.5).
+      |  cancel-offer <offer box id>
+      |  refund-offer <offer box id>        anyone, after expiry; keeps the batcher fee
+      |  match-offer <offer box id> (--order <order box id> | --ask <ask box id> [--amount <n>])
+      |      anyone: fill an order or buy from an ask with the offer; keeps the batcher fee
+      |
+      |  batch [--run]                      list every mint, pull, refund, liquidation and offer match that pays
+      |                                     whoever runs it; --run builds each (and submits each with --send)
+      |
       |First generation (add --old to a command): info, orders, bonds, claims, fill-order [--batching-fee
       |<ERG>], claim, cancel-order, repay, liquidate. New orders use the ZC Standard only.
       |""".stripMargin
@@ -147,7 +185,11 @@ object SigmaFiCli {
             try OldCommands.dispatch(app, node, a, apiKey.isDefined) finally app.close()
           } else {
             val app = new StandardApp(ctx, node, settings, protocol = standard)
-            try StandardCommands.dispatch(app, node, a, apiKey.isDefined) finally app.close()
+            // A follow-up runs as its own command, with a fresh context, and keeps this one's node options and --send.
+            def followUp(line: String): Boolean =
+              Try(Args.parse(Args.tokenize(line) ++ (if (a.flag("send")) Seq("--send") else Seq.empty)).withDefaults(a))
+                .fold(e => { report(e); false }, execute)
+            try StandardCommands.dispatch(app, node, a, apiKey.isDefined, followUp) finally app.close()
           }
         }
         true
@@ -250,12 +292,17 @@ case class Args(command: Option[String], positional: Seq[String], options: Map[S
 }
 
 object Args {
-  val Flags: Set[String] = Set("send", "mine", "liquidatable", "help", "old", "from-collateral")
+  val Flags: Set[String] = Set("send", "mine", "liquidatable", "help", "old", "from-collateral", "dutch", "nav", "run")
   val SessionOptions: Set[String] = Set("node", "api-key", "wallet-pass", "address", "fee")
   val Options: Set[String] = SessionOptions ++ Set(
     "principal", "principal-token", "repayment", "collateral-erg", "collateral-token", "batching-fee",
     "liquidation", "maturity", "term", "duration",
-    "market", "ratio", "oracle-age", "expires-in", "expiry-fee", "fee-reserve", "add-erg", "add-token")
+    "market", "ratio", "oracle-age", "expires-in", "expiry-fee", "fee-reserve", "add-erg", "add-token",
+    "shares", "share-name", "share-description", "decimals", "pull-fee", "mint-fee",
+    "auction-opening", "auction-floor", "auction-length", "amount",
+    "price", "margin", "min-fill", "refund-fee",
+    "capital", "fees", "yield", "min-blocks", "max-blocks", "batcher-fee", "collateral-floor", "min-price",
+    "min-auction-floor", "max-auction-length", "deliver-shares", "order", "ask")
 
   /** Splits a shell line on whitespace, keeping "double" or 'single' quoted text together. */
   def tokenize(line: String): Seq[String] = {

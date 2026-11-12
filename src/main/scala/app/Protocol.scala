@@ -221,6 +221,11 @@ object Protocol {
   def longReg(box: InputUTXO, r: Int): Option[Long] =
     register(box, r).filter(_.tpe == SLong).map(_.value.asInstanceOf[Long])
 
+  /** A `Coll[Coll[Byte]]` register, such as share EIP-4 metadata. */
+  def bytesListReg(box: InputUTXO, r: Int): Option[Seq[Array[Byte]]] =
+    register(box, r).filter(_.tpe == SCollection(SByteArray))
+      .map(_.value.asInstanceOf[Coll[Coll[Byte]]].toArray.toSeq.map(_.toArray))
+
   /** A hint register: ErgoTrees the box's hashes commit to. Entries that do not parse are dropped. */
   def treesReg(box: InputUTXO, r: Int): Seq[ErgoTree] =
     register(box, r).filter(_.tpe == SCollection(SByteArray)).toSeq
@@ -240,6 +245,11 @@ object Protocol {
       Colls.fromArray(tokens.map(t => (Colls.fromArray(t.id.getBytes), t.amount)).toArray)(
         sigma.data.RType.pairRType(sigma.collRType(sigma.ByteType), sigma.LongType)),
       ErgoType.pairType(ErgoType.collType(scalaByteType), scalaLongType))
+
+  /** A `Coll[Coll[Byte]]` register of UTF-8 strings, such as share EIP-4 metadata. */
+  def textsValue(parts: String*): ErgoValue[_] =
+    ErgoValue.of(Colls.fromArray(parts.map(p => Colls.fromArray(p.getBytes("UTF-8"))).toArray)(sigma.collRType(sigma.ByteType)),
+      ErgoType.collType(scalaByteType))
 
   /** A hint register: `Coll[Coll[Byte]]`, each entry an ErgoTree's bytes. */
   def treesValue(trees: ErgoTree*): ErgoValue[_] =

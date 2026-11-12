@@ -33,7 +33,7 @@ case class StdLoan(market: Market, principal: Long, repayment: Long, collateralE
  */
 class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, out: String => Unit = println,
                   val protocol: StandardProtocol = new StandardProtocol())
-  extends AppBase(ctx, node, settings, out) {
+  extends AppBase(ctx, node, settings, out) with StandardShares with StandardAsks with StandardOffers with StandardBatch {
 
   import StandardProtocol._
 
@@ -189,7 +189,7 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
   }
 
   /** The fill's own checks, so a lender learns why before the node refuses. */
-  private def checkOrder(o: StdOrder): Unit = {
+  private[standard] def checkOrder(o: StdOrder): Unit = {
     val oneAsset = o.market.token match {
       case None => o.principalTokens.isEmpty && o.principalErg > 0L && o.ergFloor <= o.repayment
       case Some(id) => o.principalTokens.map(_.id) == Seq(id) && o.principalErg <= MinBox && o.ergFloor <= MinBox
@@ -342,16 +342,36 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
 
   // ═══ HELPERS ══════════════════════════════════════════════════════════════
 
-  private def liveBond(bondId: String): StdBond =
+  private[standard] def liveBond(bondId: String): StdBond =
     protocol.asBond(unspent(bondId)).getOrElse(fail(s"$bondId is not a live ZC Standard bond"))
 
   /** The order the bond came from carries the borrower's tree in R8, when a client like this one made it. */
-  private def originHints(bond: StdBond): Seq[ErgoTree] =
+  private[standard] def originHints(bond: StdBond): Seq[ErgoTree] =
     node.boxById(bond.asset.toString).flatMap(j => Try(NodeJson.box(j)).toOption).toSeq.flatMap(treesReg(_, 8))
 
-  private def borrowerTree(hash: Array[Byte], box: InputUTXO, hints: Seq[ErgoTree]): ErgoTree =
+  private[standard] def borrowerTree(hash: Array[Byte], box: InputUTXO, hints: Seq[ErgoTree]): ErgoTree =
     treeFor(hash, box, hints).getOrElse(fail("cannot find the borrower's ErgoTree: no hint, wallet address or box " +
       "in the transaction that created this box hashes to the borrower hash"))
+
+  /**
+   * The ErgoTree an owner or seller hash commits to. As `treeFor`, and when the box's creating transaction
+   * holds no such tree, back through the boxes it was made from: an earlier state of the same contract (an
+   * offer or ask continuation), or a box naming the same hash in R4 (the offer that delivered a mint
+   * request). The first state was funded from the owner's own address, so the walk ends there.
+   */
+  private[standard] def ownerTree(hash: Array[Byte], box: InputUTXO, who: String, depth: Int = 64): ErgoTree = {
+    def step(current: InputUTXO, left: Int): Option[ErgoTree] =
+      treeFor(hash, current, Seq.empty).orElse {
+        if (left <= 0) None
+        else node.transactionById(current.input.getTransactionId).flatMap { tx =>
+          tx.hcursor.downField("inputs").focus.flatMap(_.asArray).getOrElse(Vector.empty)
+            .flatMap(j => Try(NodeJson.box(j)).toOption)
+            .find(b => sameTree(b.input.getErgoTree, current.input.getErgoTree) || bytesReg(b, 4).exists(_.sameElements(hash)))
+            .flatMap(step(_, left - 1))
+        }
+      }
+    step(box, depth).getOrElse(fail(s"cannot find the $who's ErgoTree from this wallet or the box's history"))
+  }
 
   def describeRule(rule: LiquidationRule, payload: Seq[Long]): String = rule match {
     case AtMaturity(_) => "at maturity"

@@ -58,6 +58,19 @@ class SigmaFiCliSpec extends AnyPropSpec with Matchers {
     Args.parse(Seq("repay", "id", "--send")).withDefaults(launch).flag("send") shouldBe true
   }
 
+  property("the share, ask, offer and batch options parse, including a negative margin") {
+    val offer = Args.parse(Args.tokenize("create-offer --capital 10 --yield 5 --collateral-floor 130 " +
+      "--deliver-shares 100 --dutch --auction-opening 150 --auction-floor 90 --auction-length 500 --min-auction-floor 80 " +
+      "--max-auction-length 1000 --batcher-fee 0.005 --fees 0.5 --min-price 1 --min-blocks 10 --max-blocks 20"))
+    offer.flag("dutch") shouldBe true
+    offer.opt("auction-floor") shouldBe Some("90")
+    val ask = Args.parse(Args.tokenize("sell abc --amount 60 --nav --margin -2.5 --min-fill 5 --refund-fee 0.002"))
+    ask.flag("nav") shouldBe true
+    ask.opt("margin") shouldBe Some("-2.5")
+    Args.parse(Args.tokenize("match-offer o --ask a --amount 40")).opt("ask") shouldBe Some("a")
+    Args.parse(Args.tokenize("batch --run --send")).flags shouldBe Set("run", "send")
+  }
+
   property("--old marks a command for the first-generation contracts") {
     Args.parse(Seq("orders", "--old")).flag("old") shouldBe true
     Args.parse(Seq("orders")).flag("old") shouldBe false
