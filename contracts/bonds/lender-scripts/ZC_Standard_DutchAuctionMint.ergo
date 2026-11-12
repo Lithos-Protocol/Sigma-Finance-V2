@@ -53,8 +53,10 @@
     //   runtime, as for the origin check in ZC_Standard_LendOffer.
     // OUTPUTS(0): N shares at tokens(0), at the owner script. R4, R5, R6 = the three items of R9.
     // OUTPUTS(1): ZC_Standard_DutchAuctionVault with tokens ((share, N+1), (bond asset, 1)),
-    //   R4 = bond asset id, R5 = (N, N, pull fee),
+    //   R4 = bond asset id, R5 = (N, N, pull fee), R6 any value,
     //   R7 = (repayment, opening bps, floor bps, length, 0), R8 = CONST_REPAYMENT_TOKEN.
+    //   Registers are dense, so R6 must exist to carry R7 and R8. Nothing reads it until the pull
+    //   sets the vault's state, so this script leaves it free.
     //
     // CANCEL
     // Nothing is minted, and a co-spent box guarded by the owner script releases this box.

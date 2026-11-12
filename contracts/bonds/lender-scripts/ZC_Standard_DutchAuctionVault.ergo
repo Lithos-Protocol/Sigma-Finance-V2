@@ -18,7 +18,8 @@
     // REGISTERS
     // R4: Coll[Byte] - bond asset id
     // R5: Coll[Long] - (N, outstanding shares, pull fee), as in the standard vault
-    // R6: Byte - state, present only after the pull:
+    // R6: Byte - state, set by the pull. Registers are dense, so the mint already puts some R6 in
+    //   place to carry R7 and R8; no path reads it before the pull. After the pull:
     //   0 repaid; 1 auction open; 2 lot sold, nothing to sell, or the floor already held;
     //   3 paid out in kind
     // R7: Coll[Long] - (repayment, opening bps, floor bps, length in blocks, auction start height).

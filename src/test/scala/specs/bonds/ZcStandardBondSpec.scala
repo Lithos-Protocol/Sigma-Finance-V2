@@ -175,6 +175,49 @@ class ZcStandardBondSpec extends AnyPropSpec with ZcStandardSpecBase {
     }
   }
 
+  // ═══ ONE ASSET ════════════════════════════════════════════════════════════
+
+  property("one asset: an ERG order lends nanoERG alone, with a floor that never binds") {
+    withCtx { ctx =>
+      Seq(flow(ctx, ErgBond), flow(ctx, ErgBond, ergFloor = repaymentErg - 1L), flow(ctx, ErgBond, principalValue = 1L))
+        .foreach(f => accepts(f.holder, standardFillTx(f)))
+      Seq(
+        flow(ctx, ErgBond, ergFloor = repaymentErg + 1L),
+        flow(ctx, ErgBond, principalAssets = Seq(Token(SigUSD, 600L))),
+        flow(ctx, ErgBond, principalAssets = Seq(Token(stableToken, 1L))),
+        flow(ctx, ErgBond, principalValue = 0L)
+      ).foreach(f => rejectsAtSigning(f.holder, standardFillTx(f)))
+    }
+  }
+
+  property("one asset: a token order lends one repayment token, with at most a box minimum beside it") {
+    withCtx { ctx =>
+      Seq(flow(ctx, TokenBond), flow(ctx, TokenBond, principalValue = 0L), flow(ctx, TokenBond, ergFloor = 1L),
+        flow(ctx, TokenBond, principalAssets = Seq(Token(SigUSD, 1L))))
+        .foreach(f => accepts(f.holder, standardFillTx(f)))
+      // A principal token of amount 0 cannot be built into a box at all, so it is not listed here.
+      Seq(
+        flow(ctx, TokenBond, principalValue = minBox + 1L),
+        flow(ctx, TokenBond, ergFloor = minBox + 1L),
+        flow(ctx, TokenBond, principalAssets = Seq.empty[Token]),
+        flow(ctx, TokenBond, principalAssets = Seq(Token(stableToken, 600L))),
+        flow(ctx, TokenBond, principalAssets = Seq(Token(SigUSD, 600L), Token(stableToken, 1L))),
+        flow(ctx, TokenBond, principalAssets = Seq(Token(stableToken, 1L), Token(SigUSD, 600L)))
+      ).foreach(f => rejectsAtSigning(f.holder, standardFillTx(f)))
+    }
+  }
+
+  property("one asset: an order that breaks the rule can still be cancelled or refunded after expiry") {
+    withCtx { ctx =>
+      val f = flow(ctx, TokenBond, principalValue = 2L * Parameters.OneErg)
+      rejectsAtSigning(f.holder, standardFillTx(f))
+      accepts(f.owner, buildAt(ctx, f.height, Seq(f.orderIn, funding(ctx, f.owner, 1)),
+        Seq(UTXO(borrowerTree(ctx), f.order.value, f.order.tokens)), f.owner.getAddress))
+      accepts(executor(ctx), buildAt(ctx, f.expiry.toInt, Seq(inputAt(f.order, ctx, 0).withCtxVar(0.toByte, ErgoValue.of(0))),
+        Seq(tagged(borrowerTree(ctx), f.collateralValue, f.asset, f.collateral)), executor(ctx).getAddress))
+    }
+  }
+
   // ═══ REPAY AND CLAIM ══════════════════════════════════════════════════════
 
   for (kind <- Seq[Kind](ErgBond, TokenBond); style <- Seq[OrderStyle](FixedHeight, OnClose)) {

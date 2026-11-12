@@ -23,16 +23,61 @@ object ZcStandardSpecBase {
 
   private var cache: Option[Scripts] = None
 
+  private def compile(ctx: BlockchainContext, path: String, terms: Seq[(String, Any)]): Contract = {
+    val constants = terms.foldLeft(ConstantsBuilder.create()) {
+      case (builder, (key, value)) => builder.item(key, value)
+    }.build()
+    Contract.fromErgoContract(ctx.compileContract(constants, ScriptGenerator.mkScript(path)))
+  }
+
+  private def hash(c: Contract) = Colls.fromArray(c.hashedPropBytes)
+
+  /**
+   * The contracts compiled per repayment (or payment) asset beyond the bond and order: the lend offer,
+   * both asks, the two expressions they run, and the Dutch auction mint.
+   */
+  case class Market(offer: Contract, saleOrder: Contract, navAsk: Contract, pricing: Contract,
+                    policy: Contract, dutchMint: Contract)
+
+  case class Exchange(erg: Market, token: Market, dutchVault: Contract)
+
+  private var exchangeCache: Option[Exchange] = None
+
+  /** The P2P exchange, the Dutch auction pair and the policies, compiled once per JVM. */
+  def exchange(ctx: BlockchainContext): Exchange = synchronized {
+    exchangeCache.getOrElse {
+      val s = scripts(ctx)
+      val dutchVault = compile(ctx, "bonds/lender-scripts/ZC_Standard_DutchAuctionVault", Seq.empty)
+      def market(token: Array[Byte], order: Contract, bond: Contract, rule: Contract): Market = {
+        val asset = Colls.fromArray(token)
+        val dutchMint = compile(ctx, "bonds/lender-scripts/ZC_Standard_DutchAuctionMint",
+          Seq("CONST_DUTCH_VAULT_HASH" -> hash(dutchVault), "CONST_BOND_HASH" -> hash(bond),
+            "CONST_REPAYMENT_TOKEN" -> asset))
+        Market(
+          compile(ctx, "bonds/P2P/ZC_Standard_LendOffer",
+            Seq("CONST_REPAYMENT_TOKEN" -> asset, "CONST_ORDER_HASH" -> hash(order),
+              "CONST_BOND_HASH" -> hash(bond), "CONST_FRACTIONAL_MINT_HASH" -> hash(s.fractionalMint),
+              "CONST_DUTCH_MINT_HASH" -> hash(dutchMint))),
+          compile(ctx, "bonds/P2P/ZC_Standard_SaleOrder", Seq("CONST_PAYMENT_TOKEN" -> asset)),
+          compile(ctx, "bonds/P2P/ZC_Standard_NavAsk", Seq("CONST_PAYMENT_TOKEN" -> asset)),
+          compile(ctx, "bonds/policies/ZC_Standard_AccruedValue_Pricing",
+            Seq("CONST_REPAYMENT_TOKEN" -> asset, "CONST_BOND_HASH" -> hash(bond))),
+          compile(ctx, "bonds/policies/ZC_Standard_ERG_SigUSD_CollateralPolicy",
+            Seq("CONST_REPAYMENT_TOKEN" -> asset, "CONST_LIQUIDATION_HASH" -> Colls.fromArray(rule.hashedValueBytes))),
+          dutchMint)
+      }
+      val e = Exchange(market(Array.empty[Byte], s.ergOrder, s.ergBond, s.ergOracle),
+        market(SigUSD.getBytes, s.tokenOrder, s.tokenBond, s.tokenOracle), dutchVault)
+      exchangeCache = Some(e)
+      e
+    }
+  }
+
   /** Compiled once per JVM: the sigma compiler mutates shared AST nodes. */
   def scripts(ctx: BlockchainContext): Scripts = synchronized {
     cache.getOrElse {
-      def compile(path: String, terms: Seq[(String, Any)] = Seq.empty): Contract = {
-        val constants = terms.foldLeft(ConstantsBuilder.create()) {
-          case (builder, (key, value)) => builder.item(key, value)
-        }.build()
-        Contract.fromErgoContract(ctx.compileContract(constants, ScriptGenerator.mkScript(path)))
-      }
-      def hash(c: Contract) = Colls.fromArray(c.hashedPropBytes)
+      def compile(path: String, terms: Seq[(String, Any)] = Seq.empty): Contract =
+        ZcStandardSpecBase.compile(ctx, path, terms)
       val vault = compile("bonds/core/ZC_Standard_BondVault")
       def bond(token: Array[Byte]) = compile("bonds/core/ZC_Standard_Bond",
         Seq("CONST_VAULT_HASH" -> hash(vault), "CONST_REPAYMENT_TOKEN" -> Colls.fromArray(token)))
@@ -84,6 +129,18 @@ trait ZcStandardSpecBase extends BondSpecBase {
   protected def orderOf(ctx: BlockchainContext, kind: Kind): Contract =
     if (kind == ErgBond) scripts(ctx).ergOrder else scripts(ctx).tokenOrder
 
+  /** The offer, asks, expressions and Dutch mint compiled for this kind's repayment asset. */
+  protected def marketOf(ctx: BlockchainContext, kind: Kind): Market =
+    if (kind == ErgBond) exchange(ctx).erg else exchange(ctx).token
+
+  /** A `Coll[Coll[Byte]]` register of UTF-8 strings, such as share EIP-4 metadata; empty with no parts. */
+  protected def textsValue(parts: String*): ErgoValue[_] =
+    ErgoValue.of(Colls.fromArray(parts.map(p => Colls.fromArray(p.getBytes("UTF-8"))).toArray)(
+      sigma.collRType(sigma.ByteType)), ErgoType.collType(org.ergoplatform.appkit.scalaapi.scalaByteType))
+
+  /** The smallest x with x * den >= num, for positive den. */
+  protected def ceilDiv(num: BigInt, den: BigInt): Long = ((num + den - 1) / den).toLong
+
   /**
    * `fixedMaturity` overrides a fixed-height order's maturity. `extra` is the borrower payload from
    * index 7: the oracle rule reads its ratio and maximum age there.
@@ -94,7 +151,7 @@ trait ZcStandardSpecBase extends BondSpecBase {
                      duration: Long = 1000L, fixedMaturity: Long = -1L,
                      principalValue: Long = -1L, principalAssets: Seq[Token] = null,
                      repayment: Long = -1L, extra: Seq[Long] = Seq(15000L, 30L, 777L),
-                     liq: Contract = null): Flow = {
+                     liq: Contract = null, ergFloor: Long = -1L): Flow = {
     val s = scripts(ctx)
     val height = ctx.getHeight + 10
     val maturity =
@@ -105,7 +162,7 @@ trait ZcStandardSpecBase extends BondSpecBase {
     val principalTokens = if (principalAssets != null) principalAssets else
       if (kind == ErgBond) Seq.empty[Token] else Seq(Token(SigUSD, 600L))
     val repaymentAmount = if (repayment >= 0L) repayment else if (kind == ErgBond) repaymentErg else 700L
-    val floor = if (kind == ErgBond) repaymentAmount else minBox
+    val floor = if (ergFloor >= 0L) ergFloor else if (kind == ErgBond) repaymentAmount else minBox
     val expression = if (liq == null) s.maturity else liq
     val data = Seq(repaymentAmount, principalERG, floor,
       if (style == FixedHeight) maturity else duration, deadline, expiryFee,
