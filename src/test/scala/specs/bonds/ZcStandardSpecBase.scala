@@ -36,13 +36,16 @@ object ZcStandardSpecBase {
       val vault = compile("bonds/lender-scripts/ZC_Standard_BondVault")
       def bond(token: Array[Byte]) = compile("bonds/P2P/ZC_Standard_Bond",
         Seq("CONST_VAULT_HASH" -> hash(vault), "CONST_REPAYMENT_TOKEN" -> Colls.fromArray(token)))
-      def order(b: Contract) = compile("bonds/P2P/ZC_Standard_Order", Seq("CONST_BOND_HASH" -> hash(b)))
+      // The order compiles in the same repayment token as its bond, for the one-asset rule.
+      def order(b: Contract, token: Array[Byte]) = compile("bonds/P2P/ZC_Standard_Order",
+        Seq("CONST_BOND_HASH" -> hash(b), "CONST_REPAYMENT_TOKEN" -> Colls.fromArray(token)))
       val ergBond = bond(Array.empty[Byte])
       val tokenBond = bond(SigUSD.getBytes)
       val fractionalVault = compile("bonds/lender-scripts/ZC_Standard_FractionalVault")
       val fractionalMint = compile("bonds/lender-scripts/ZC_Standard_FractionalMint",
         Seq("CONST_FRACTIONAL_VAULT_HASH" -> hash(fractionalVault)))
-      val c = Scripts(vault, ergBond, tokenBond, order(ergBond), order(tokenBond), fractionalVault, fractionalMint,
+      val c = Scripts(vault, ergBond, tokenBond, order(ergBond, Array.empty[Byte]), order(tokenBond, SigUSD.getBytes),
+        fractionalVault, fractionalMint,
         compile("bonds/liquidations/ZC_Standard_MaturityLiquidation"),
         // The oracle rule measures the repayment, so it is compiled per repayment asset like the bond.
         compile("bonds/liquidations/ZC_Standard_ERG_SigUSD_Liquidation",

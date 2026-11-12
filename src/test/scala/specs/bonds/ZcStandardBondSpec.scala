@@ -352,10 +352,11 @@ class ZcStandardBondSpec extends AnyPropSpec with ZcStandardSpecBase {
 
   property("oracle: mixed ERG and SigUSD collateral is valued against the repayment at one price") {
     withCtx { ctx =>
-      val equal = oracleFlow(ctx, 4000000000L, Seq(Token(SigUSD, 400L)), 2000000000L, Seq(Token(SigUSD, 400L)))
+      // A token loan carries no more than a box minimum of nanoERG beside its one principal token.
+      val equal = oracleFlow(ctx, 4000000000L, Seq(Token(SigUSD, 400L)), 0L, Seq(Token(SigUSD, 400L)))
       rejectsAtSigning(executor(ctx), standardLiquidationTx(equal, oracleBond(equal),
         data = Seq(oracleBox(equal)), height = equal.height))
-      val under = oracleFlow(ctx, 4000000000L, Seq(Token(SigUSD, 399L)), 2000000000L, Seq(Token(SigUSD, 400L)))
+      val under = oracleFlow(ctx, 4000000000L, Seq(Token(SigUSD, 399L)), 0L, Seq(Token(SigUSD, 400L)))
       accepts(executor(ctx), standardLiquidationTx(under, oracleBond(under),
         data = Seq(oracleBox(under)), height = under.height))
       val ergLoan = oracleFlow(ctx, 2000000000L, Seq(Token(SigUSD, 799L)), 4000000000L, Seq.empty,

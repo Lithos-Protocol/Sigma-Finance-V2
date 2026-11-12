@@ -24,6 +24,10 @@
     //   3 requested maturity height or on-close duration; 4 order expiry height (historical);
     //   5 expiry fee (already refunded); 6 maturity mode; 7.. liquidation payload
     // R7: Coll[(Coll[Byte], Long)] - agreed principal tokens
+    // ZC_Standard_Order lends only in this bond's repayment asset, so for a bond it created the
+    // principal P is R6(1) for ERG (R7 empty) and R7(0)._2 for a token (R7 exactly that token),
+    // in the same unit as the repayment R6(0). R6(2) never binds for ERG and is at most 1000000
+    // for a token, so R6(0) is the whole repayment. This script does not re-check any of it.
     // R8: Coll[Byte] - blake2b256 of the serialized liquidation expression
     // R9: Coll[Long] - (lender liquidation fee reserve, start height, maturity height)
     // Value minus R9(0) is collateral nanoERG.

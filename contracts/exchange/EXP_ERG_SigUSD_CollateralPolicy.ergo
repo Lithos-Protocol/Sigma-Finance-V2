@@ -18,7 +18,8 @@
     //
     // INPUTS FROM THE OFFER
     // Offer R5(5): the lender's floor, a collateral ratio in basis points of the repayment (13000 = 130%).
-    // Offer R5(8): maximum oracle age in blocks (1..100000).
+    // Offer R5(8): maximum oracle age in blocks (1..100000). It is used twice: the oracle read here
+    //   must be this fresh, and the bond's own rule must accept an oracle at least this old.
     // The bond is the box the offer itself authenticated: the data input named by context var 3
     // when buying an existing bond or its shares, otherwise OUTPUTS(1) of a new-bond fill.
     //
@@ -28,6 +29,10 @@
     // 2. Ongoing cover: the bond's own liquidation ratio, borrower R6(7), is at least the lender's
     //    floor. The bond is then liquidated while its collateral is still worth the floor, and
     //    the borrower cannot set a ratio so low that it never fires before maturity.
+    //    The rule's oracle age, borrower R6(8), is the borrower's too. It must be at least the
+    //    lender's R5(8): any oracle the lender would buy on can then also liquidate. A smaller
+    //    age lets the rule fire only right after an oracle refresh. It must also be at most
+    //    100000, because above that the rule rejects and never fires before maturity.
     // 3. Cover now: collateral is worth at least the floor today.
     // A bond that is already below its own ratio but above the lender's floor passes: it can be
     // liquidated at once for collateral the lender has just accepted as enough.
@@ -60,7 +65,7 @@
         sigmaProp(false)
     } else {
         val ruleAgreed = bond.R8[Coll[Byte]].get == CONST_LIQUIDATION_HASH
-        val ongoingCover = borrower(7) >= floorBps
+        val ongoingCover = borrower(7) >= floorBps && borrower(8) >= maxAge && borrower(8) <= 100000L
 
         val pool = pools(0)
         val price = pool.R4[Long].get

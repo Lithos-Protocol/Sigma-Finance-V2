@@ -1,0 +1,109 @@
+{
+    // EXPERIMENTAL pricing expression for EXP_NavAsk. No specs and no off-chain code exist.
+    // Executed through the ask's context var 2 with the ASK as SELF. It prices a live standard bond,
+    // or shares of one, at its accrued value plus or minus the seller's margin. The ask pins this
+    // expression's hash in R6, so a seller chooses it and a batcher cannot swap it.
+    //
+    // NAV
+    // The accrued value of a live bond runs in a straight line from the principal P at the start
+    // height to the repayment R at maturity:
+    //   NAV = P + (R - P) * (HEIGHT - start) / (maturity - start)
+    // u of N shares are worth NAV * u / N. All four values are read from the bond itself.
+    //
+    // CONSTANTS
+    // CONST_REPAYMENT_TOKEN: Coll[Byte] - the bond's repayment asset, EMPTY for ERG. The ask must be
+    //   paid in this asset, so no oracle is needed. One compiled expression, and one hash, per asset.
+    // CONST_BOND_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Bond tree for that asset
+    //
+    // INPUTS FROM THE ASK
+    // Ask R5(4): the margin in basis points over NAV, signed: -200 sells 2% under NAV. -9999..1000000.
+    // Ask R5(5): N, the raw units of the token for sale that make up one bond: 1 for a bond unit,
+    //   the share count for fractional shares. 1..1000000000.
+    // Ask R7: the bond asset id X. For a bond unit it is the token for sale itself.
+    // Context var 3: Int data-input index of the bond's state box. Vars 0 and 1 are the ask's
+    //   payout and continuation indices, read exactly as the ask reads them.
+    //
+    // CHECKS
+    // State: the data input holds (X, 2) at tokens(0) under CONST_BOND_HASH. For a genuine X only
+    //   the live bond can: 2 of its 3 units stay together, and after settlement they sit under the
+    //   vault script. So a settled bond does not fill, and neither does one at or past maturity.
+    //   The unit then waits for the seller, who claims the vault or liquidates.
+    // Principal: ZC_Standard_Order lends only in the repayment asset, so P is bond R6(1) for an
+    //   ERG bond and the one principal token's amount, R7(0), for a token bond. Every live
+    //   standard bond can be priced; no loan is excluded.
+    // Price, with term = maturity - start and elapsed = HEIGHT - start, and with no division:
+    //   paid * N * term * 10000 >= sold * (P * (term - elapsed) + R * elapsed) * (10000 + margin)
+    //   Products are widened to BigInt before multiplying.
+    //
+    // WHY THERE IS NO ORIGIN CHECK
+    // The origin check protects a buyer from a fake token. A seller loses nothing by underpricing a
+    // fake, and for a genuine X nobody else can hold 2 units, so the state box cannot be forged
+    // against the seller. For shares the seller states X and N rather than proving them. A buyer
+    // verifies the token its own way, as EXP_LendOffer does.
+    //
+    // LIMITS
+    // - The lender fee reserve, and for shares the fractional vault's own nanoERG and pull fee, are
+    //   not counted. That errs against the seller; the margin can cover it.
+    // - A bond that can be liquidated right now is still priced at its accrued value.
+    // - The price rises each block while R is above P. A fill must pay for the height it lands at,
+    //   so a builder pays for a few blocks ahead.
+    // - A wrong X or N in the ask misprices it. The seller, or the seller's client, sets them.
+
+    val terms = SELF.R5[Coll[Long]].get
+    val payoutIndex = getVar[Int](0).get
+    val nextIndex = getVar[Int](1)
+    val stateIndex = getVar[Int](3).get
+
+    if (terms.size < 6 || SELF.tokens.size != 1 ||
+        payoutIndex < 0 || payoutIndex >= OUTPUTS.size ||
+        stateIndex < 0 || stateIndex >= CONTEXT.dataInputs.size) {
+        sigmaProp(false)
+    } else {
+        val margin = terms(4)
+        val wholeUnits = terms(5)
+        val asset = SELF.R7[Coll[Byte]].get
+        val state = CONTEXT.dataInputs(stateIndex)
+        val isBond =
+            blake2b256(state.propositionBytes) == CONST_BOND_HASH &&
+            state.tokens.size > 0 && state.tokens(0)._1 == asset && state.tokens(0)._2 == 2L
+
+        if (!isBond || margin <= -10000L || margin > 1000000L ||
+            wholeUnits < 1L || wholeUnits > 1000000000L) {
+            sigmaProp(false)
+        } else {
+            val borrower = state.R6[Coll[Long]].get
+            val lender = state.R9[Coll[Long]].get
+            val principalTokens = state.R7[Coll[(Coll[Byte], Long)]].get
+            val repaysERG = CONST_REPAYMENT_TOKEN.size == 0
+            val repayment = borrower(0)
+            // ZC_Standard_Order lends in the repayment asset alone, so P is in the same unit as R.
+            val principal = if (repaysERG) borrower(1) else principalTokens(0)._2
+            val start = lender(1)
+            val maturity = lender(2)
+            val term = maturity - start
+            val elapsed = HEIGHT.toLong - start
+
+            val payout = OUTPUTS(payoutIndex)
+            val paid = if (repaysERG) {
+                payout.value
+            } else if (payout.tokens.size > 0 && payout.tokens(0)._1 == CONST_REPAYMENT_TOKEN) {
+                payout.tokens(0)._2
+            } else 0L
+            val remaining = if (nextIndex.isDefined) OUTPUTS(nextIndex.get).tokens(0)._2 else 0L
+            val sold = SELF.tokens(0)._2 - remaining
+
+            if (repayment <= 0L || term <= 0L ||
+                elapsed < 0L || elapsed >= term || sold < 1L) {
+                sigmaProp(false)
+            } else {
+                // NAV * term: P * (term - elapsed) + R * elapsed, never negative.
+                val accrued = principal.toBigInt * (term - elapsed).toBigInt +
+                    repayment.toBigInt * elapsed.toBigInt
+                sigmaProp(
+                    paid.toBigInt * wholeUnits.toBigInt * term.toBigInt * 10000L.toBigInt >=
+                        sold.toBigInt * accrued * (10000L + margin).toBigInt
+                )
+            }
+        }
+    }
+}

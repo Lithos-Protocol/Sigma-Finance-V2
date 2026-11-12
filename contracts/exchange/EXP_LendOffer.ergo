@@ -1,63 +1,91 @@
 {
     // EXPERIMENTAL lend offer (a yield bid). No specs and no off-chain code exist.
     // Holds a lender's capital and buys standard bonds that clear a minimum simple-interest yield:
-    // new ones, by filling a ZC_Standard_Order, and existing ones, from an EXP_SaleOrder. The lender
-    // is never assumed to be online after posting: any batcher matches the offer, for the fee the
-    // offer itself sets, and the bond unit is delivered to the lender or into a fractional request.
+    // new ones, by filling a ZC_Standard_Order, and existing ones, from any ask that follows the ask
+    // convention below (EXP_SaleOrder, EXP_NavAsk, or a later one). The lender is never assumed to
+    // be online after posting: any batcher matches the offer, for the fee the offer itself sets,
+    // and the bond unit is delivered to the lender or into a fractional request.
     //
     // CONSTANTS (one offer address per repayment asset, under one shared template)
     // CONST_REPAYMENT_TOKEN: Coll[Byte] - the asset lent and repaid; EMPTY for ERG
     // CONST_ORDER_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Order tree for that asset
     // CONST_BOND_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Bond tree for that asset
-    // CONST_SALE_HASH: Coll[Byte] - blake2b256 of the EXP_SaleOrder tree paid in that asset
-    // CONST_FRACTIONAL_MINT_HASH: Coll[Byte] - blake2b256 of ZC_Standard_FractionalMint
+    // CONST_FRACTIONAL_MINT_HASH: Coll[Byte] - blake2b256 of ZC_Standard_FractionalMint. Used only to
+    //   verify shares being BOUGHT; where a delivery goes is the lender's choice in R9.
+    // CONST_DUTCH_MINT_HASH: Coll[Byte] - blake2b256 of EXP_DutchAuctionMint compiled for this
+    //   repayment asset and CONST_BOND_HASH. Also used only to verify shares being bought.
+    // No ask script is pinned: a new kind of ask needs no new offer.
     // The deployer must compile these consistently; the script cannot check one against another.
     //
     // CAPITAL
     // ERG offer: the box value, no tokens. Token offer: tokens(0) = (repayment token, amount), and
     // the box value pays fees and box minimums.
     //
-    // REGISTERS (all present; all copied unchanged to the continuation)
+    // REGISTERS (R4 to R9, all present; all copied unchanged to the continuation)
     // R4: Coll[Byte] - blake2b256 of the owner script: may cancel, receives the bond unit or shares
-    // R5: Coll[Long] - terms, exactly 9:
+    // R5: Coll[Long] - terms, exactly 11:
     //   0 minimum yield, basis points of simple interest per 262800 blocks (one year of 2-minute blocks)
     //   1 minimum and 2 maximum blocks left to maturity
-    //   3 batcher fee per fill, nanoERG
+    //   3 batcher fee per fill, and for the expiry refund, nanoERG
     //   4 lender liquidation fee reserve to put in a NEW bond, nanoERG, exact
     //   5 collateral floor in basis points of the repayment, and 8 maximum oracle age in blocks: read only
     //     by the collateral policy expression
-    //   6 expiry height; fills require HEIGHT < expiry
+    //   6 expiry height; fills require HEIGHT < expiry, and from then on anyone may refund
     //   7 minimum price of one fill, in raw units of the repayment asset
+    //   9 minimum auction floor, basis points of the repayment, and 10 maximum auction length,
+    //     blocks: the worst auction terms on EXP_DutchAuctionMint shares this offer will buy.
+    //     A maximum length of 0 buys none. Bond units and standard shares ignore both.
     // R6: Coll[Byte] - blake2b256 of the serialized collateral policy expression. The policy is the
     //   whole risk decision: it names the liquidation rule a bond must carry, requires that rule to
     //   fire at or above the lender's floor, and checks the collateral is worth the floor now.
-    // R7: Coll[Long] - fractional delivery (N, pull fee, mint fee); EMPTY delivers the bond unit itself
+    // R7: Coll[Long] - fractional delivery: (N, pull fee, mint fee), then whatever else the chosen
+    //   mint reads, 3..16 values in all; EMPTY delivers the bond unit itself
     // R8: Coll[Coll[Byte]] - share token EIP-4 (name, description, decimals); EMPTY when R7 is empty
+    // R9: Coll[Byte] - blake2b256 of the mint request script a fractional delivery goes into:
+    //   ZC_Standard_FractionalMint, EXP_DutchAuctionMint (R7 then carries its three auction terms),
+    //   or any script that keeps their request layout. The lender's own choice of where the unit
+    //   goes, so it is not pinned; a wrong hash strands the unit. EMPTY when R7 is empty.
     //
     // THE YIELD TEST
     // Paying price P now for repayment R at maturity, with D blocks left, must satisfy
     //   R * 10000 * 262800 >= P * (10000 * 262800 + yield * D).
-    // P is the principal of a new bond or the ask of a sale. For an ERG offer P includes the batcher
-    // fee, so the yield is net of it; a token offer pays that fee in nanoERG outside the test.
+    // P is the principal of a new bond or what the seller's payout holds. For an ERG offer P includes
+    // the batcher fee, so the yield is net of it; a token offer pays that fee in nanoERG outside the test.
     // The price ceiling rises towards R as maturity approaches, so one number follows the bond's
     // value with no updates. The yield is what the lender earns IF the bond is repaid; the collateral
     // policy covers the case where it is not.
     //
     // CONTEXT VARS
-    // 0 Int continuation index (always). 1 Coll[Byte] collateral policy expression (always).
-    // Buying from a sale order also needs: 2 Int sale order input index; 3 Int data-input index of
-    // the bond's state box; 4 Coll[Byte] the serialized order box that minted the bond asset;
-    // 5 Int delivery output index. The absence of var 2 selects a new-bond fill.
-    // Buying fractional shares adds: 6 Coll[Byte] the serialized ZC_Standard_FractionalMint request
-    // box that minted the shares.
+    // 0 Int continuation index, or the refund index after expiry (always). A fill also needs
+    // 1 Coll[Byte] the collateral policy expression.
+    // Buying from an ask also needs: 2 Int ask input index; 3 Int data-input index of the bond's
+    // state box; 4 Coll[Byte] the serialized order box that minted the bond asset; 5 Int delivery
+    // output index; 7 Int the seller's payout output index. The absence of var 2 selects a
+    // new-bond fill.
+    // Buying fractional shares adds: 6 Coll[Byte] the serialized mint request box that minted the
+    // shares, under ZC_Standard_FractionalMint or EXP_DutchAuctionMint.
+    //
+    // THE ASK CONVENTION (what this offer expects of the box at var 2, whatever its script)
+    // tokens(0) is the token for sale. R4: Coll[Byte] is blake2b256 of the seller script. A fill
+    // pays one payout box at the seller script with R4 = the ask's box id and R5: Long = the raw
+    // units it pays for, holding the payment: its nanoERG for an ERG price, its tokens(0) for a
+    // token price. The ask's own script must enforce that R5.
+    // The offer's price is whatever that payout holds: it never reads the ask's price. It requires
+    // the payout's R5 to equal the units delivered here. An ask that follows the convention then
+    // cannot have sold more units than the offer received, so the payment covers exactly them, and
+    // anything above the ask's own price reaches the seller, not the batcher.
+    // An ask that does NOT enforce R5 lets a batcher keep units the offer paid for, up to the
+    // offer's yield limit. That is the cost of pinning no ask script: the offer still never does
+    // worse than its terms, but it relies on asks keeping the convention for anything better.
     //
     // NEW BOND (var 2 absent)
     // INPUTS(0) is a ZC_Standard_Order with CONST_ORDER_HASH, whose own script validates the bond at
-    // OUTPUTS(1) and pays the borrower at OUTPUTS(2). OUTPUTS(0) is the delivery. The principal must
-    // be in the repayment asset alone (a token loan may carry at most 1000000 nanoERG beside it).
+    // OUTPUTS(1) and pays the borrower at OUTPUTS(2). OUTPUTS(0) is the delivery. That order only
+    // lends in the repayment asset alone (a token loan carries at most 1000000 nanoERG beside it),
+    // so the principal is the price with no further check.
     //
     // EXISTING BOND (var 2 present)
-    // The sale order holds exactly one unit of asset X and is paid its own stated price.
+    // The ask sells one unit of asset X and is paid through its payout.
     // Origin: var 4 hashes to X, so it is the box whose spending minted X, and its script is the
     //   standard order. That proves X was minted by the order's rules: supply 3, 2 locked.
     // State: the data input holds 2 units of X under CONST_BOND_HASH, so it is the live bond and its
@@ -65,31 +93,50 @@
     //
     // EXISTING SHARES (vars 2 and 6 present)
     // The same two checks, plus one more link in front of them. Var 6 hashes to the share id Y, so
-    // it is the request box whose spending minted Y, and its script is the standard fractional
-    // mint. That proves 2N+1 shares exist for exactly the bond unit X the request held, with N read
+    // it is the request box whose spending minted Y, and its script is one of the two pinned mints.
+    // That proves 2N+1 shares exist for exactly the bond unit X the request held, with N read
     // from its R8. X is then verified by var 4 and the state box exactly as for a whole bond.
+    // Dutch auction shares must also clear the lender's auction bounds, read from the same R8:
+    // floor R8(4) >= R5(9) and length R8(5) <= R5(10). That mint wrote those terms into the vault
+    // and measured them against this bond's own repayment. So if the bond is liquidated, the vault
+    // ends with at least floor/10000 of the repayment in the repayment asset, unless an auction
+    // runs its whole length (at most R5(10) blocks from the pull) with no buyer; holders then take
+    // the collateral in kind. While the bond is live the auction has not begun, and a Dutch share
+    // claims the same u/N as a standard one.
     // Buying u shares claims u/N of the repayment, so the yield test compares R * u with P * N.
-    // The sale order is paid its stated price for u shares and may continue with the rest. While
+    // The ask is paid for exactly the u shares delivered and may continue with the rest. While
     // the bond is live no share can have been redeemed, so all N are still outstanding.
     // Shares go straight to the owner script; R7 and R8 are not used.
     //
     // DELIVERY
     // Unit itself: a box at the owner script holding (X, 1) and at least 1000000 nanoERG.
-    // Fractional: a ZC_Standard_FractionalMint box holding (X, 1) with R7 = owner, R8 = this R7,
+    // Fractional: a box at the script named by R9 holding (X, 1) with R7 = owner, R8 = this R7,
     //   R9 = this R8, funded with 2000000 nanoERG plus both fees. Any batcher then mints the shares.
     //
     // WHAT MAY LEAVE THE BOX
     // The price, the batcher fee, the delivery funding, a new bond's fee reserve, and at most
     // 1000000 nanoERG of box minimum on a token offer. Everything else stays in the continuation.
-    // Only one input with this script is allowed per transaction, so one bond cannot be charged to
-    // two offers.
+    // Only one input with this script is allowed per fill, so one bond cannot be charged to two
+    // offers.
+    //
+    // EXPIRY REFUND (anyone, once HEIGHT >= R5(6))
+    // Var 0 names the refund: at the owner script, R4 = this box's id, every token of this box, and
+    // at least this value less the batcher fee R5(3). The tag lets an owner that is a contract,
+    // which cannot co-sign a cancel, recognise its own capital. Several offers may be refunded in
+    // one transaction, each to its own tagged output. A fee too small to pay a batcher leaves the
+    // box for the owner to cancel.
     //
     // LIMITS OF THIS DRAFT
     // - Best execution is not enforced. The offer never does worse than its terms, but a batcher
     //   chooses which ask it meets.
     // - Settled bonds cannot be bought, whole or as shares: only claims on a live bond.
+    // - Shares are bought only from the two pinned mints; another share mint needs a new offer.
+    // - Of a Dutch auction share's terms only the floor and the length are bounded. The opening
+    //   price and the speed of the fall decide how far above the floor a sale lands, not the floor.
     // - A share's value ignores the fractional vault's own nanoERG and its pull fee.
-    // - A continuation is always required; dust left in it is recovered by cancelling.
+    // - A fill always leaves a continuation; dust left in it comes back by cancelling or at expiry.
+    // - A purchase is judged at the payout's whole value. One priced below the minimum box value
+    //   in nanoERG is therefore judged at that minimum.
     // - Storage rent, serialization and maximum cost are unverified.
 
     val ownerHash = SELF.R4[Coll[Byte]].get
@@ -105,8 +152,19 @@
         val nextIndex = getVar[Int](0).get
         val offers = INPUTS.filter { (b: Box) => b.propositionBytes == SELF.propositionBytes }
 
-        if (terms.size != 9 || offers.size != 1 || (fractional.size != 0 && fractional.size != 3) ||
-            nextIndex < 0 || nextIndex >= OUTPUTS.size) {
+        if (terms.size != 11 || nextIndex < 0 || nextIndex >= OUTPUTS.size) {
+            sigmaProp(false)
+        } else if (HEIGHT.toLong >= terms(6)) {
+            // Expiry refund, by anyone: everything goes back to the owner, less the batcher fee.
+            val refund = OUTPUTS(nextIndex)
+            sigmaProp(
+                blake2b256(refund.propositionBytes) == ownerHash &&
+                refund.R4[Coll[Byte]].get == SELF.id &&
+                refund.tokens == SELF.tokens &&
+                refund.value >= SELF.value - terms(3)
+            )
+        } else if (offers.size != 1 ||
+            (fractional.size != 0 && (fractional.size < 3 || fractional.size > 16))) {
             sigmaProp(false)
         } else {
             val next = OUTPUTS(nextIndex)
@@ -127,49 +185,64 @@
             // Shares are bought only from a sale order, and only when their mint request is supplied.
             val requestBytes = getVar[Coll[Byte]](6)
             val buysShares = !primary && requestBytes.isDefined
+            // The mint request whose spending minted the shares. SELF stands in when none are bought.
+            val request = if (buysShares) Global.deserializeTo[Box](requestBytes.get) else SELF
             // The token delivered and how many raw units of it: 1 bond unit, or u shares.
             val traded = unit.tokens(0)._1
             val units = unit.tokens(0)._2
             // How many of those units make up the whole bond: 1, or the share count N.
-            val wholeUnits = if (buysShares) {
-                Global.deserializeTo[Box](requestBytes.get).R8[Coll[Long]].get(0)
-            } else 1L
+            val wholeUnits = if (buysShares) request.R8[Coll[Long]].get(0) else 1L
 
             // What the offer pays, in raw units of the repayment asset.
             val price = if (primary) {
                 if (lendsERG) borrower(1) else principalTokens(0)._2
             } else {
-                val ask = INPUTS(saleIndex.get).R5[Coll[Long]].get
-                ((units.toBigInt * ask(0).toBigInt + ask(1).toBigInt - 1L.toBigInt) / ask(1).toBigInt).toLong
+                // Whatever the seller's payout holds. The ask's own price is never read.
+                val payout = OUTPUTS(getVar[Int](7).get)
+                if (lendsERG) {
+                    payout.value
+                } else if (payout.tokens.size > 0 && payout.tokens(0)._1 == CONST_REPAYMENT_TOKEN) {
+                    payout.tokens(0)._2
+                } else 0L
             }
 
             val sourceValid = if (primary) {
+                // The order lends in the repayment asset alone, so its principal is the price.
                 val order = INPUTS(0)
-                val sameAsset = if (lendsERG) principalTokens.size == 0 else {
-                    principalTokens.size == 1 && principalTokens(0)._1 == CONST_REPAYMENT_TOKEN &&
-                    borrower(1) <= 1000000L
-                }
                 blake2b256(order.propositionBytes) == CONST_ORDER_HASH &&
                 asset == order.id && traded == asset && units == 1L &&
-                lender(0) == terms(4) &&
-                sameAsset
+                lender(0) == terms(4)
             } else {
                 val sale = INPUTS(saleIndex.get)
+                val payoutIndex = getVar[Int](7).get
+                val payout = OUTPUTS(payoutIndex)
                 val originBytes = getVar[Coll[Byte]](4).get
                 val origin = Global.deserializeTo[Box](originBytes)
                 val tokenValid = if (buysShares) {
                     // The request box hashes to the share id, so the shares were minted by its
                     // script: 2N+1 of them, for the one bond unit the request held.
-                    val request = Global.deserializeTo[Box](requestBytes.get)
-                    blake2b256(requestBytes.get) == traded &&
-                    blake2b256(request.propositionBytes) == CONST_FRACTIONAL_MINT_HASH &&
+                    val mint = blake2b256(request.propositionBytes)
+                    val mintTerms = request.R8[Coll[Long]].get
+                    // A Dutch auction share's worth after a liquidation rests on its auction terms,
+                    // so they must clear the lender's bounds. That mint only runs with exactly 6.
+                    val mintAccepted = mint == CONST_FRACTIONAL_MINT_HASH || (
+                        mint == CONST_DUTCH_MINT_HASH &&
+                        mintTerms(4) >= terms(9) && mintTerms(5) <= terms(10)
+                    )
+                    blake2b256(requestBytes.get) == traded && mintAccepted &&
                     request.tokens.size == 1 && request.tokens(0)._1 == asset &&
                     wholeUnits >= 1L && units >= 1L && units <= wholeUnits
                 } else {
                     traded == asset && units == 1L
                 }
-                blake2b256(sale.propositionBytes) == CONST_SALE_HASH &&
-                sale.tokens.size == 1 && sale.tokens(0)._1 == traded &&
+                // The ask convention. No ask script is pinned: the payout goes to the seller the
+                // ask names, is tagged with the ask, and pays for exactly the units delivered.
+                sale.id != SELF.id &&
+                sale.tokens.size > 0 && sale.tokens(0)._1 == traded &&
+                blake2b256(payout.propositionBytes) == sale.R4[Coll[Byte]].get &&
+                payout.R4[Coll[Byte]].get == sale.id &&
+                payout.R5[Long].get == units &&
+                payoutIndex != nextIndex && payoutIndex != getVar[Int](5).get &&
                 tokenValid &&
                 blake2b256(originBytes) == asset &&
                 blake2b256(origin.propositionBytes) == CONST_ORDER_HASH &&
@@ -180,8 +253,8 @@
             val remaining = lender(2) - HEIGHT.toLong
             val year = 2628000000L // 10000 basis points * 262800 blocks
             val cost = if (lendsERG) price + batcherFee else price
+            // Fills run only before the expiry, R5(6): from then on this box can only be refunded.
             val termsValid =
-                HEIGHT.toLong < terms(6) &&
                 terms(0) >= 0L && batcherFee >= 0L &&
                 remaining > 0L && remaining >= terms(1) && remaining <= terms(2) &&
                 price > 0L && price >= terms(7) &&
@@ -198,7 +271,7 @@
                 unit.value >= deliveryFunding && (
                     if (plain) blake2b256(unit.propositionBytes) == ownerHash
                     else {
-                        blake2b256(unit.propositionBytes) == CONST_FRACTIONAL_MINT_HASH &&
+                        blake2b256(unit.propositionBytes) == SELF.R9[Coll[Byte]].get &&
                         unit.R7[Coll[Byte]].get == ownerHash &&
                         unit.R8[Coll[Long]].get == fractional &&
                         unit.R9[Coll[Coll[Byte]]].get == SELF.R8[Coll[Coll[Byte]]].get
@@ -231,7 +304,8 @@
                 next.R5[Coll[Long]].get == terms &&
                 next.R6[Coll[Byte]].get == SELF.R6[Coll[Byte]].get &&
                 next.R7[Coll[Long]].get == fractional &&
-                next.R8[Coll[Coll[Byte]]].get == SELF.R8[Coll[Coll[Byte]]].get
+                next.R8[Coll[Coll[Byte]]].get == SELF.R8[Coll[Coll[Byte]]].get &&
+                next.R9[Coll[Byte]].get == SELF.R9[Coll[Byte]].get
 
             val policyAgreed = blake2b256(getVar[Coll[Byte]](1).get) == SELF.R6[Coll[Byte]].get
 

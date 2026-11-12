@@ -8,21 +8,35 @@
     // CONST_BOND_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Bond ErgoTree. The bond compiles
     //   in its repayment token, so this hash also fixes the repayment asset: orders split into one
     //   address per repayment asset, all sharing one template.
+    // CONST_REPAYMENT_TOKEN: Coll[Byte] - that bond's repayment token, EMPTY for ERG. The deployer
+    //   must compile it to match CONST_BOND_HASH; the script cannot read the bond's constant.
+    //
+    // ONE ASSET
+    // A standard loan is lent and repaid in one asset, the repayment asset. A fill requires:
+    //   ERG:   no principal tokens, principal R4(1) > 0, and floor R4(2) <= R4(0), so the floor
+    //          never binds and the repayment is exactly R4(0) nanoERG.
+    //   token: principal tokens exactly ((repayment token, P > 0)), and at most 1000000 nanoERG
+    //          in both R4(1) and R4(2): box minimums beside the token, never a second asset.
+    // So every standard bond has its principal P and repayment R in one unit, and anything that
+    // reads a bond (a lend offer, a pricing expression) can work out its rate, accrued value or
+    // NAV with no further check. Cross-asset loans and loans of several assets are not standard;
+    // they would need their own order and bond pair. Cancel and expiry ignore this rule.
     //
     // ORDER REGISTERS -> BOND REGISTERS (copied exactly; the lender cannot alter them)
     // R4: Coll[Long] -> bond R6: borrower values, length 7..64:
     //   0 repayment amount, in the repayment asset of the bond named by CONST_BOND_HASH
-    //   1 principal nanoERG
-    //   2 repayment ERG floor, excluding the lender-fee refund. For ERG repayment the bond requires
-    //     the larger of this floor and R4(0); for token repayment it is the nanoERG paid beside
-    //     the tokens.
+    //   1 principal: nanoERG for ERG; for a token loan the nanoERG beside the token, <= 1000000
+    //   2 repayment ERG floor, excluding the lender-fee refund. For ERG repayment it is at most
+    //     R4(0) and so never binds; for token repayment it is the nanoERG paid beside the
+    //     tokens, <= 1000000.
     //   3 maturity: an absolute height (mode 0) or a duration in blocks, at least 30 (mode 1)
     //   4 absolute order expiry height
     //   5 borrower-funded expiry batching fee, >= 2000000 nanoERG
     //   6 maturity mode: 0 fixed height, 1 on-close (start height + duration)
     //   7.. opaque borrower payload, interpreted only by the agreed liquidation expression.
     //     ZC_Standard_ERG_SigUSD_Liquidation reads 7: minimum ratio in basis points, 8: maximum oracle age.
-    // R5: Coll[(Coll[Byte], Long)] -> bond R7: exact principal tokens
+    // R5: Coll[(Coll[Byte], Long)] -> bond R7: exact principal tokens: empty for ERG, or exactly
+    //   one entry, the repayment token and the principal amount
     // R6: Coll[Byte] -> bond R5: blake2b256 of the borrower script
     // R7: Coll[Byte] -> bond R8: blake2b256 of the serialized liquidation expression
     // Bond R4 = this order's id. Bond R9: Coll[Long] = (lender liquidation fee reserve, start height,
@@ -60,8 +74,7 @@
     //
     // ASSUMPTIONS
     // The borrower inspects the liquidation expression; its hash is a commitment, not a proof of
-    // safety or liveness. Principal/repayment asset consistency is the borrower's responsibility.
-    // Anyone-can-spend borrower scripts let anyone cancel.
+    // safety or liveness. Anyone-can-spend borrower scripts let anyone cancel.
 
     def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
         OUTPUTS.fold(0L, { (a: Long, b: Box) =>
@@ -97,7 +110,20 @@
                 val principalTokens = SELF.R5[Coll[(Coll[Byte], Long)]].get
                 val decimals = fromBase16("30")
 
+                // Lent and repaid in one asset, the repayment asset: the principal is that asset
+                // alone, and the repayment needs nothing beside it but a box minimum. The empty
+                // collection is taken from the box so the compiler cannot fold the constant.
+                val noToken = SELF.id.slice(0, 0)
+                val singleAsset = if (CONST_REPAYMENT_TOKEN == noToken) {
+                    principalTokens.size == 0 && borrower(1) > 0L && borrower(2) <= borrower(0)
+                } else {
+                    principalTokens.size == 1 && principalTokens(0)._1 == CONST_REPAYMENT_TOKEN &&
+                    principalTokens(0)._2 > 0L &&
+                    borrower(1) <= 1000000L && borrower(2) <= 1000000L
+                }
+
                 val borrowerValid =
+                    singleAsset &&
                     borrower(0) > 0L && borrower(1) >= 0L && borrower(2) > 0L &&
                     (mode == 0L || mode == 1L) &&
                     expiryFee >= 2000000L && expiryFee <= SELF.value - 1000000L &&

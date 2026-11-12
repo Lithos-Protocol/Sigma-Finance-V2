@@ -1,0 +1,158 @@
+{
+    // EXPERIMENTAL Dutch auction fractionalization request. No specs and no off-chain code exist.
+    // A ZC_Standard_FractionalMint that also commits to an auction. It holds one circulating bond
+    // unit and turns it into N fungible shares backed by an EXP_DutchAuctionVault. If the bond is
+    // repaid, that vault behaves like the standard fractional vault. If the bond is liquidated, the
+    // vault sells the collateral it receives in a Dutch auction for the bond's repayment asset, so
+    // share holders are paid in one currency. The bond, its terms and its liquidation expression
+    // are untouched and never learn any of this.
+    // The owner is never assumed to be online after creating this box: any batcher runs the mint
+    // for the mint fee.
+    //
+    // CONSTANTS (one address per repayment asset, under one shared template)
+    // CONST_DUTCH_VAULT_HASH: Coll[Byte] - blake2b256 of EXP_DutchAuctionVault
+    // CONST_BOND_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Bond tree for the repayment asset
+    // CONST_REPAYMENT_TOKEN: Coll[Byte] - that asset, EMPTY for ERG. It becomes the auction currency.
+    // The deployer must compile the last two consistently; the script cannot check one against the other.
+    //
+    // TOKENS
+    // tokens(0): (bond asset, 1) - the only token allowed
+    //
+    // REGISTERS (the mint-request layout of ZC_Standard_FractionalMint, with a longer R8)
+    // R4-R6: free. When this box is an order's OUTPUTS(0) they hold the bond asset's EIP-4 data.
+    // R7: Coll[Byte] - blake2b256 of the owner script: receives the shares, may cancel
+    // R8: Coll[Long] - exactly 6:
+    //   0 N, the number of shares, 1 <= N <= 1000000000
+    //   1 pull batching fee, >= 2000000 nanoERG, moved into the vault
+    //   2 mint batching fee, >= 2000000 nanoERG, paid to whoever runs the mint
+    //   3 auction opening price and 4 auction floor price, in basis points of the bond's repayment
+    //     (15000 = 150%). 0 <= floor <= opening <= 1000000. Prices are relative so that a lend
+    //     offer can set them without knowing which bond it will buy.
+    //   5 auction length in blocks, 1..1000000. The vault's currency target falls in a straight
+    //     line from the opening to the floor over this many blocks and then stays at the floor.
+    //     See EXP_DutchAuctionVault: a floor of 0 never opens an auction.
+    // R9: Coll[Coll[Byte]] - the share token's EIP-4 (name, description, decimals), exactly 3 items
+    //
+    // VALUE
+    // As the standard mint: the vault gets at least 1000000 nanoERG plus the pull fee, the share
+    // output at least 1000000 nanoERG, and together at least SELF.value minus the mint fee.
+    //
+    // MINT (anyone)
+    // Context var 0: Int data-input index of the box holding (bond asset, 2): the bond's state box.
+    // Context var 1: Coll[Byte] the serialized bond box, only once the bond has settled.
+    // INPUTS(0) = SELF: the share id is this box's id. Exactly 2*N+1 shares are minted.
+    // The repayment the auction prices are measured against is the bond's R6(0), read from:
+    //   - the live bond: the data input itself, under CONST_BOND_HASH (var 1 absent);
+    //   - a settled bond: the box in var 1. It hashes to the data input's R4, and the bond script
+    //     sets that register to its own box id when it settles into ZC_Standard_BondVault. The
+    //     deserialized box must be under CONST_BOND_HASH and hold the same (bond asset, 2).
+    //   So a batcher can mint whether or not the bond settled while this request waited, and an
+    //   offline owner is never left with a request nobody can run. For a genuine bond asset only
+    //   the bond or its vault can hold 2 units, and the vault cannot be claimed while this box
+    //   holds the circulating unit. Global.deserializeTo[Box] on real box bytes is unverified at
+    //   runtime, as for the origin check in EXP_LendOffer.
+    // OUTPUTS(0): N shares at tokens(0), at the owner script. R4, R5, R6 = the three items of R9.
+    // OUTPUTS(1): EXP_DutchAuctionVault with tokens ((share, N+1), (bond asset, 1)),
+    //   R4 = bond asset id, R5 = (N, N, pull fee),
+    //   R7 = (repayment, opening bps, floor bps, length, 0), R8 = CONST_REPAYMENT_TOKEN.
+    //
+    // CANCEL
+    // Nothing is minted, and a co-spent box guarded by the owner script releases this box.
+    //
+    // VERIFYING A SHARE
+    // As for the standard mint: share id Y is genuine iff the box with id Y was spent under this
+    // exact script and constants. A buyer must ALSO read the auction terms in that box's R8: a
+    // low floor, or a short auction, can sell the collateral cheaply after a liquidation (a floor
+    // of 0 means no auction, and holders are paid in kind). This script
+    // does not check that the bond asset is genuine: the depositor answers for what they wrap.
+    // EXP_LendOffer does all of this before it buys: it pins this script's hash, verifies the bond
+    // asset, and requires the floor and the length to clear the lender's bounds in its R5(9), R5(10).
+
+    def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
+        OUTPUTS.fold(0L, { (a: Long, b: Box) =>
+            val count = b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                if (t._1 == tokenId) z + t._2 else z
+            })
+            a + count
+        })
+    }
+
+    val ownerHash = SELF.R7[Coll[Byte]].get
+    val minted = numTokenInOutputs(SELF.id)
+
+    if (minted > 0L) {
+        val terms = SELF.R8[Coll[Long]].get
+        val metadata = SELF.R9[Coll[Coll[Byte]]].get
+        val stateIndex = getVar[Int](0).get
+        if (terms.size != 6 || metadata.size != 3 || OUTPUTS.size < 2 || SELF.tokens.size != 1 ||
+            stateIndex < 0 || stateIndex >= CONTEXT.dataInputs.size) {
+            sigmaProp(false)
+        } else {
+            val shares = terms(0)
+            val pullFee = terms(1)
+            val mintFee = terms(2)
+            val openingBps = terms(3)
+            val floorBps = terms(4)
+            val length = terms(5)
+            val shareOut = OUTPUTS(0)
+            val vault = OUTPUTS(1)
+            val bondUnit = SELF.tokens(0)
+            val state = CONTEXT.dataInputs(stateIndex)
+            // Var 1, given only once the bond has settled: the serialized bond box. The data input
+            // is then its settlement, which names that box's id in R4.
+            val bondBytes = getVar[Coll[Byte]](1)
+            val bond = if (bondBytes.isDefined) Global.deserializeTo[Box](bondBytes.get) else state
+            val reserve = (bondUnit._1, 2L)
+
+            val termsValid =
+                shares >= 1L && shares <= 1000000000L &&
+                pullFee >= 2000000L && mintFee >= 2000000L &&
+                pullFee <= SELF.value && mintFee <= SELF.value - pullFee &&
+                floorBps >= 0L && floorBps <= openingBps && openingBps <= 1000000L &&
+                length >= 1L && length <= 1000000L
+
+            val mintValid =
+                SELF.id == INPUTS(0).id &&
+                minted == 2L * shares + 1L &&
+                bondUnit._2 == 1L
+
+            val bondFound =
+                state.tokens.size > 0 && state.tokens(0) == reserve &&
+                blake2b256(bond.propositionBytes) == CONST_BOND_HASH &&
+                bond.tokens.size > 0 && bond.tokens(0) == reserve &&
+                (!bondBytes.isDefined || blake2b256(bondBytes.get) == state.R4[Coll[Byte]].get)
+
+            if (!termsValid || !mintValid || !bondFound) {
+                sigmaProp(false)
+            } else {
+                val repayment = bond.R6[Coll[Long]].get(0)
+
+                val sharesPaid =
+                    blake2b256(shareOut.propositionBytes) == ownerHash &&
+                    shareOut.value >= 1000000L &&
+                    shareOut.tokens.size > 0 &&
+                    shareOut.tokens(0)._1 == SELF.id && shareOut.tokens(0)._2 == shares &&
+                    shareOut.R4[Coll[Byte]].get == metadata(0) &&
+                    shareOut.R5[Coll[Byte]].get == metadata(1) &&
+                    shareOut.R6[Coll[Byte]].get == metadata(2)
+
+                val vaultValid =
+                    blake2b256(vault.propositionBytes) == CONST_DUTCH_VAULT_HASH &&
+                    vault.value - pullFee >= 1000000L &&
+                    vault.value + shareOut.value >= SELF.value - mintFee &&
+                    vault.tokens == Coll((SELF.id, shares + 1L), bondUnit) &&
+                    vault.R4[Coll[Byte]].get == bondUnit._1 &&
+                    vault.R5[Coll[Long]].get == Coll(shares, shares, pullFee) &&
+                    vault.R7[Coll[Long]].get == Coll(repayment, openingBps, floorBps, length, 0L) &&
+                    vault.R8[Coll[Byte]].get == CONST_REPAYMENT_TOKEN
+
+                sigmaProp(repayment > 0L && sharesPaid && vaultValid)
+            }
+        }
+    } else {
+        val ownerAuth = INPUTS.exists { (b: Box) =>
+            b.id != SELF.id && blake2b256(b.propositionBytes) == ownerHash
+        }
+        sigmaProp(ownerAuth)
+    }
+}

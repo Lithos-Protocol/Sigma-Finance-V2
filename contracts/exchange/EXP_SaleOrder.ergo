@@ -17,21 +17,35 @@
     // R5: Coll[Long] - (price numerator, price denominator, minimum fill, expiry height)
     //   The price of u raw units is ceil(u * numerator / denominator) raw units of the payment
     //   asset, so shares can be priced below one payment unit each. A fill below the minimum is
-    //   allowed only when it takes everything that is left. Fills require HEIGHT < expiry.
+    //   allowed only when it takes everything that is left. Fills require HEIGHT < expiry; from
+    //   expiry on, anyone may refund.
     //
-    // FILL (anyone)
+    // VALUE
+    // At least the box minimum. nanoERG funded above 1000000 is the fee for an expiry refund; it
+    // survives partial fills, because a continuation keeps at least this value.
+    //
+    // FILL (anyone, before expiry)
     // Context var 0: Int payout index. Context var 1: Int continuation index, absent for a full take.
-    // Payout: at the seller script, R4 = SELF.id, holding at least the price. For a token price the
-    //   payment token is the payout's tokens(0), and the buyer funds the box's nanoERG.
+    // Payout (the ask convention, shared with EXP_NavAsk): at the seller script, R4 = SELF.id,
+    //   R5: Long = the raw units this payout pays for, holding at least the price. For a token
+    //   price the payment token is the payout's tokens(0), and the buyer funds the box's nanoERG.
     // Continuation: this script, R4 and R5 unchanged, value not lower, tokens(0) = what is left.
     //
+    // EXPIRY REFUND (anyone, once HEIGHT >= expiry)
+    // Context var 0: Int refund index. The refund is at the seller script with R4 = SELF.id and
+    // every token of this box, and keeps at least 1000000 nanoERG (all of the value, if this box
+    // holds less). The rest pays the batcher. The tag lets a seller that is a contract, which
+    // cannot co-sign a cancel, recognise its tokens. With no fee funded, the tokens wait for the
+    // seller to cancel.
+    //
     // CANCEL
-    // A co-spent box guarded by the seller script releases this box at any height. After expiry
-    // the tokens simply wait for the seller: no batcher refund path exists yet.
+    // A co-spent box guarded by the seller script releases this box at any height.
     //
     // ASSUMPTIONS
-    // - The price is the seller's limit and is public. A buying contract should read it here and
-    //   pay exactly this, so the gap between a bid and this ask is not left to the batcher.
+    // - The price is the seller's limit and is public. A buying contract does not read it: it
+    //   counts what the payout holds as its price. The payout states the units it pays for, so a
+    //   buyer that checks R5 against the units it receives cannot be charged for units that went
+    //   elsewhere, and anything above this ask's price reaches the seller, not the batcher.
     // - The batcher fee is the buyer's to set. This order pays none.
 
     val sellerHash = SELF.R4[Coll[Byte]].get
@@ -47,6 +61,16 @@
         val nextIndex = getVar[Int](1)
         if (terms.size != 4 || SELF.tokens.size != 1 || payoutIndex < 0 || payoutIndex >= OUTPUTS.size) {
             sigmaProp(false)
+        } else if (HEIGHT.toLong >= terms(3)) {
+            // Expiry refund, by anyone: the tokens go back to the seller. The batcher's fee is
+            // whatever nanoERG the seller funded above 1000000.
+            val refund = OUTPUTS(payoutIndex)
+            sigmaProp(
+                blake2b256(refund.propositionBytes) == sellerHash &&
+                refund.R4[Coll[Byte]].get == SELF.id &&
+                refund.tokens == SELF.tokens &&
+                (refund.value >= 1000000L || refund.value >= SELF.value)
+            )
         } else {
             val numerator = terms(0)
             val denominator = terms(1)
@@ -87,10 +111,10 @@
                 } else 0L
 
                 sigmaProp(
-                    HEIGHT.toLong < terms(3) &&
                     sold >= 1L && (sold >= minFill || remaining == 0L) &&
                     blake2b256(payout.propositionBytes) == sellerHash &&
                     payout.R4[Coll[Byte]].get == SELF.id &&
+                    payout.R5[Long].get == sold &&
                     paid.toBigInt >= price
                 )
             }
