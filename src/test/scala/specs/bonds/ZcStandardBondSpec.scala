@@ -15,7 +15,7 @@ class ZcStandardBondSpec extends AnyPropSpec with ZcStandardSpecBase {
     withCtx { ctx =>
       val s = scripts(ctx)
       Seq(s.vault, s.ergBond, s.tokenBond, s.ergOrder, s.tokenOrder, s.fractionalVault, s.fractionalMint,
-        s.maturity, s.oracle)
+        s.maturity, s.ergOracle, s.tokenOracle)
         .foreach(_.ergoTree.version shouldBe 3)
     }
   }
@@ -324,17 +324,17 @@ class ZcStandardBondSpec extends AnyPropSpec with ZcStandardSpecBase {
 
   private def oracleFlow(ctx: BlockchainContext, collateralValue: Long, collateral: Seq[Token] = Seq.empty,
                          principalValue: Long = 0L, principalAssets: Seq[Token] = Seq(Token(SigUSD, 800L)),
-                         kind: Kind = TokenBond, repayment: Long = 900L,
+                         kind: Kind = TokenBond, repayment: Long = 800L,
                          extra: Seq[Long] = Seq(15000L, 30L)): Flow =
     flow(ctx, kind, collateralValue = collateralValue, collateral = collateral,
       principalValue = principalValue, principalAssets = principalAssets, repayment = repayment,
-      extra = extra, liq = scripts(ctx).oracle)
+      extra = extra, liq = oracleRuleOf(ctx, kind))
 
   private def oracleBond(f: Flow): InputUTXO = liquidationInput(f, spendOutput(filled(f), 1))
 
   property("oracle: liquidates strictly below the borrower ratio, at any data-input position") {
     withCtx { ctx =>
-      // 800 raw SigUSD is $8; at 0.5 ERG per USD, 150% is exactly 6 ERG of collateral.
+      // The debt is the repayment: 800 raw SigUSD is $8; at 0.5 ERG per USD, 150% is exactly 6 ERG.
       val f = oracleFlow(ctx, 6000000000L - 1L)
       val bond = oracleBond(f)
       val oracle = oracleBox(f)
@@ -350,7 +350,7 @@ class ZcStandardBondSpec extends AnyPropSpec with ZcStandardSpecBase {
     }
   }
 
-  property("oracle: mixed ERG and SigUSD on both sides use one peg and one price") {
+  property("oracle: mixed ERG and SigUSD collateral is valued against the repayment at one price") {
     withCtx { ctx =>
       val equal = oracleFlow(ctx, 4000000000L, Seq(Token(SigUSD, 400L)), 2000000000L, Seq(Token(SigUSD, 400L)))
       rejectsAtSigning(executor(ctx), standardLiquidationTx(equal, oracleBond(equal),
@@ -359,7 +359,7 @@ class ZcStandardBondSpec extends AnyPropSpec with ZcStandardSpecBase {
       accepts(executor(ctx), standardLiquidationTx(under, oracleBond(under),
         data = Seq(oracleBox(under)), height = under.height))
       val ergLoan = oracleFlow(ctx, 2000000000L, Seq(Token(SigUSD, 799L)), 4000000000L, Seq.empty,
-        kind = ErgBond, repayment = 5000000000L)
+        kind = ErgBond, repayment = 4000000000L)
       accepts(executor(ctx), standardLiquidationTx(ergLoan, oracleBond(ergLoan),
         data = Seq(oracleBox(ergLoan)), height = ergLoan.height))
     }

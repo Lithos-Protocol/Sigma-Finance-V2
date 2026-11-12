@@ -1,0 +1,99 @@
+{
+    // EXPERIMENTAL sale order (an ask). No specs and no off-chain code exist.
+    // Sells one token for a fixed price per raw unit, with partial fills. It is generic: the token
+    // can be a bond unit, fractional shares, or anything else. Nothing here verifies what the token
+    // is: a buyer, or a buying contract such as EXP_LendOffer, does that.
+    //
+    // CONSTANTS
+    // CONST_PAYMENT_TOKEN: Coll[Byte] - the asset the seller is paid in; EMPTY for ERG. Each payment
+    //   asset therefore has its own address under one shared template. The token for sale is held
+    //   in the box, so an indexed node finds asks for it by token id.
+    //
+    // TOKENS
+    // tokens(0): (token for sale, amount remaining) - the only token allowed
+    //
+    // REGISTERS
+    // R4: Coll[Byte] - blake2b256 of the seller script: is paid, may cancel
+    // R5: Coll[Long] - (price numerator, price denominator, minimum fill, expiry height)
+    //   The price of u raw units is ceil(u * numerator / denominator) raw units of the payment
+    //   asset, so shares can be priced below one payment unit each. A fill below the minimum is
+    //   allowed only when it takes everything that is left. Fills require HEIGHT < expiry.
+    //
+    // FILL (anyone)
+    // Context var 0: Int payout index. Context var 1: Int continuation index, absent for a full take.
+    // Payout: at the seller script, R4 = SELF.id, holding at least the price. For a token price the
+    //   payment token is the payout's tokens(0), and the buyer funds the box's nanoERG.
+    // Continuation: this script, R4 and R5 unchanged, value not lower, tokens(0) = what is left.
+    //
+    // CANCEL
+    // A co-spent box guarded by the seller script releases this box at any height. After expiry
+    // the tokens simply wait for the seller: no batcher refund path exists yet.
+    //
+    // ASSUMPTIONS
+    // - The price is the seller's limit and is public. A buying contract should read it here and
+    //   pay exactly this, so the gap between a bid and this ask is not left to the batcher.
+    // - The batcher fee is the buyer's to set. This order pays none.
+
+    val sellerHash = SELF.R4[Coll[Byte]].get
+    val sellerAuth = INPUTS.exists { (b: Box) =>
+        b.id != SELF.id && blake2b256(b.propositionBytes) == sellerHash
+    }
+
+    if (sellerAuth) {
+        sigmaProp(true)
+    } else {
+        val terms = SELF.R5[Coll[Long]].get
+        val payoutIndex = getVar[Int](0).get
+        val nextIndex = getVar[Int](1)
+        if (terms.size != 4 || SELF.tokens.size != 1 || payoutIndex < 0 || payoutIndex >= OUTPUTS.size) {
+            sigmaProp(false)
+        } else {
+            val numerator = terms(0)
+            val denominator = terms(1)
+            val minFill = terms(2)
+            val have = SELF.tokens(0)._2
+            val payout = OUTPUTS(payoutIndex)
+
+            val continued = if (nextIndex.isDefined) {
+                val index = nextIndex.get
+                if (index < 0 || index >= OUTPUTS.size || index == payoutIndex) {
+                    false
+                } else {
+                    val next = OUTPUTS(index)
+                    next.propositionBytes == SELF.propositionBytes &&
+                    next.value >= SELF.value &&
+                    next.tokens.size == 1 &&
+                    next.tokens(0)._1 == SELF.tokens(0)._1 &&
+                    next.tokens(0)._2 >= 1L && next.tokens(0)._2 < have &&
+                    next.R4[Coll[Byte]].get == sellerHash &&
+                    next.R5[Coll[Long]].get == terms
+                }
+            } else true
+
+            if (!continued || numerator <= 0L || denominator <= 0L) {
+                sigmaProp(false)
+            } else {
+                val remaining = if (nextIndex.isDefined) OUTPUTS(nextIndex.get).tokens(0)._2 else 0L
+                val sold = have - remaining
+                val price = (sold.toBigInt * numerator.toBigInt + denominator.toBigInt - 1L.toBigInt) /
+                    denominator.toBigInt
+                // An empty collection taken from the box, not a literal: testing the constant alone
+                // is folded at compile time and would give each payment asset a different template.
+                val noToken = SELF.id.slice(0, 0)
+                val paid = if (CONST_PAYMENT_TOKEN == noToken) {
+                    payout.value
+                } else if (payout.tokens.size > 0 && payout.tokens(0)._1 == CONST_PAYMENT_TOKEN) {
+                    payout.tokens(0)._2
+                } else 0L
+
+                sigmaProp(
+                    HEIGHT.toLong < terms(3) &&
+                    sold >= 1L && (sold >= minFill || remaining == 0L) &&
+                    blake2b256(payout.propositionBytes) == sellerHash &&
+                    payout.R4[Coll[Byte]].get == SELF.id &&
+                    paid.toBigInt >= price
+                )
+            }
+        }
+    }
+}

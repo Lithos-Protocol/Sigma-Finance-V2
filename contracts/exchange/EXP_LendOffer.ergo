@@ -1,0 +1,244 @@
+{
+    // EXPERIMENTAL lend offer (a yield bid). No specs and no off-chain code exist.
+    // Holds a lender's capital and buys standard bonds that clear a minimum simple-interest yield:
+    // new ones, by filling a ZC_Standard_Order, and existing ones, from an EXP_SaleOrder. The lender
+    // is never assumed to be online after posting: any batcher matches the offer, for the fee the
+    // offer itself sets, and the bond unit is delivered to the lender or into a fractional request.
+    //
+    // CONSTANTS (one offer address per repayment asset, under one shared template)
+    // CONST_REPAYMENT_TOKEN: Coll[Byte] - the asset lent and repaid; EMPTY for ERG
+    // CONST_ORDER_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Order tree for that asset
+    // CONST_BOND_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Bond tree for that asset
+    // CONST_SALE_HASH: Coll[Byte] - blake2b256 of the EXP_SaleOrder tree paid in that asset
+    // CONST_FRACTIONAL_MINT_HASH: Coll[Byte] - blake2b256 of ZC_Standard_FractionalMint
+    // The deployer must compile these consistently; the script cannot check one against another.
+    //
+    // CAPITAL
+    // ERG offer: the box value, no tokens. Token offer: tokens(0) = (repayment token, amount), and
+    // the box value pays fees and box minimums.
+    //
+    // REGISTERS (all present; all copied unchanged to the continuation)
+    // R4: Coll[Byte] - blake2b256 of the owner script: may cancel, receives the bond unit or shares
+    // R5: Coll[Long] - terms, exactly 9:
+    //   0 minimum yield, basis points of simple interest per 262800 blocks (one year of 2-minute blocks)
+    //   1 minimum and 2 maximum blocks left to maturity
+    //   3 batcher fee per fill, nanoERG
+    //   4 lender liquidation fee reserve to put in a NEW bond, nanoERG, exact
+    //   5 collateral floor in basis points of the repayment, and 8 maximum oracle age in blocks: read only
+    //     by the collateral policy expression
+    //   6 expiry height; fills require HEIGHT < expiry
+    //   7 minimum price of one fill, in raw units of the repayment asset
+    // R6: Coll[Byte] - blake2b256 of the serialized collateral policy expression. The policy is the
+    //   whole risk decision: it names the liquidation rule a bond must carry, requires that rule to
+    //   fire at or above the lender's floor, and checks the collateral is worth the floor now.
+    // R7: Coll[Long] - fractional delivery (N, pull fee, mint fee); EMPTY delivers the bond unit itself
+    // R8: Coll[Coll[Byte]] - share token EIP-4 (name, description, decimals); EMPTY when R7 is empty
+    //
+    // THE YIELD TEST
+    // Paying price P now for repayment R at maturity, with D blocks left, must satisfy
+    //   R * 10000 * 262800 >= P * (10000 * 262800 + yield * D).
+    // P is the principal of a new bond or the ask of a sale. For an ERG offer P includes the batcher
+    // fee, so the yield is net of it; a token offer pays that fee in nanoERG outside the test.
+    // The price ceiling rises towards R as maturity approaches, so one number follows the bond's
+    // value with no updates. The yield is what the lender earns IF the bond is repaid; the collateral
+    // policy covers the case where it is not.
+    //
+    // CONTEXT VARS
+    // 0 Int continuation index (always). 1 Coll[Byte] collateral policy expression (always).
+    // Buying from a sale order also needs: 2 Int sale order input index; 3 Int data-input index of
+    // the bond's state box; 4 Coll[Byte] the serialized order box that minted the bond asset;
+    // 5 Int delivery output index. The absence of var 2 selects a new-bond fill.
+    // Buying fractional shares adds: 6 Coll[Byte] the serialized ZC_Standard_FractionalMint request
+    // box that minted the shares.
+    //
+    // NEW BOND (var 2 absent)
+    // INPUTS(0) is a ZC_Standard_Order with CONST_ORDER_HASH, whose own script validates the bond at
+    // OUTPUTS(1) and pays the borrower at OUTPUTS(2). OUTPUTS(0) is the delivery. The principal must
+    // be in the repayment asset alone (a token loan may carry at most 1000000 nanoERG beside it).
+    //
+    // EXISTING BOND (var 2 present)
+    // The sale order holds exactly one unit of asset X and is paid its own stated price.
+    // Origin: var 4 hashes to X, so it is the box whose spending minted X, and its script is the
+    //   standard order. That proves X was minted by the order's rules: supply 3, 2 locked.
+    // State: the data input holds 2 units of X under CONST_BOND_HASH, so it is the live bond and its
+    //   registers are the terms. A settled bond (the vault holds the 2 units) is not bought here.
+    //
+    // EXISTING SHARES (vars 2 and 6 present)
+    // The same two checks, plus one more link in front of them. Var 6 hashes to the share id Y, so
+    // it is the request box whose spending minted Y, and its script is the standard fractional
+    // mint. That proves 2N+1 shares exist for exactly the bond unit X the request held, with N read
+    // from its R8. X is then verified by var 4 and the state box exactly as for a whole bond.
+    // Buying u shares claims u/N of the repayment, so the yield test compares R * u with P * N.
+    // The sale order is paid its stated price for u shares and may continue with the rest. While
+    // the bond is live no share can have been redeemed, so all N are still outstanding.
+    // Shares go straight to the owner script; R7 and R8 are not used.
+    //
+    // DELIVERY
+    // Unit itself: a box at the owner script holding (X, 1) and at least 1000000 nanoERG.
+    // Fractional: a ZC_Standard_FractionalMint box holding (X, 1) with R7 = owner, R8 = this R7,
+    //   R9 = this R8, funded with 2000000 nanoERG plus both fees. Any batcher then mints the shares.
+    //
+    // WHAT MAY LEAVE THE BOX
+    // The price, the batcher fee, the delivery funding, a new bond's fee reserve, and at most
+    // 1000000 nanoERG of box minimum on a token offer. Everything else stays in the continuation.
+    // Only one input with this script is allowed per transaction, so one bond cannot be charged to
+    // two offers.
+    //
+    // LIMITS OF THIS DRAFT
+    // - Best execution is not enforced. The offer never does worse than its terms, but a batcher
+    //   chooses which ask it meets.
+    // - Settled bonds cannot be bought, whole or as shares: only claims on a live bond.
+    // - A share's value ignores the fractional vault's own nanoERG and its pull fee.
+    // - A continuation is always required; dust left in it is recovered by cancelling.
+    // - Storage rent, serialization and maximum cost are unverified.
+
+    val ownerHash = SELF.R4[Coll[Byte]].get
+    val ownerAuth = INPUTS.exists { (b: Box) =>
+        b.id != SELF.id && blake2b256(b.propositionBytes) == ownerHash
+    }
+
+    if (ownerAuth) {
+        sigmaProp(true)
+    } else {
+        val terms = SELF.R5[Coll[Long]].get
+        val fractional = SELF.R7[Coll[Long]].get
+        val nextIndex = getVar[Int](0).get
+        val offers = INPUTS.filter { (b: Box) => b.propositionBytes == SELF.propositionBytes }
+
+        if (terms.size != 9 || offers.size != 1 || (fractional.size != 0 && fractional.size != 3) ||
+            nextIndex < 0 || nextIndex >= OUTPUTS.size) {
+            sigmaProp(false)
+        } else {
+            val next = OUTPUTS(nextIndex)
+            val saleIndex = getVar[Int](2)
+            val primary = !saleIndex.isDefined
+            // Taken from the box so the compiler cannot fold the constant into the template.
+            val noToken = SELF.id.slice(0, 0)
+            val lendsERG = CONST_REPAYMENT_TOKEN == noToken
+            val batcherFee = terms(3)
+
+            val bond = if (primary) OUTPUTS(1) else CONTEXT.dataInputs(getVar[Int](3).get)
+            val unit = if (primary) OUTPUTS(0) else OUTPUTS(getVar[Int](5).get)
+            val asset = bond.tokens(0)._1
+            val borrower = bond.R6[Coll[Long]].get
+            val lender = bond.R9[Coll[Long]].get
+            val principalTokens = bond.R7[Coll[(Coll[Byte], Long)]].get
+
+            // Shares are bought only from a sale order, and only when their mint request is supplied.
+            val requestBytes = getVar[Coll[Byte]](6)
+            val buysShares = !primary && requestBytes.isDefined
+            // The token delivered and how many raw units of it: 1 bond unit, or u shares.
+            val traded = unit.tokens(0)._1
+            val units = unit.tokens(0)._2
+            // How many of those units make up the whole bond: 1, or the share count N.
+            val wholeUnits = if (buysShares) {
+                Global.deserializeTo[Box](requestBytes.get).R8[Coll[Long]].get(0)
+            } else 1L
+
+            // What the offer pays, in raw units of the repayment asset.
+            val price = if (primary) {
+                if (lendsERG) borrower(1) else principalTokens(0)._2
+            } else {
+                val ask = INPUTS(saleIndex.get).R5[Coll[Long]].get
+                ((units.toBigInt * ask(0).toBigInt + ask(1).toBigInt - 1L.toBigInt) / ask(1).toBigInt).toLong
+            }
+
+            val sourceValid = if (primary) {
+                val order = INPUTS(0)
+                val sameAsset = if (lendsERG) principalTokens.size == 0 else {
+                    principalTokens.size == 1 && principalTokens(0)._1 == CONST_REPAYMENT_TOKEN &&
+                    borrower(1) <= 1000000L
+                }
+                blake2b256(order.propositionBytes) == CONST_ORDER_HASH &&
+                asset == order.id && traded == asset && units == 1L &&
+                lender(0) == terms(4) &&
+                sameAsset
+            } else {
+                val sale = INPUTS(saleIndex.get)
+                val originBytes = getVar[Coll[Byte]](4).get
+                val origin = Global.deserializeTo[Box](originBytes)
+                val tokenValid = if (buysShares) {
+                    // The request box hashes to the share id, so the shares were minted by its
+                    // script: 2N+1 of them, for the one bond unit the request held.
+                    val request = Global.deserializeTo[Box](requestBytes.get)
+                    blake2b256(requestBytes.get) == traded &&
+                    blake2b256(request.propositionBytes) == CONST_FRACTIONAL_MINT_HASH &&
+                    request.tokens.size == 1 && request.tokens(0)._1 == asset &&
+                    wholeUnits >= 1L && units >= 1L && units <= wholeUnits
+                } else {
+                    traded == asset && units == 1L
+                }
+                blake2b256(sale.propositionBytes) == CONST_SALE_HASH &&
+                sale.tokens.size == 1 && sale.tokens(0)._1 == traded &&
+                tokenValid &&
+                blake2b256(originBytes) == asset &&
+                blake2b256(origin.propositionBytes) == CONST_ORDER_HASH &&
+                blake2b256(bond.propositionBytes) == CONST_BOND_HASH &&
+                bond.tokens(0)._2 == 2L
+            }
+
+            val remaining = lender(2) - HEIGHT.toLong
+            val year = 2628000000L // 10000 basis points * 262800 blocks
+            val cost = if (lendsERG) price + batcherFee else price
+            val termsValid =
+                HEIGHT.toLong < terms(6) &&
+                terms(0) >= 0L && batcherFee >= 0L &&
+                remaining > 0L && remaining >= terms(1) && remaining <= terms(2) &&
+                price > 0L && price >= terms(7) &&
+                // u of N units claim u/N of the repayment; both sides are multiplied through by N.
+                borrower(0).toBigInt * units.toBigInt * year.toBigInt >=
+                    cost.toBigInt * wholeUnits.toBigInt *
+                    (year.toBigInt + terms(0).toBigInt * remaining.toBigInt)
+
+            // Shares are already fractional, so they always go straight to the owner.
+            val plain = fractional.size == 0 || buysShares
+            val deliveryFunding = if (plain) 1000000L else 2000000L + fractional(1) + fractional(2)
+            val delivered =
+                unit.tokens.size == 1 &&
+                unit.value >= deliveryFunding && (
+                    if (plain) blake2b256(unit.propositionBytes) == ownerHash
+                    else {
+                        blake2b256(unit.propositionBytes) == CONST_FRACTIONAL_MINT_HASH &&
+                        unit.R7[Coll[Byte]].get == ownerHash &&
+                        unit.R8[Coll[Long]].get == fractional &&
+                        unit.R9[Coll[Coll[Byte]]].get == SELF.R8[Coll[Coll[Byte]]].get
+                    }
+                )
+
+            // nanoERG that may leave: fee, delivery, a new bond's reserve, and either the ERG price
+            // or the box minimum that rides with a token payment.
+            val reserve = if (primary) lender(0) else 0L
+            val ergBesidePrice = if (lendsERG) price else if (primary) borrower(1) else 1000000L
+            val ergOut = batcherFee + deliveryFunding + reserve + ergBesidePrice
+            val capitalKept = if (lendsERG) {
+                next.tokens.size == 0 && SELF.tokens.size == 0 &&
+                next.value >= SELF.value - ergOut
+            } else {
+                val have = if (SELF.tokens.size == 1 && SELF.tokens(0)._1 == CONST_REPAYMENT_TOKEN) {
+                    SELF.tokens(0)._2
+                } else 0L
+                val left = have - price
+                left >= 0L &&
+                next.value >= SELF.value - ergOut &&
+                (if (left == 0L) next.tokens.size == 0
+                 else next.tokens.size == 1 && next.tokens(0)._1 == CONST_REPAYMENT_TOKEN &&
+                      next.tokens(0)._2 >= left)
+            }
+
+            val continued =
+                next.propositionBytes == SELF.propositionBytes &&
+                next.R4[Coll[Byte]].get == ownerHash &&
+                next.R5[Coll[Long]].get == terms &&
+                next.R6[Coll[Byte]].get == SELF.R6[Coll[Byte]].get &&
+                next.R7[Coll[Long]].get == fractional &&
+                next.R8[Coll[Coll[Byte]]].get == SELF.R8[Coll[Coll[Byte]]].get
+
+            val policyAgreed = blake2b256(getVar[Coll[Byte]](1).get) == SELF.R6[Coll[Byte]].get
+
+            sigmaProp(
+                sourceValid && termsValid && delivered && capitalKept &&
+                continued && policyAgreed
+            ) && executeFromVar[SigmaProp](1)
+        }
+    }
+}

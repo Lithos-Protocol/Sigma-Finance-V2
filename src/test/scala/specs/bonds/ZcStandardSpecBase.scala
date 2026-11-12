@@ -19,7 +19,7 @@ object ZcStandardSpecBase {
   case class Scripts(vault: Contract, ergBond: Contract, tokenBond: Contract,
                      ergOrder: Contract, tokenOrder: Contract,
                      fractionalVault: Contract, fractionalMint: Contract,
-                     maturity: Contract, oracle: Contract)
+                     maturity: Contract, ergOracle: Contract, tokenOracle: Contract)
 
   private var cache: Option[Scripts] = None
 
@@ -44,7 +44,11 @@ object ZcStandardSpecBase {
         Seq("CONST_FRACTIONAL_VAULT_HASH" -> hash(fractionalVault)))
       val c = Scripts(vault, ergBond, tokenBond, order(ergBond), order(tokenBond), fractionalVault, fractionalMint,
         compile("bonds/liquidations/ZC_Standard_MaturityLiquidation"),
-        compile("bonds/liquidations/ZC_Standard_ERG_SigUSD_Liquidation"))
+        // The oracle rule measures the repayment, so it is compiled per repayment asset like the bond.
+        compile("bonds/liquidations/ZC_Standard_ERG_SigUSD_Liquidation",
+          Seq("CONST_REPAYMENT_TOKEN" -> Colls.fromArray(Array.empty[Byte]))),
+        compile("bonds/liquidations/ZC_Standard_ERG_SigUSD_Liquidation",
+          Seq("CONST_REPAYMENT_TOKEN" -> Colls.fromArray(SigUSD.getBytes))))
       cache = Some(c)
       c
     }
@@ -70,6 +74,9 @@ trait ZcStandardSpecBase extends BondSpecBase {
 
   protected def bondOf(ctx: BlockchainContext, kind: Kind): Contract =
     if (kind == ErgBond) scripts(ctx).ergBond else scripts(ctx).tokenBond
+
+  protected def oracleRuleOf(ctx: BlockchainContext, kind: Kind): Contract =
+    if (kind == ErgBond) scripts(ctx).ergOracle else scripts(ctx).tokenOracle
 
   protected def orderOf(ctx: BlockchainContext, kind: Kind): Contract =
     if (kind == ErgBond) scripts(ctx).ergOrder else scripts(ctx).tokenOrder

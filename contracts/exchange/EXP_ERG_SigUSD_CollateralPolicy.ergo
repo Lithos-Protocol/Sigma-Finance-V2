@@ -1,0 +1,84 @@
+{
+    // EXPERIMENTAL collateral policy expression for EXP_LendOffer. No specs or off-chain code exist.
+    // Executed through the offer's context var 1 with the OFFER as SELF. It is the lender's whole
+    // risk decision for a bond: which liquidation rule the bond must carry, how early that rule
+    // must fire, and how much collateral must be there now. The offer pins this expression's hash
+    // in R6, so a lender chooses it and a batcher cannot swap it. Other collateral types or other
+    // liquidation rules need another expression, not another offer contract.
+    //
+    // It is the counterpart of ZC_Standard_ERG_SigUSD_Liquidation and measures exactly what that
+    // rule measures: collateral value against the REPAYMENT, at the same oracle price. The only
+    // differences are whose ratio is used and which way the comparison points.
+    //
+    // CONSTANTS
+    // CONST_REPAYMENT_TOKEN: Coll[Byte] - the offer's repayment asset: EMPTY for ERG, or SigUSD.
+    //   Any other asset is unsupported and never passes.
+    // CONST_LIQUIDATION_HASH: Coll[Byte] - blake2b256 of the serialized
+    //   ZC_Standard_ERG_SigUSD_Liquidation expression compiled for the same repayment asset.
+    //
+    // INPUTS FROM THE OFFER
+    // Offer R5(5): the lender's floor, a collateral ratio in basis points of the repayment (13000 = 130%).
+    // Offer R5(8): maximum oracle age in blocks (1..100000).
+    // The bond is the box the offer itself authenticated: the data input named by context var 3
+    // when buying an existing bond or its shares, otherwise OUTPUTS(1) of a new-bond fill.
+    //
+    // THREE CHECKS
+    // 1. Rule: the bond's R8 is CONST_LIQUIDATION_HASH. Only then do the bond's payload fields mean
+    //    what this expression reads them as.
+    // 2. Ongoing cover: the bond's own liquidation ratio, borrower R6(7), is at least the lender's
+    //    floor. The bond is then liquidated while its collateral is still worth the floor, and
+    //    the borrower cannot set a ratio so low that it never fires before maturity.
+    // 3. Cover now: collateral is worth at least the floor today.
+    // A bond that is already below its own ratio but above the lender's floor passes: it can be
+    // liquidated at once for collateral the lender has just accepted as enough.
+    //
+    // VALUATION (identical to the liquidation rule)
+    // One fresh USD Oracle v2 data input, found by its singleton NFT; R4 Long = nanoERG per USD.
+    // SigUSD is taken as $1 with 100 raw units per USD. Other collateral tokens count as zero.
+    // The bond's lender fee reserve R9(0) is not collateral. With oracle price P:
+    //   C = 100 * collateralNanoERG + P * collateralSigUSDRaw
+    //   L = 100 * repaymentNanoERG, or P * repaymentSigUSDRaw
+    // pass iff C * 10000 >= L * floor. Products are widened to BigInt before multiplying.
+
+    val terms = SELF.R5[Coll[Long]].get
+    val stateIndex = getVar[Int](3)
+    val bond = if (stateIndex.isDefined) CONTEXT.dataInputs(stateIndex.get) else OUTPUTS(1)
+    val borrower = bond.R6[Coll[Long]].get
+    val lender = bond.R9[Coll[Long]].get
+    val floorBps = terms(5)
+    val maxAge = terms(8)
+    val oracleNFT = fromBase16("6a2b821b5727e85beb5e78b4efb9f0250d59cd48481d2ded2c23e91ba1d07c66")
+    val sigUSD = fromBase16("03faf2cb329f2e90d6d23b58d91bbb6c046aa143261cc21f52fbe2824bfcbf04")
+    val pools = CONTEXT.dataInputs.filter { (b: Box) =>
+        b.tokens.exists { (t: (Coll[Byte], Long)) => t._1 == oracleNFT && t._2 == 1L }
+    }
+    val repaysERG = CONST_REPAYMENT_TOKEN.size == 0
+    val supported = repaysERG || CONST_REPAYMENT_TOKEN == sigUSD
+
+    if (!supported || floorBps <= 0L || maxAge < 1L || maxAge > 100000L || pools.size != 1 ||
+        borrower.size < 9 || lender.size != 3 || lender(0) < 0L || lender(0) > bond.value) {
+        sigmaProp(false)
+    } else {
+        val ruleAgreed = bond.R8[Coll[Byte]].get == CONST_LIQUIDATION_HASH
+        val ongoingCover = borrower(7) >= floorBps
+
+        val pool = pools(0)
+        val price = pool.R4[Long].get
+        val epoch = pool.R5[Int].get
+        val created = pool.creationInfo._1.toLong
+        val fresh = created >= 0L && created <= HEIGHT.toLong && HEIGHT.toLong - created <= maxAge
+        val collateral = bond.tokens.slice(1, bond.tokens.size)
+        val collateralUSD = collateral.fold(0L, { (a: Long, t: (Coll[Byte], Long)) =>
+            if (t._1 == sigUSD) a + t._2 else a
+        })
+        val collateralValue = (bond.value - lender(0)).toBigInt * 100L.toBigInt +
+            price.toBigInt * collateralUSD.toBigInt
+        val repayment = borrower(0)
+        val debtValue = if (repaysERG) repayment.toBigInt * 100L.toBigInt
+            else price.toBigInt * repayment.toBigInt
+        val coverNow = fresh && price > 0L && epoch >= 0 && repayment > 0L &&
+            collateralValue * 10000L.toBigInt >= debtValue * floorBps.toBigInt
+
+        sigmaProp(ruleAgreed && ongoingCover && coverNow)
+    }
+}

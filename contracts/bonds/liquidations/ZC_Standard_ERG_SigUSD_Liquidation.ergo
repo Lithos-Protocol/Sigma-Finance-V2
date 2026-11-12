@@ -1,9 +1,11 @@
 {
     // Standard ERG/SigUSD liquidation expression. No off-chain code exists yet.
     // For ZC_Standard_Bond only, executed via host context var 0 with the bond as SELF.
-    // Borrower R6(7): minimum collateral / PRINCIPAL ratio in basis points (15000 = 150%).
+    // CONST_REPAYMENT_TOKEN: Coll[Byte] - the bond's repayment asset: EMPTY for ERG, or SigUSD. It must
+    //   match the bond tree this rule is used with; one compiled rule, and one hash, per asset.
+    // Borrower R6(7): minimum collateral / REPAYMENT ratio in basis points (15000 = 150%).
     // Borrower R6(8): maximum oracle age in blocks (1..100000). Further borrower data are ignored.
-    // R6(1) / R7 are the agreed principal nanoERG / tokens, excluding expiry-fee refund.
+    // R6(0) is the repayment amount in that asset: what the lender is owed, and so the debt measured.
     // Lender R9 = (liquidation fee reserve, start height, maturity); exclude the fee from collateral.
     // tokens(0) is the bond's 2-unit asset reserve, never collateral; tokens(1..) are collateral.
     //
@@ -22,10 +24,12 @@
     // VALUATION
     // SigUSD is assumed $1, with 100 raw units per USD (2 decimals). Other collateral tokens
     // are valued at zero, but ALL are paid to the vault. Before maturity this rule supports only
-    // ERG/SigUSD principal assets, rejecting unpriced principal tokens rather than omitting debt.
+    // ERG or SigUSD repayment; any other repayment asset never liquidates early.
+    // The debt is the REPAYMENT, not the principal: a ratio against principal overstates the
+    // lender's cover by the interest. EXP_ERG_SigUSD_CollateralPolicy measures the same thing.
     // With oracle P nanoERG/USD, compare without division or price rounding:
     // C = 100*collateralNanoERG + P*collateralSigUSDRaw
-    // L = 100*principalNanoERG  + P*principalSigUSDRaw
+    // L = 100*repaymentNanoERG, or P*repaymentSigUSDRaw
     // liquidate iff C*10000 < L*borrowerRatioBps, with positive L. Widen BEFORE multiplication.
     // Products fit BigInt's 256-bit domain for Long inputs, including Long ratio/price extremes.
     //
@@ -71,21 +75,18 @@
                     val epoch = pool.R5[Int].get
                     val created = pool.creationInfo._1.toLong
                     val fresh = created >= 0L && created <= HEIGHT.toLong && HEIGHT.toLong - created <= maxAge
-                    val principal = SELF.R7[Coll[(Coll[Byte], Long)]].get
-                    val principalSupported = principal.size == 0 ||
-                        (principal.size == 1 && principal(0)._1 == sigUSD && principal(0)._2 > 0L)
+                    val repaysERG = CONST_REPAYMENT_TOKEN.size == 0
+                    val supported = repaysERG || CONST_REPAYMENT_TOKEN == sigUSD
+                    val repayment = borrower(0)
                     val collateralUSD = collateral.fold(0L, { (a: Long, t: (Coll[Byte], Long)) =>
-                        if (t._1 == sigUSD) a + t._2 else a
-                    })
-                    val principalUSD = principal.fold(0L, { (a: Long, t: (Coll[Byte], Long)) =>
                         if (t._1 == sigUSD) a + t._2 else a
                     })
                     val collateralValue = (SELF.value - fee).toBigInt * 100L.toBigInt +
                         price.toBigInt * collateralUSD.toBigInt
-                    val principalValue = borrower(1).toBigInt * 100L.toBigInt +
-                        price.toBigInt * principalUSD.toBigInt
-                    fresh && price > 0L && epoch >= 0 && borrower(1) >= 0L && principalSupported &&
-                        principalValue > 0L && collateralValue * 10000L.toBigInt < principalValue * ratioBps.toBigInt
+                    val debtValue = if (repaysERG) repayment.toBigInt * 100L.toBigInt
+                        else price.toBigInt * repayment.toBigInt
+                    fresh && price > 0L && epoch >= 0 && supported && repayment > 0L &&
+                        collateralValue * 10000L.toBigInt < debtValue * ratioBps.toBigInt
                 }
             }
         }
