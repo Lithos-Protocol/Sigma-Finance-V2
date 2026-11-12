@@ -26,7 +26,9 @@
     // R5: Coll[Long] - terms, exactly 11:
     //   0 minimum yield, basis points of simple interest per 262800 blocks (one year of 2-minute blocks)
     //   1 minimum and 2 maximum blocks left to maturity
-    //   3 batcher fee per fill, and for the expiry refund, nanoERG
+    //   3 batcher fee per fill, and for the expiry refund, nanoERG. A fill needs at least 2000000
+    //     (0.002 ERG), the floor every standard batching fee shares; an offer below it never fills,
+    //     and its owner cancels it or anyone refunds it after expiry.
     //   4 lender liquidation fee reserve to put in a NEW bond, nanoERG, exact
     //   5 collateral floor in basis points of the repayment, and 8 maximum oracle age in blocks: read only
     //     by the collateral policy expression
@@ -255,7 +257,7 @@
             val cost = if (lendsERG) price + batcherFee else price
             // Fills run only before the expiry, R5(6): from then on this box can only be refunded.
             val termsValid =
-                terms(0) >= 0L && batcherFee >= 0L &&
+                terms(0) >= 0L && batcherFee >= 2000000L &&
                 remaining > 0L && remaining >= terms(1) && remaining <= terms(2) &&
                 price > 0L && price >= terms(7) &&
                 // u of N units claim u/N of the repayment; both sides are multiplied through by N.

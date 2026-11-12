@@ -269,6 +269,9 @@ where R is the repayment, P the price, D the blocks left to maturity and 262800 
 batcher fee. The price ceiling rises towards R as maturity nears, so one number follows a bond's
 value with no updates. A lender can ladder offers with different maturity windows.
 
+The batcher fee per fill, R5(3), is at least 0.002 ERG, the floor every standard batching fee
+shares. An offer set below it never fills; its owner cancels it, or anyone refunds it after expiry.
+
 The offer buys from three sources, chosen by context variables:
 
 1. **A new bond**: it fills a standard order. The order's own script validates the bond.

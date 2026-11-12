@@ -111,8 +111,11 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
       val f = flow(ctx, ErgBond)
       val blocks = f.maturity - f.height
       accepts(executor(ctx), newBondTx(f, offerBox(ctx, ErgBond, Terms(minBlocks = blocks, maxBlocks = blocks))))
+      // The batcher fee has the 0.002 ERG floor every standard batching fee shares.
+      accepts(executor(ctx), newBondTx(f, offerBox(ctx, ErgBond, Terms(batcherFee = 2000000L))))
       Seq(Terms(minBlocks = blocks + 1L), Terms(maxBlocks = blocks - 1L), Terms(minFill = priceOf(f) + 1L),
-        Terms(reserve = batchingFee + 1L), Terms(yieldBps = -1L), Terms(batcherFee = -1L)).foreach { t =>
+        Terms(reserve = batchingFee + 1L), Terms(yieldBps = -1L), Terms(batcherFee = -1L),
+        Terms(batcherFee = 1999999L)).foreach { t =>
         // The executor's box keeps every variant buildable, so only the offer can refuse it.
         rejectsAtSigning(executor(ctx), newBondTx(f, offerBox(ctx, ErgBond, t), extra = Seq(funding(ctx, executor(ctx), 9))))
       }
@@ -553,6 +556,10 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
       val rb = tagged(lenderTree(ctx), b.value - batchingFee, inputAt(b, ctx, 2).id)
       accepts(executor(ctx), refundTx(ctx, Seq(a -> 1, b -> 2), Seq(ra, rb), expiry))
       rejectsAtSigning(executor(ctx), refundTx(ctx, Seq(a -> 1, b -> 2), Seq(rb), expiry, indices = Seq(0, 0)))
+      // The 0.002 ERG floor binds fills only: an offer below it never fills, but can still be refunded.
+      val low = offerBox(ctx, ErgBond, Terms(expiry = expiry, batcherFee = minBox))
+      accepts(executor(ctx), refundTx(ctx, Seq(low -> 1),
+        Seq(tagged(lenderTree(ctx), low.value - minBox, inputAt(low, ctx, 1).id)), expiry))
       // A fill at expiry is refused: the box can only be refunded.
       val f = flow(ctx, ErgBond)
       rejectsAtSigning(executor(ctx), newBondTx(f, offerBox(ctx, ErgBond, Terms(expiry = f.height)), height = f.height))
