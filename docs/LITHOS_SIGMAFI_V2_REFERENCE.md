@@ -4,7 +4,9 @@ This document describes the borrower-order protocol committed in
 `23676ab6ba0f5b19912694eb83ce912fbc3109e7` and made canonical on `master` by merge
 `bcd9ef215978719cc7644698a076fd03ed974cd2` on November 6, 2026. It replaces the earlier
 one-unit bond implementation currently consumed by Lithos. It is an integration reference, not a
-deployment manifest. [SigmaBonds.MD](../SigmaBonds.MD) describes the protocol in full.
+deployment manifest. [SIGMABONDS_OLD.md](./SIGMABONDS_OLD.md) describes the protocol in full; its
+contracts now live in `contracts/old/`. The ZC Standard set that succeeds it is described in
+[SigmaBonds.MD](../SigmaBonds.MD).
 
 The generated block contains full ErgoTrees, raw template hex, both kinds of hash, every order/token
 constant with its type and serialized value, concrete ERG/SigUSD addresses, and liquidation expression bytes.

@@ -26,7 +26,8 @@ shared with c-bonds; anything in this file or the repository takes precedence ov
 | `src/main/scala/mutations/NodeWallet.scala` | the miner-reward-delay constant the above needs |
 | `src/test/scala/specs/harness/` | `ContractSpecBase`, `HarnessProbeSpec` |
 | `src/test/scala/specs/<product>/` | one `<Product>SpecBase` plus one suite per contract |
-| `src/test/scala/specs/bonds/` | `BondSpecBase`; suites for the ZC bonds, orders, `MaturityLiquidation`, `BondAssetVault`, template verification and collateral conversion |
+| `src/test/scala/specs/bonds/` | `BondSpecBase`; suites for the first-generation bonds, orders, `MaturityLiquidation`, `BondAssetVault`, template verification and collateral conversion |
+| `src/test/scala/specs/bonds/ZcStandard*` | `ZcStandardSpecBase`, which compiles every ZC Standard contract once per JVM and per market (`scripts`, `exchange`, `marketOf`) and builds an order-to-bond `Flow`; suites for the bond, order and vault, the fractional pair, the asks, the lend offer and the Dutch auction pair |
 | `src/test/scala/specs/app/` | `SigmaFiAppSpec`: the CLI's App end to end, over `FakeNode`, an in-memory chain served as the node's index and wallet JSON |
 
 The mutations package keeps its Lithos name rather than the `org.lithosprotocol.sigmafi` prefix so
@@ -55,6 +56,22 @@ transaction that never balanced, so a negative with an arithmetic slip passes wh
 nothing. `rejectsAtSigning` splits it: building must succeed, signing must not. Reserve `rejects`
 for negatives that genuinely cannot produce a buildable transaction, and say so in the property
 name.
+
+## Measuring transaction cost
+
+Set `SIGMAFI_COST` to a file path and run the suite:
+
+```bash
+SIGMAFI_COST=costs.tsv sbt test
+```
+
+Every transaction a spec accepts appends one tab-separated line: appkit's cost estimate from
+signing, the input scripts in order (ZC Standard contracts by name and market, `wallet` for a
+public key, `other` for anything unnamed), the data-input and output counts, and the signed size in
+bytes. Without the variable nothing is written. The mocked node's `maxBlockCost` is 1,000,000 and
+appkit enforces it while signing, so every accepted transaction is already under the reference
+node's default per-transaction limit (`maxTransactionCost`, also 1,000,000). Group the lines by
+their second column to get the heaviest case of each transaction shape.
 
 ## Writing a suite for a SigmaFi contract
 
