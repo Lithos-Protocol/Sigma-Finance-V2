@@ -65,11 +65,48 @@ trait StandardSpecSupport extends ContractSpecBase with Assertions {
       chain.unspent.remove(paidId)
       chain.spent(paidId) = (paid, txId)
       chain.add(made)
-      chain.txs(txId) = (Seq(paid), Seq(made))
+      chain.txs(txId) = FakeTx(Seq(paid), Seq(made))
       box
     }
 
-    def app(p: ErgoProver): StandardApp = new StandardApp(ctx, new FakeNode(chain, p), AppSettings(), _ => (), protocol)
+    /**
+     * Seed `utxo` as created by a transaction of `funder`'s that discloses `disclosed` in context variable 64
+     * (zcs1 script disclosure) but neither spends from nor pays to them.
+     */
+    def seedDisclosing(funder: ErgoProver, utxo: UTXO, disclosed: Contract*): InputUTXO = {
+      val box = seedFrom(funder, utxo)
+      val txId = box.input.getTransactionId
+      // As the node renders a context extension: variable id to the serialized value, in hex.
+      val extension = io.circe.Json.obj(DisclosureVar.toString ->
+        io.circe.Json.fromString(treesValue(disclosed.map(_.ergoTree): _*).toHex))
+      chain.txs(txId) = chain.txs(txId).copy(proofs = Seq(io.circe.Json.obj(
+        "proofBytes" -> io.circe.Json.fromString(""), "extension" -> extension)))
+      box
+    }
+
+    def app(p: ErgoProver, settings: AppSettings = AppSettings()): StandardApp =
+      new StandardApp(ctx, new FakeNode(chain, p), settings, _ => (), protocol)
+
+    /** A batch runner for `runBatch`: runs one command line as `p`, signing it, and says whether it worked. */
+    def runner(p: ErgoProver): String => Boolean = { line =>
+      val a = app(p)
+      Try(run(p, line.split(" ").toSeq match {
+        case "pack" +: ids => a.pack(ids)
+        case Seq("mint-shares", id) => a.mintShares(id)
+        case Seq("pull", id) => a.pull(id)
+        case Seq("refund-order", id) => a.refundOrder(id)
+        case Seq("refund-offer", id) => a.refundOffer(id)
+        case Seq("refund-ask", id) => a.refundAsk(id)
+        case Seq("liquidate", id) => a.liquidate(Seq(id))
+        case Seq("match-offer", offer, "--order", order) => a.matchOrder(offer, order)
+        case Seq("match-offer", offer, "--ask", ask) => a.matchAsk(offer, ask, None)
+        case Seq("match-offer", offer, "--ask", ask, "--amount", n) => a.matchAsk(offer, ask, Some(n.toLong))
+      })).isSuccess
+    }
+
+    /** The trees the transaction `txId` discloses in context variable 64, as a batcher reads them from the node. */
+    def disclosed(txId: String, p: ErgoProver): Seq[Seq[Byte]] =
+      new FakeNode(chain, p).transactionById(txId).toSeq.flatMap(NodeJson.disclosedTrees).map(_.bytes.toSeq)
 
     def run(p: ErgoProver, prepared: => Prepared): SignedTransaction = {
       val built = Try(prepared) match {

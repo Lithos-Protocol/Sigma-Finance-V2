@@ -22,8 +22,13 @@ case class NodeError(status: Int, path: String, reason: String)
  * The Ergo node REST API, and nothing else: there is no explorer. The `/blockchain` endpoints need the
  * node's extra index (`ergo.node.extraIndex = true`); the `/wallet` endpoints need the API key. Every
  * endpoint returns the node's JSON as is, so a spec can stand in for the node by overriding them.
+ *
+ * With `mempool`, lookups also see the mempool: unspent listings include boxes created by unconfirmed
+ * transactions and leave out boxes they spend, a box id falls back to the node's UTXO set with its pool, and
+ * the wallet lists unconfirmed boxes too. A batch run uses it to chain work through continuations it has just
+ * submitted.
  */
-class NodeApi(nodeUrl: String, apiKey: Option[String]) {
+class NodeApi(nodeUrl: String, apiKey: Option[String], val mempool: Boolean = false) {
 
   private val root = nodeUrl.stripSuffix("/")
   private val JsonType = MediaType.parse("application/json; charset=utf-8")
@@ -57,11 +62,23 @@ class NodeApi(nodeUrl: String, apiKey: Option[String]) {
     get(s"/blockchain/box/unspent/byTokenId/$tokenId", unspentQuery(offset, limit))
   }
 
-  /** Any box the index has seen, spent or not: `spentTransactionId` says which. */
-  def boxById(boxId: String): Option[Json] = get(s"/blockchain/box/byId/$boxId")
+  /**
+   * Any box the index has seen, spent or not: `spentTransactionId` says which. With `mempool`, a box the index
+   * has not seen yet is looked up in the UTXO set with the mempool's outputs.
+   */
+  def boxById(boxId: String): Option[Json] =
+    get(s"/blockchain/box/byId/$boxId").orElse(
+      if (mempool) get(s"/utxo/withPool/byId/$boxId").filterNot(_.isNull) else None)
 
-  /** Its `inputs` and `outputs` are whole boxes, ErgoTrees included. */
+  /**
+   * Its `inputs` and `outputs` are whole boxes, ErgoTrees included, and each input carries the `spendingProof`
+   * it was spent with, context extension included.
+   */
   def transactionById(txId: String): Option[Json] = get(s"/blockchain/transaction/byId/$txId")
+
+  /** A transaction still in the mempool: its inputs carry their `spendingProof`, and their box when known. */
+  def unconfirmedTransactionById(txId: String): Option[Json] =
+    get(s"/transactions/unconfirmed/byTransactionId/$txId").filterNot(_.isNull)
 
   // ─── wallet ──────────────────────────────────────────────────────────────
 
@@ -75,9 +92,10 @@ class NodeApi(nodeUrl: String, apiKey: Option[String]) {
   def walletAddresses(): Seq[String] =
     required("/wallet/addresses", get("/wallet/addresses")).asArray.getOrElse(Vector.empty).flatMap(_.asString)
 
-  /** The `box` of every confirmed, unspent box the wallet holds. */
+  /** The `box` of every unspent box the wallet holds: confirmed ones, and with `mempool` unconfirmed ones too. */
   def walletUnspentBoxes(): Seq[Json] = pages(WalletPageSize) { (offset, limit) =>
-    get("/wallet/boxes/unspent", Seq("offset" -> offset, "limit" -> limit))
+    get("/wallet/boxes/unspent", Seq("offset" -> offset, "limit" -> limit) ++
+      (if (mempool) Seq("minConfirmations" -> -1) else Seq.empty))
   }.flatMap(_.hcursor.downField("box").focus)
 
   /**
@@ -99,7 +117,8 @@ class NodeApi(nodeUrl: String, apiKey: Option[String]) {
   // ─── http ────────────────────────────────────────────────────────────────
 
   private def unspentQuery(offset: Int, limit: Int): Seq[(String, Any)] =
-    Seq("offset" -> offset, "limit" -> limit, "sortDirection" -> "asc")
+    Seq("offset" -> offset, "limit" -> limit, "sortDirection" -> "asc") ++
+      (if (mempool) Seq("includeUnconfirmed" -> true, "excludeMempoolSpent" -> true) else Seq.empty)
 
   private def get(path: String, query: Seq[(String, Any)] = Seq.empty): Option[Json] =
     request("GET", path, query, None)
@@ -195,6 +214,24 @@ object NodeJson {
       json.hcursor.downField(field).focus.flatMap(_.asArray).getOrElse(Vector.empty)
         .flatMap(_.hcursor.downField("ergoTree").as[String].toOption)
     }.flatMap(hex => scala.util.Try(tree(hex)).toOption)
+
+  /**
+   * The ErgoTrees a transaction discloses in context variable 64 (zcs1 script disclosure): a
+   * `Coll[Coll[Byte]]` on any input's extension, read from each input's `spendingProof`. Entries that do not
+   * parse are dropped.
+   */
+  def disclosedTrees(json: Json): Seq[ErgoTree] = v6 {
+    json.hcursor.downField("inputs").focus.flatMap(_.asArray).getOrElse(Vector.empty).flatMap { input =>
+      input.hcursor.downField("spendingProof").downField("extension").focus.toSeq
+        .flatMap(ext => JsonCodecsWrapper.contextExtensionDecoder.decodeJson(ext).toOption)
+        .flatMap(_.values.get(Protocol.DisclosureVar))
+        .flatMap {
+          case c: sigma.ast.Constant[_] if c.tpe == sigma.ast.SCollection(sigma.ast.SCollection.SByteArray) =>
+            c.value.asInstanceOf[sigma.Coll[sigma.Coll[Byte]]].toArray.toSeq.map(_.toArray)
+          case _ => Seq.empty
+        }
+    }.flatMap(bytes => scala.util.Try(tree(Base16.encode(bytes))).toOption)
+  }
 
   /** The unsigned transaction as `/wallet/transaction/sign` reads it, context extensions included. */
   def unsignedTx(uTx: UnsignedTransaction): Json = v6 {

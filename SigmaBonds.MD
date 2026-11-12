@@ -11,7 +11,8 @@ and its compiled trees are pinned in [docs/ZC_STANDARD_REFERENCE.md](./docs/ZC_S
 The CLI builds every contract from those pinned trees: the bond lifecycle (orders, fills, repayment
 also from collateral, recollateralization, liquidation, expiry refunds, claims), fractional and Dutch
 auction shares, both asks and the lend offer, and a `batch` scan that lists, and with `--run` performs,
-every mint, pull, refund, liquidation and offer match that pays its runner. The CLI's `--old` commands still serve the
+every mint, pull, refund, liquidation and offer match that pays its runner. It follows the off-chain
+rules below. The CLI's `--old` commands still serve the
 first-generation contracts in `contracts/old/`, described in [docs/SIGMABONDS_OLD.md](./docs/SIGMABONDS_OLD.md).
 
 Each contract's header comment is its authoritative schema: registers, context variables and every
@@ -334,8 +335,9 @@ The heaviest match uses 2.5% of the per-transaction limit. A block holds about 2
 
 The contracts fix what must hold for a box to move. What clients write, how batchers find and serve
 work, and how tokens are displayed is set by the off-chain profile in
-[docs/ZC_STANDARD_OFFCHAIN.md](./docs/ZC_STANDARD_OFFCHAIN.md) (draft, `zcs1`). Off-chain rules cover
-user experience and batching only; prices and risk terms are always the user's input. In brief:
+[docs/ZC_STANDARD_OFFCHAIN.md](./docs/ZC_STANDARD_OFFCHAIN.md) (draft, `zcs1`), which the CLI follows.
+Off-chain rules cover user experience and batching only; prices and risk terms are always the user's
+input. In brief:
 
 - **Script disclosure** (required). A transaction that creates a box naming a borrower, owner or
   seller by hash puts that script's ErgoTree in context variable 64 of `INPUTS(0)`, unless an input or
@@ -350,8 +352,9 @@ user experience and batching only; prices and risk terms are always the user's i
   it would change both mints and the lend offer.
 - **Maturity grid** (recommended). Fixed maturities snap to multiples of 21,600 blocks (about 30
   days), so bonds of a market maturing in the same month share one height.
-- **Batching.** Pack refunds and liquidations into one transaction, chain fills through
-  continuations in one block, use one published matching order, and price NAV asks 3 blocks ahead.
+- **Batching.** Pack refunds and liquidations into one transaction (the CLI's `pack`), chain fills
+  through continuations in one block, use one published matching order, and price NAV asks 3 blocks
+  ahead.
 
 ## Limits and assumptions
 

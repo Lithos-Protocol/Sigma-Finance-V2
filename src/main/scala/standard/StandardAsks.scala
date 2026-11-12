@@ -70,12 +70,17 @@ trait StandardAsks extends AppBase { self: StandardApp =>
    * Put `amount` raw units of a token this wallet holds up for sale, paid in `market`'s asset. A NAV ask needs
    * the token to be a standard bond unit or its shares, and is paid in that bond's own asset.
    */
-  def sell(tokenId: String, amount: Long, market: Market, price: AskPrice, minFill: Long, expiry: Long,
+  def sell(tokenId: String, amount: Long, market: Market, price: AskPrice, minFillAsked: Option[Long], expiry: Long,
            refundFee: Long): Prepared = {
     val token = Try(ErgoId.create(tokenId)).getOrElse(fail(s"$tokenId is not a token id"))
     val held = walletBoxes.flatMap(_.tokens).filter(_.id == token).map(_.amount).sum
     if (amount < 1L || amount > held) fail(s"this wallet holds $held of $tokenId; sell 1 to $held")
+    // zcs1: shares sell in lots that pay at least one raw unit of the repayment, unless the seller says otherwise.
+    val lot = shareLot(token)
+    val minFill = minFillAsked.getOrElse(lot.getOrElse(1L))
     if (minFill < 1L) fail("the minimum fill must be at least 1")
+    val lotNotes = lot.filter(l => amount < l || minFill < l).map(l =>
+      s"WARNING: fills under $l shares claim less than one raw unit of the bond's repayment, which rounds to nothing").toSeq
     if (expiry <= height.toLong + 1L) fail("the ask's expiry must be above the current height")
     if (refundFee < 0L) fail("the refund fee cannot be negative")
     val seller = bytesValue(hashOf(myTree))
@@ -100,8 +105,27 @@ trait StandardAsks extends AppBase { self: StandardApp =>
     prepare(s"Sell $amount of $tokenId", plan(Seq.empty, Seq(ask)), Seq(note,
       s"paid in $market; minimum fill $minFill; expires at height $expiry, then anyone may return it for the " +
         s"${Fmt.erg(refundFee)} refund fee",
-      "Output 0 is the ask. Cancel it with `cancel-ask <its box id>`."))
+      "Output 0 is the ask. Cancel it with `cancel-ask <its box id>`.") ++ lotNotes)
   }
+
+  /**
+   * zcs1's least lot of a bond's shares: ceil(N / R) raw shares claim at least one raw unit of the repayment
+   * R. None for a token that is not shares of a standard bond.
+   */
+  def shareLot(token: ErgoId): Option[Long] =
+    bondOf(token).filter(_._2 > 1L).flatMap { case (asset, n) =>
+      bondRecord(asset).filter(_.repayment > 0L).map(b => math.max(1L, (n + b.repayment - 1L) / b.repayment))
+    }
+
+  /**
+   * A price as a percentage of face, in basis points: `price` for `units` of a token that is `whole` units of
+   * a bond repaying R is worth price * whole / (units * R). None when the token is not a standard bond's.
+   */
+  def faceBps(token: ErgoId, price: Long, units: Long): Option[Long] =
+    bondOf(token).flatMap { case (asset, whole) =>
+      bondRecord(asset).filter(b => b.repayment > 0L && units > 0L)
+        .map(b => (BigInt(price) * whole * 10000 / (BigInt(units) * b.repayment)).toLong)
+    }
 
   // ═══ BUY, CANCEL, REFUND ══════════════════════════════════════════════════
 
@@ -157,11 +181,6 @@ trait StandardAsks extends AppBase { self: StandardApp =>
   /** From an ask's expiry on, anyone returns its tokens to the seller and keeps the nanoERG above 0.001 ERG. */
   def refundAsk(askId: String): Prepared = {
     val ask = protocol.asAsk(unspent(askId)).getOrElse(fail(s"$askId is not a ZC Standard ask"))
-    if (height.toLong + 1L < ask.expiry) fail(s"the ask expires at height ${ask.expiry}; it can be refunded from then on")
-    val refund = UTXO(Contract(ownerTree(ask.sellerHash, ask.box, "seller")), math.min(MinBox, ask.box.value),
-      Seq(ask.token), Seq(bytesValue(ask.box.id.getBytes)))
-    prepare(s"Refund ask $askId", plan(Seq(ask.box.withCtxVar(0.toByte, intValue(0))), Seq(refund)),
-      Seq(s"returns ${ask.token.amount} of ${ask.token.id} to the seller; you keep ${Fmt.erg(ask.box.value - refund.value)}, " +
-        "less the miner fee"))
+    packed(s"Refund ask $askId", Seq(askRefund(ask)))
   }
 }

@@ -14,7 +14,7 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
 
   private val fee = erg("0.005")
   private def terms(n: Long, auction: Option[AuctionTerms] = None): ShareTerms =
-    ShareTerms(n, fee, fee, "Bond shares", "Shares of one bond", "0", auction)
+    ShareTerms(n, fee, fee, auction = auction)
 
   private def offerSpec(w: World, capital: Long = erg("20")): OfferSpec =
     OfferSpec(Market.Erg, capital, 0L, yieldBps = 1000L, minBlocks = 1L, maxBlocks = 262800L, batcherFee = fee,
@@ -160,7 +160,7 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
       w.fund(e, erg("20"))
       val bond = w.liveBond(loan()(w), l)
 
-      w.run(l, w.app(l).sell(bond.asset.toString, 1L, Market.Erg, FixedPrice(erg("5.5")), 1L, w.h + 100L, erg("0.002")))
+      w.run(l, w.app(l).sell(bond.asset.toString, 1L, Market.Erg, FixedPrice(erg("5.5")), Some(1L), w.h + 100L, erg("0.002")))
       val ask = w.app(e).asks().loneElement
       ask.nav shouldBe false
       w.app(e).askPrice(ask, 1L)._1 shouldBe erg("5.5")
@@ -173,9 +173,9 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
       w.run(e, w.app(e).fractionalize(bond.asset.toString, terms(100L)))
       w.run(e, w.app(e).mintShares(w.app(e).shareRequests().loneElement.box.id.toString))
       val shareId = w.app(e).shareVaults().loneElement.shareId
-      refused(w.app(e).sell(shareId.toString, 60L, Market.SigUsd, NavPrice(0L, None), 1L, w.h + 100L, 0L)) should
+      refused(w.app(e).sell(shareId.toString, 60L, Market.SigUsd, NavPrice(0L, None), Some(1L), w.h + 100L, 0L)) should
         include("use --market ERG")
-      w.run(e, w.app(e).sell(shareId.toString, 60L, Market.Erg, NavPrice(0L, None), 1L, w.h + 100L, erg("0.002")))
+      w.run(e, w.app(e).sell(shareId.toString, 60L, Market.Erg, NavPrice(0L, None), Some(1L), w.h + 100L, erg("0.002")))
       val nav = w.app(l).asks().loneElement
       nav.nav shouldBe true
       nav.wholeUnits shouldBe 100L
@@ -232,7 +232,7 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
 
       // A holder sells an oracle-rule unit; the offer buys it.
       val held = w.liveBond(oracleLoan(w, 30L), l)
-      w.run(l, w.app(l).sell(held.asset.toString, 1L, Market.Erg, FixedPrice(erg("5.2")), 1L, w.h + 100L, erg("0.002")))
+      w.run(l, w.app(l).sell(held.asset.toString, 1L, Market.Erg, FixedPrice(erg("5.2")), Some(1L), w.h + 100L, erg("0.002")))
       val ask = w.app(e).asks().loneElement
       val next = w.app(e).offers().loneElement
       val l0 = w.nano(l)
@@ -243,7 +243,7 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
 
       // 10% a year over about 1000 blocks caps the price near 5.9977 ERG for 6; above that it refuses and says why.
       w.run(l, w.app(l).sell(w.liveBond(oracleLoan(w, 20L), l).asset.toString, 1L, Market.Erg,
-        FixedPrice(erg("5.999")), 1L, w.h + 100L, erg("0.002")))
+        FixedPrice(erg("5.999")), Some(1L), w.h + 100L, erg("0.002")))
       refused(w.app(e).matchAsk(w.app(e).offers().loneElement.box.id.toString, w.app(e).asks().loneElement.box.id.toString, None)) should
         include("under the offer's 10% yield")
     }
@@ -262,7 +262,7 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
       w.run(l, w.app(l).fractionalize(bond.asset.toString, terms(100L)))
       w.run(e, w.app(e).mintShares(w.app(e).shareRequests().loneElement.box.id.toString))
       val shareId = w.app(e).shareVaults().loneElement.shareId
-      w.run(l, w.app(l).sell(shareId.toString, 60L, Market.Erg, NavPrice(0L, None), 1L, w.h + 100L, erg("0.002")))
+      w.run(l, w.app(l).sell(shareId.toString, 60L, Market.Erg, NavPrice(0L, None), Some(1L), w.h + 100L, erg("0.002")))
       w.run(o, w.app(o).createOffer(offerSpec(w)))
 
       val ask = w.app(e).asks().loneElement
@@ -295,7 +295,7 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
       w.run(l, w.app(l).fractionalize(bond.asset.toString, terms(100L, Some(AuctionTerms(15000L, 9000L, 500L)))))
       w.run(e, w.app(e).mintShares(w.app(e).shareRequests().loneElement.box.id.toString))
       val shareId = w.app(e).shareVaults().loneElement.shareId
-      w.run(l, w.app(l).sell(shareId.toString, 60L, Market.Erg, NavPrice(0L, None), 1L, w.h + 100L, erg("0.002")))
+      w.run(l, w.app(l).sell(shareId.toString, 60L, Market.Erg, NavPrice(0L, None), Some(1L), w.h + 100L, erg("0.002")))
       val ask = w.app(e).asks().loneElement
 
       // Three offers: one buys no Dutch shares, one wants a 95% floor, one accepts 80% over at most 1000 blocks.
@@ -337,7 +337,7 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
       val req = w.app(e).shareRequests().loneElement
       req.bondAsset shouldBe order.box.id
       req.dutch shouldBe Some(Market.SigUsd)
-      // The request names the offer's owner, whose script the batcher finds through the offer's history.
+      // The request names the offer's owner; the fill disclosed its script in context variable 64 (zcs1).
       w.run(e, w.app(e).mintShares(req.box.id.toString))
       w.tokens(o).get(req.shareId) shouldBe Some(100L)
       w.app(e).shareVault(req.shareId).get.currencyToken shouldBe Some(SigUsd)

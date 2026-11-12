@@ -42,8 +42,12 @@ object SigmaFiCli {
       |  --fee <ERG>           the miner fee (default 0.001)
       |  --send                submit the transaction. Without it, the node only signs and checks it. In the
       |                        shell it applies only to the command it is typed with.
+      |  --mempool             also read the mempool: boxes unconfirmed transactions create, less those they
+      |                        spend (batch --run always does)
       |
-      |ZC Standard (the default):
+      |ZC Standard (the default). Every transaction follows the zcs1 off-chain rules
+      |(docs/ZC_STANDARD_OFFCHAIN.md): it discloses the scripts its boxes name by hash in context variable 64,
+      |and bond units and shares carry zcs1 names and descriptions.
       |  info                               heights, pinned contract addresses and hashes, your wallet address
       |  orders [--mine]                    open borrow orders, every market
       |  bonds [--mine] [--liquidatable]    live bonds, with oracle ratios and whether each asset is genuine
@@ -51,12 +55,14 @@ object SigmaFiCli {
       |
       |  Borrower:
       |  create-order --principal <amount> --repayment <amount> --collateral-erg <ERG>
-      |               (--maturity <height> | --term <blocks> | --duration <blocks>)
+      |               (--maturity <height> | --term <blocks> | --duration <blocks>) [--exact-maturity]
       |               [--market ERG|SigUSD] [--collateral-token <token id>:<n> ...]
       |               [--liquidation maturity|oracle] [--ratio <percent>] [--oracle-age <blocks>]
       |               [--expires-in <blocks>] [--expiry-fee <ERG>]
       |      Amounts are in the market's unit (ERG, or SigUSD with 2 decimals); a loan is lent and repaid in
-      |      that one asset. --duration makes an on-close order: the bond matures that many blocks after the
+      |      that one asset. A --maturity or --term snaps to the nearest multiple of 21600 blocks (about 30
+      |      days), so bonds maturing the same month share one height; --exact-maturity keeps it as given.
+      |      --duration makes an on-close order: the bond matures that many blocks after the
       |      fill. --liquidation oracle liquidates below --ratio (e.g. 150) of the repayment at a USD oracle
       |      price at most --oracle-age blocks old (default 60), as well as at maturity.
       |      The order expires after --expires-in blocks (default 5040); then anyone may return it to you for
@@ -75,13 +81,17 @@ object SigmaFiCli {
       |  Anyone:
       |  liquidate <bond box id> [...]       keeps each bond's fee reserve
       |  refund-order <order box id>        return an expired order to its borrower; keeps its expiry fee
+      |  pack <box id> [...]                refund expired orders, offers and asks and liquidate bonds, any mix,
+      |                                     in one transaction with one miner fee; keeps every fee
       |
       |  Shares (fractional, or with a Dutch auction of a liquidated bond's collateral):
       |  shares [--mine]                    share requests and vaults, with any open auction's price
-      |  fractionalize <bond asset id> --shares <N> [--share-name <s>] [--share-description <s>]
+      |  fractionalize <bond asset id> [--shares <N>] [--share-name <s>] [--share-description <s>]
       |               [--decimals <d>] [--pull-fee <ERG>] [--mint-fee <ERG>]
       |               [--dutch --auction-opening <percent> --auction-floor <percent> --auction-length <blocks>]
       |      deposits a bond unit you hold; any batcher mints the shares to you. Fees default to 0.005 ERG.
+      |      zcs1 defaults: 1000000 shares with 6 decimals (1.000000 = one bond), and a name and description
+      |      built from the bond, such as ZCS-SigUSD-S-1749600-3fa2c1. Overriding any of them is nonstandard.
       |  mint-shares <request box id>       anyone: mint a request's shares; keeps the mint fee
       |  cancel-share-request <request box id>
       |  pull <share vault box id>          anyone: pull a settled bond into its share vault; keeps the pull fee
@@ -92,7 +102,8 @@ object SigmaFiCli {
       |  asks [--mine]
       |  sell <token id> --amount <n> [--market ERG|SigUSD] (--price <total> | --nav [--margin <percent>]
       |               [--price <floor total>]) [--min-fill <n>] [--expires-in <blocks>] [--refund-fee <ERG>]
-      |      --nav prices a bond unit or its shares at the bond's accrued value plus --margin (may be negative)
+      |      --nav prices a bond unit or its shares at the bond's accrued value plus --margin (may be negative).
+      |      Shares' --min-fill defaults to the least lot that claims a raw unit of the repayment.
       |  buy <ask box id> [--amount <n>]
       |  cancel-ask <ask box id>
       |  refund-ask <ask box id>            anyone, after expiry; keeps the refund fee
@@ -103,16 +114,21 @@ object SigmaFiCli {
       |               [--market ERG|SigUSD] [--min-blocks <n>] [--max-blocks <n>] [--min-price <amount>]
       |               [--batcher-fee <ERG>] [--fee-reserve <ERG>] [--oracle-age <blocks>] [--expires-in <blocks>]
       |               [--fees <ERG>] [--min-auction-floor <percent> --max-auction-length <blocks>]
-      |               [--deliver-shares <N> [share and --dutch options as for fractionalize]]
+      |               [--deliver-shares [share and --dutch options as for fractionalize]]
       |      Buys only bonds with the oracle liquidation rule: its policy measures their collateral. --fees is the
-      |      ERG a SigUSD offer carries for fees and box minimums (default 0.5).
+      |      ERG a SigUSD offer carries for fees and box minimums (default 0.5). --deliver-shares has a batcher
+      |      mint each bond unit into shares for you; their zcs1 name leaves the bond out (ZCS-SigUSD-S), since
+      |      the offer cannot know it yet.
       |  cancel-offer <offer box id>
       |  refund-offer <offer box id>        anyone, after expiry; keeps the batcher fee
       |  match-offer <offer box id> (--order <order box id> | --ask <ask box id> [--amount <n>])
       |      anyone: fill an order or buy from an ask with the offer; keeps the batcher fee
       |
       |  batch [--run]                      list every mint, pull, refund, liquidation and offer match that pays
-      |                                     whoever runs it; --run builds each (and submits each with --send)
+      |                                     whoever runs it, and what it passed over because a box does not
+      |                                     disclose a script it names. --run does the work in rounds: refunds
+      |                                     and liquidations packed together, offers matched best yield first,
+      |                                     and a fresh scan after each round (each submitted with --send)
       |
       |First generation (add --old to a command): info, orders, bonds, claims, fill-order [--batching-fee
       |<ERG>], claim, cancel-order, repay, liquidate. New orders use the ZC Standard only.
@@ -146,6 +162,9 @@ object SigmaFiCli {
     private var network: Option[NetworkType] = None
     private var oldProtocol: Option[Protocol] = None
     private lazy val standard = new StandardProtocol()
+    /** Scripts seen and boxes spent so far: shared by every command this session runs. */
+    private val scripts = new ScriptBook
+    private val spent = scala.collection.mutable.Set.empty[String]
 
     /** Reads commands until `exit` or the end of input. */
     def shell(): Unit = {
@@ -173,21 +192,26 @@ object SigmaFiCli {
         if (a.command.isEmpty || a.command.contains("help") || a.flag("help")) println(Usage)
         else {
           val apiKey = apiKeyFor(a)
-          val node = new NodeApi(a.opt("node").map(_.stripSuffix("/")).getOrElse(nodeUrl), apiKey)
+          // A batch run reads the mempool, so a later round finds what an earlier one submitted.
+          val mempool = a.flag("mempool") || (a.command.contains("batch") && a.flag("run"))
+          val node = new NodeApi(a.opt("node").map(_.stripSuffix("/")).getOrElse(nodeUrl), apiKey, mempool)
           val ctx = context(node, a.opt("node").map(_.stripSuffix("/")).getOrElse(nodeUrl), apiKey)
           val settings = AppSettings(
             address = a.opt("address"),
             walletPass = a.opt("wallet-pass").orElse(env("SIGMAFI_WALLET_PASS")),
             fee = a.opt("fee").map(parseErg).getOrElse(org.ergoplatform.appkit.Parameters.MinFee),
-            send = a.flag("send"))
+            send = a.flag("send"),
+            spent = spent)
           if (a.flag("old")) {
             val app = new SigmaFiApp(ctx, node, settings, compiled = Some(old(ctx)))
             try OldCommands.dispatch(app, node, a, apiKey.isDefined) finally app.close()
           } else {
-            val app = new StandardApp(ctx, node, settings, protocol = standard)
-            // A follow-up runs as its own command, with a fresh context, and keeps this one's node options and --send.
+            val app = new StandardApp(ctx, node, settings, protocol = standard, scripts = scripts)
+            // A follow-up runs as its own command, with a fresh context, and keeps this one's node options,
+            // --send and mempool reading.
             def followUp(line: String): Boolean =
-              Try(Args.parse(Args.tokenize(line) ++ (if (a.flag("send")) Seq("--send") else Seq.empty)).withDefaults(a))
+              Try(Args.parse(Args.tokenize(line) ++ (if (a.flag("send")) Seq("--send") else Seq.empty) ++
+                (if (mempool) Seq("--mempool") else Seq.empty)).withDefaults(a))
                 .fold(e => { report(e); false }, execute)
             try StandardCommands.dispatch(app, node, a, apiKey.isDefined, followUp) finally app.close()
           }
@@ -292,7 +316,8 @@ case class Args(command: Option[String], positional: Seq[String], options: Map[S
 }
 
 object Args {
-  val Flags: Set[String] = Set("send", "mine", "liquidatable", "help", "old", "from-collateral", "dutch", "nav", "run")
+  val Flags: Set[String] = Set("send", "mine", "liquidatable", "help", "old", "from-collateral", "dutch", "nav", "run",
+    "deliver-shares", "exact-maturity", "mempool")
   val SessionOptions: Set[String] = Set("node", "api-key", "wallet-pass", "address", "fee")
   val Options: Set[String] = SessionOptions ++ Set(
     "principal", "principal-token", "repayment", "collateral-erg", "collateral-token", "batching-fee",
@@ -302,7 +327,7 @@ object Args {
     "auction-opening", "auction-floor", "auction-length", "amount",
     "price", "margin", "min-fill", "refund-fee",
     "capital", "fees", "yield", "min-blocks", "max-blocks", "batcher-fee", "collateral-floor", "min-price",
-    "min-auction-floor", "max-auction-length", "deliver-shares", "order", "ask")
+    "min-auction-floor", "max-auction-length", "order", "ask")
 
   /** Splits a shell line on whitespace, keeping "double" or 'single' quoted text together. */
   def tokenize(line: String): Seq[String] = {

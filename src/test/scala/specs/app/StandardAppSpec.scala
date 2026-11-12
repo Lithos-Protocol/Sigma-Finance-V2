@@ -198,12 +198,12 @@ class StandardAppSpec extends AnyPropSpec with StandardSpecSupport with LoneElem
       w.app(e).orders() shouldBe empty
       w.tokens(b).get(collateralToken) shouldBe Some(100L)
 
-      // An order made earlier, now past its expiry.
+      // An order the borrower made earlier, now past its expiry.
       val borrowerTree = Contract.fromAddress(b.getAddress).ergoTree
-      val expired = w.seed(UTXO(protocol.market(Market.Erg).order, erg("3") + erg("0.005"), Seq(Token(collateralToken, 7L)),
+      val expired = w.seedFrom(b, UTXO(protocol.market(Market.Erg).order, erg("3") + erg("0.005"), Seq(Token(collateralToken, 7L)),
         Seq(longsValue(erg("2"), erg("1"), erg("2"), w.h + 1000L, w.h.toLong, erg("0.005"), 0L),
           tokensValue(Seq.empty), bytesValue(hashOf(borrowerTree)),
-          bytesValue(protocol.contracts.maturity.hashedValueBytes), treesValue(borrowerTree))))
+          bytesValue(protocol.contracts.maturity.hashedValueBytes))))
       refused(w.app(e).fillOrder(expired.id.toString, reserve)) should include("expired")
       val before = w.nano(b)
       w.run(e, w.app(e).refundOrder(expired.id.toString))
@@ -222,7 +222,7 @@ class StandardAppSpec extends AnyPropSpec with StandardSpecSupport with LoneElem
       def order(principalTokens: Seq[Token], rule: Array[Byte]): InputUTXO =
         w.seed(UTXO(protocol.market(Market.Erg).order, erg("3"), Seq.empty,
           Seq(longsValue(erg("2"), erg("1"), erg("2"), w.h + 1000L, w.h + 500L, erg("0.005"), 0L),
-            tokensValue(principalTokens), bytesValue(hashOf(borrowerTree)), bytesValue(rule), treesValue(borrowerTree))))
+            tokensValue(principalTokens), bytesValue(hashOf(borrowerTree)), bytesValue(rule))))
       refused(w.app(l).fillOrder(order(Seq(Token(SigUsd, 1L)), protocol.contracts.maturity.hashedValueBytes).id.toString,
         reserve)) should include("does not lend and repay in ERG alone")
       refused(w.app(l).fillOrder(order(Seq.empty, Array.fill(32)(7.toByte)).id.toString, reserve)) should

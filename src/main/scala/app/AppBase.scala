@@ -12,21 +12,37 @@ import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.util.Try
 
-/** What a run may do beyond reading: which wallet address to act as, the fee, and whether to submit. */
+/**
+ * What a run may do beyond reading: which wallet address to act as, the fee, and whether to submit. `spent`
+ * collects the boxes transactions submitted in this session spent, so a later command never builds on them
+ * while the node still lists them; a shell session shares one set across its commands.
+ */
 case class AppSettings(address: Option[String] = None,
                        walletPass: Option[String] = None,
                        fee: Long = Parameters.MinFee,
-                       send: Boolean = false)
+                       send: Boolean = false,
+                       spent: mutable.Set[String] = mutable.Set.empty[String])
 
 /** A transaction built and ready for the node wallet, with what it does in words. */
 case class Prepared(title: String, tx: org.ergoplatform.appkit.UnsignedTransaction, notes: Seq[String])
+
+/**
+ * ErgoTrees by the blake2b256 hash of their bytes, as contracts name scripts. A hash never changes meaning,
+ * so entries never expire; a shell session shares one book across its commands.
+ */
+class ScriptBook {
+  private val byHash = mutable.Map.empty[String, ErgoTree]
+  def add(tree: ErgoTree): Unit = byHash(Base16.encode(Protocol.hashOf(tree))) = tree
+  def get(hash: Array[Byte]): Option[ErgoTree] = byHash.get(Base16.encode(hash))
+}
 
 /**
  * What every SigmaFi app shares, whichever contract generation it builds: the node wallet, transaction
  * planning around protocol inputs, and signing and submitting through the node. Nothing is signed locally,
  * and no explorer is used. A subclass names the scripts it knows, for transaction summaries.
  */
-abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, out: String => Unit) {
+abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, out: String => Unit,
+                       scripts: ScriptBook = new ScriptBook) {
 
   import Protocol._
 
@@ -35,6 +51,9 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
 
   /** The node, for code mixed into a subclass. */
   protected def nodeApi: NodeApi = node
+
+  /** The miner fee every transaction this run builds pays. */
+  def minerFee: Long = settings.fee
 
   def networkType: NetworkType = ctx.getNetworkType
 
@@ -97,13 +116,14 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
 
   /**
    * Boxes the wallet can spend: P2PK boxes at its own addresses. Boxes carrying re-emission tokens are left
-   * out, so a spend never owes the EIP-27 payment.
+   * out, so a spend never owes the EIP-27 payment, and so are boxes this session has already spent.
    */
   lazy val walletBoxes: Seq[InputUTXO] = {
     walletReady
     node.walletUnspentBoxes().flatMap(j => Try(NodeJson.box(j)).toOption)
       .filter(b => walletTrees.contains(Base16.encode(hashOf(b.input.getErgoTree))))
       .filterNot(_.tokens.exists(_.id.toString == MainnetEip27Constants.TokenId))
+      .filterNot(b => settings.spent.contains(b.id.toString))
   }
 
   def walletHolds(tokenId: ErgoId): Boolean = walletBoxes.exists(_.tokens.exists(_.id == tokenId))
@@ -132,6 +152,7 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
     }
     if (settings.send) {
       val sent = node.sendTransaction(signed)
+      settings.spent ++= p.tx.getInputs.asScala.map(_.getId.toString)
       out(s"Submitted: $sent")
       Some(sent)
     } else {
@@ -177,10 +198,42 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
                             dataInputs: Seq[InputUTXO] = Seq.empty)
 
   protected def prepare(title: String, p: Plan, notes: Seq[String] = Seq.empty): Prepared = {
-    val tx = TxBuilder(ctx).setInputs(p.inputs: _*).setDataInputs(p.dataInputs: _*).setOutputs(p.outputs: _*)
+    val (inputs, disclosed) = disclose(p)
+    val tx = TxBuilder(ctx).setInputs(inputs: _*).setDataInputs(p.dataInputs: _*).setOutputs(p.outputs: _*)
       .buildTx(p.fee, myAddress, p.burn)
-    Prepared(title, tx, notes)
+    Prepared(title, tx, notes ++ (if (disclosed == 0) Seq.empty
+      else Seq(s"discloses $disclosed script(s) the outputs name by hash, in context variable ${DisclosureVar.toInt} (zcs1)")))
   }
+
+  /**
+   * The hashes of scripts `outputs` name in their registers (a borrower, an owner, a seller): what script
+   * disclosure covers. A subclass that builds such boxes says which registers those are.
+   */
+  protected def namedScripts(outputs: Seq[UTXO]): Seq[Array[Byte]] = Seq.empty
+
+  /**
+   * zcs1 script disclosure: every script the outputs name by hash, and that no input or output of the
+   * transaction already has as its script, goes into context variable 64 of INPUTS(0) as ErgoTree bytes. A
+   * batcher then finds it in one lookup of the box's creating transaction. A script this app cannot name
+   * stops the build: the transaction would not be standard.
+   */
+  private def disclose(p: Plan): (Seq[InputUTXO], Int) = {
+    val present = (p.inputs.map(_.input.getErgoTree) ++ p.outputs.map(_.contract.ergoTree))
+      .map(t => Base16.encode(hashOf(t))).toSet
+    val missing = namedScripts(p.outputs).map(Base16.encode).distinct.filterNot(present.contains)
+    if (missing.isEmpty || p.inputs.isEmpty) (p.inputs, 0)
+    else {
+      val trees = missing.map { hex =>
+        knownTree(Base16.decode(hex).get).getOrElse(fail(s"cannot disclose the script with hash $hex, which an " +
+          "output names: zcs1 needs it in the transaction, and this client has not seen it"))
+      }
+      (p.inputs.head.withCtxVar(DisclosureVar, treesValue(trees: _*)) +: p.inputs.tail, trees.size)
+    }
+  }
+
+  /** A tree already known for `hash`: this run's book, or one of the wallet's own addresses. */
+  protected def knownTree(hash: Array[Byte]): Option[ErgoTree] =
+    scripts.get(hash).orElse(if (walletAvailable) walletTrees.get(Base16.encode(hash)) else None)
 
   /**
    * Protocol inputs keep the positions their contracts read, and wallet boxes follow them to cover the ERG
@@ -252,21 +305,27 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
 
   /** An unspent box by id, from the node's index. */
   protected def unspent(boxId: String): InputUTXO = {
+    if (settings.spent.contains(boxId)) fail(s"box $boxId was spent by a transaction this session submitted")
     val json = node.boxById(boxId).getOrElse(fail(s"the node's index has no box $boxId"))
     NodeJson.spentBy(json).foreach(tx => fail(s"box $boxId was already spent, by transaction $tx"))
     NodeJson.box(json)
   }
 
   /**
-   * The ErgoTree a hash commits to, from candidates: hint trees, this wallet's addresses, and every box in
-   * the transaction that created `box`. The last is how a box made by another client is resolved: the
-   * borrower or lender usually funded it from the very address the hash names.
+   * The ErgoTree a hash commits to: a hint tree, a tree this run has already seen, one of this wallet's
+   * addresses, or, in one lookup of the transaction that created `box`, a tree it disclosed in context
+   * variable 64 or the script of one of its inputs or outputs (zcs1 script disclosure). Nothing walks further
+   * back. What is found is kept for the rest of the run.
    */
   protected def treeFor(hash: Array[Byte], box: InputUTXO, hints: Seq[ErgoTree]): Option[ErgoTree] = {
     def matching(trees: Seq[ErgoTree]) = trees.find(t => hashOf(t).sameElements(hash))
-    matching(hints)
-      .orElse(walletTrees.get(Base16.encode(hash)))
-      .orElse(node.transactionById(box.input.getTransactionId).flatMap(tx => matching(NodeJson.transactionTrees(tx))))
+    val txId = box.input.getTransactionId
+    val found = matching(hints)
+      .orElse(knownTree(hash))
+      .orElse(node.transactionById(txId).orElse(node.unconfirmedTransactionById(txId))
+        .flatMap(tx => matching(NodeJson.disclosedTrees(tx) ++ NodeJson.transactionTrees(tx))))
+    found.foreach(scripts.add)
+    found
   }
 
   protected def addAmount(a: Long, b: Long): Long =

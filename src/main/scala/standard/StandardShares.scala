@@ -15,10 +15,25 @@ case class AuctionTerms(openingBps: Long, floorBps: Long, length: Long) {
   def longs: Seq[Long] = Seq(openingBps, floorBps, length)
 }
 
-/** What a share request commits to: N shares, the batching fees, the share token's EIP-4, and an auction. */
-case class ShareTerms(shares: Long, pullFee: Long, mintFee: Long, name: String, description: String,
-                      decimals: String, auction: Option[AuctionTerms]) {
+/**
+ * What a share request commits to: N shares, the batching fees, the share token's EIP-4, and an auction. The
+ * count defaults to zcs1's 1,000,000; a name, description or decimals left out is zcs1's (StandardMetadata).
+ */
+case class ShareTerms(shares: Long = StandardMetadata.ShareCount, pullFee: Long, mintFee: Long,
+                      name: Option[String] = None, description: Option[String] = None, decimals: Option[String] = None,
+                      auction: Option[AuctionTerms] = None) {
   def longs: Seq[Long] = Seq(shares, pullFee, mintFee) ++ auction.toSeq.flatMap(_.longs)
+
+  /** The (name, description, decimals) to commit: `standard`, with any field given here in its place. */
+  def metadata(standard: Seq[String]): Seq[String] =
+    Seq(name.getOrElse(standard(0)), description.getOrElse(standard(1)), decimals.getOrElse(standard(2)))
+
+  /** Where these terms depart from zcs1, for a command's notes. */
+  def departures(standard: Seq[String]): Seq[String] =
+    (if (shares != StandardMetadata.ShareCount)
+      Seq(s"NONSTANDARD share count: zcs1 uses ${StandardMetadata.ShareCount}, so that 1.000000 is one bond") else Seq.empty) ++
+      (if (metadata(standard) != standard) Seq(s"NONSTANDARD metadata: zcs1 writes '${standard(0)}', '${standard(1)}', " +
+        s"${standard(2)} decimals") else Seq.empty)
 }
 
 /**
@@ -82,16 +97,54 @@ trait StandardShares extends AppBase { self: StandardApp =>
       if (a.length < 1L || a.length > 1000000L) fail("the auction length must be 1 to 1000000 blocks")
     }
     val script = if (t.auction.isDefined) protocol.market(market).dutchMint else protocol.contracts.fractionalMint
+    // zcs1 names the bond in the shares' metadata when the writer knows it, as here.
+    val standard = StandardMetadata.shares(market, t.auction,
+      bondRecord(asset).map(b => StandardMetadata.ShareBond(asset, b.repayment, b.maturity)))
+    val metadata = t.metadata(standard)
+    // Registers are dense: R4 to R6 carry a copy of the metadata so R7 to R9 can be set.
     val request = UTXO(script, 2L * MinBox + t.pullFee + t.mintFee, Seq(Token(asset, 1L)),
-      Seq(utf8Value(t.name), utf8Value(t.description), utf8Value(t.decimals), bytesValue(hashOf(myTree)),
-        longsValue(t.longs: _*), textsValue(t.name, t.description, t.decimals)))
+      metadata.map(utf8Value) ++ Seq(bytesValue(hashOf(myTree)), longsValue(t.longs: _*), textsValue(metadata: _*)))
     prepare(s"Fractionalize $assetId", plan(Seq.empty, Seq(request)), Seq(
-      s"${t.shares} shares of bond $asset ($market), named '${t.name}' with ${t.decimals} decimals",
+      s"${t.shares} shares of bond $asset ($market), named '${metadata(0)}' with ${metadata(2)} decimals") ++
+      t.departures(standard) ++ Seq(
       t.auction.fold("no auction: after a liquidation, holders are paid in kind")(a =>
         s"Dutch auction after a liquidation: from ${Units.percent(a.openingBps)} down to ${Units.percent(a.floorBps)} " +
           s"of the repayment over ${a.length} blocks"),
       s"fees committed: mint ${Fmt.erg(t.mintFee)}, pull ${Fmt.erg(t.pullFee)}",
       "Output 0 is the request; any batcher can mint it with `mint-shares <its box id>`."))
+  }
+
+  /**
+   * How a share token's metadata departs from zcs1, read from the request that minted it: its R9 must be
+   * the template with or without its bond, its count 1,000,000, and its issuing box (the mint's OUTPUTS(0))
+   * must leave R7 to R9 empty. Empty when it matches.
+   */
+  def shareMetadataIssues(shareId: ErgoId): Seq[String] = {
+    val request = nodeApi.boxById(shareId.toString).flatMap(j => Try(NodeJson.box(j)).toOption).flatMap(protocol.asShareRequest)
+    request.fold(Seq("cannot read the request that minted it")) { req =>
+      val issuing = nodeApi.boxById(shareId.toString).flatMap(NodeJson.spentBy).flatMap(nodeApi.transactionById)
+        .flatMap(_.hcursor.downField("outputs").focus.flatMap(_.asArray).flatMap(_.headOption))
+        .flatMap(j => Try(NodeJson.box(j)).toOption)
+      requestMetadataIssues(req) ++ issuing.filter(_.registers.size > 3)
+        .map(_ => "its issuing box sets R7 to R9, which zcs1 leaves empty")
+    }
+  }
+
+  /** How a share request's committed count and metadata depart from zcs1. Empty when they match. */
+  def requestMetadataIssues(req: StdShareRequest): Seq[String] = {
+    val market = req.dutch.orElse(assetMarket(req.bondAsset))
+    val auction = req.dutch.map(_ => AuctionTerms(req.auction(0), req.auction(1), req.auction(2)))
+    val count = if (req.shares != StandardMetadata.ShareCount)
+      Seq(s"its share count is ${req.shares}, not zcs1's ${StandardMetadata.ShareCount}") else Seq.empty
+    count ++ market.fold(Seq("its bond asset was not minted by a standard order")) { m =>
+      val generic = StandardMetadata.shares(m, auction, None)
+      val named = bondRecord(req.bondAsset).map(b =>
+        StandardMetadata.shares(m, auction, Some(StandardMetadata.ShareBond(req.bondAsset, b.repayment, b.maturity))))
+      val found = req.metadata.map(StandardMetadata.text)
+      if (found == generic || named.contains(found)) Seq.empty
+      else Seq(s"its name is '${found.headOption.getOrElse("")}', not zcs1's '${named.getOrElse(generic).head}'" +
+        (if (found.lift(2).exists(_ != StandardMetadata.ShareDecimals)) s" (and ${found(2)} decimals, not 6)" else ""))
+    }
   }
 
   /** Mint a request's shares: N to its owner, N+1 locked in the vault with the bond unit. Earns the mint fee. */
@@ -228,18 +281,24 @@ trait StandardShares extends AppBase { self: StandardApp =>
       if (v.auctionOpen && !ended) fail(s"the auction runs until height ${v.auction(4) + v.auction(3)}; claims wait for it")
       def part(n: Long): Long = (BigInt(n) * burned / v.outstanding).toLong
       val paidErg = part(v.box.value)
-      val paid = v.assets.map(t => Token(t.id, part(t.amount))).filter(_.amount > 0L)
-      val kept = v.assets.map(t => Token(t.id, t.amount - part(t.amount))).filter(_.amount > 0L)
+      // A token's part can round to zero, and a token box cannot hold zero of one: drop it before building.
+      val paid = v.assets.flatMap(t => Some(part(t.amount)).filter(_ > 0L).map(Token(t.id, _)))
+      val kept = v.assets.flatMap(t => Some(t.amount - part(t.amount)).filter(_ > 0L).map(Token(t.id, _)))
       val state = if (v.auctionOpen) Some(3.toByte) else v.state
       val regs = v.box.registers.updated(1, longsValue(v.n, v.outstanding - burned, v.pullFee))
         .patch(2, state.map(s => ErgoValue.of(s)).toSeq, if (v.box.registers.size > 2) 1 else 0)
       val next = UTXO(Contract(v.box.input.getErgoTree), v.box.value - paidErg, Token(id, v.n + 1L) +: kept, regs)
       val payout = UTXO(Contract(myTree), math.max(paidErg, MinBox), paid, tag)
+      // zcs1: warn when a holding rounds to nothing; it stays in the vault for later claimants.
+      val rounded = v.assets.filter(t => part(t.amount) == 0L).map { t =>
+        s"WARNING: this claim takes none of ${t.id} (${t.amount} held); claim at least " +
+          s"${(BigInt(v.outstanding) + t.amount - 1) / t.amount} shares to receive some"
+      }
       prepare(s"Claim $burned of $shareId",
         plan(v.box.withCtxVar(0.toByte, intValue(1)).withCtxVar(1.toByte, intValue(0)) +: boxes, Seq(payout, next),
           burn = Seq(Token(id, burned))),
         Seq(s"burns $burned of ${v.outstanding} outstanding shares; takes ${Fmt.contents(paidErg, paid)}" +
-          (if (v.auctionOpen) "; this closes the unsold auction, so holders take the lot in kind" else "")))
+          (if (v.auctionOpen) "; this closes the unsold auction, so holders take the lot in kind" else "")) ++ rounded)
     }
   }
 }

@@ -49,12 +49,14 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     if (s.expiry <= height.toLong + 1L) fail("the offer's expiry must be above the current height")
     if (s.minPrice < 1L) fail("the minimum price must be at least 1")
     if (s.auctionFloorBps < 0L || s.auctionLength < 0L) fail("the auction bounds cannot be negative")
+    // An offer is posted before it knows which bond it buys, so zcs1 metadata here leaves the bond out.
+    val standard = s.delivery.map(d => StandardMetadata.shares(m, d.terms.auction, None))
     val (fractional, metadata, mint) = s.delivery match {
       case None => (Seq.empty[Long], textsValue(), Array.empty[Byte])
       case Some(OfferDelivery(t)) =>
         if (t.shares < 1L || t.shares > 1000000000L) fail("the share count must be 1 to 1000000000")
         if (t.pullFee < MinBatchingFee || t.mintFee < MinBatchingFee) fail(s"the pull and mint fees must each be at least ${Fmt.erg(MinBatchingFee)}")
-        (t.longs, textsValue(t.name, t.description, t.decimals),
+        (t.longs, textsValue(t.metadata(standard.get): _*),
           if (t.auction.isDefined) protocol.market(m).dutchMint.hashedPropBytes else protocol.contracts.fractionalMint.hashedPropBytes)
     }
     val terms = Seq(s.yieldBps, s.minBlocks, s.maxBlocks, s.batcherFee, s.feeReserve, s.floorBps, s.expiry,
@@ -73,9 +75,23 @@ trait StandardOffers extends AppBase { self: StandardApp =>
       if (s.auctionLength == 0L) "buys no Dutch auction shares"
       else s"buys Dutch auction shares with a floor of at least ${Units.percent(s.auctionFloorBps)} and at most ${s.auctionLength} blocks",
       s.delivery.fold("bond units come to this wallet")(d => s"bond units are delivered into ${d.terms.shares} shares" +
-        d.terms.auction.fold("")(_ => " with a Dutch auction")),
-      s"expires at height ${s.expiry}; cancel it any time with `cancel-offer <its box id>`"))
+        d.terms.auction.fold("")(_ => " with a Dutch auction") + s", named '${d.terms.metadata(standard.get).head}'"),
+      s"expires at height ${s.expiry}; cancel it any time with `cancel-offer <its box id>`") ++
+      s.delivery.toSeq.flatMap(_.terms.departures(standard.get)))
   }
+
+  /** How an offer's share delivery departs from zcs1: its count and its metadata, which omit the bond. */
+  def offerMetadataIssues(o: StdOffer): Seq[String] =
+    if (!o.delivers) Seq.empty
+    else {
+      val auction = if (o.fractional.size >= 6) Some(AuctionTerms(o.fractional(3), o.fractional(4), o.fractional(5))) else None
+      val standard = StandardMetadata.shares(o.market, auction, None)
+      val found = o.metadata.map(StandardMetadata.text)
+      (if (o.fractional.head != StandardMetadata.ShareCount)
+        Seq(s"it delivers ${o.fractional.head} shares, not zcs1's ${StandardMetadata.ShareCount}") else Seq.empty) ++
+        (if (found != standard) Seq(s"its share name is '${found.headOption.getOrElse("")}', not zcs1's '${standard.head}'")
+        else Seq.empty)
+    }
 
   def cancelOffer(offerId: String): Prepared = {
     val o = protocol.asOffer(unspent(offerId)).getOrElse(fail(s"$offerId is not a ZC Standard lend offer"))
@@ -85,12 +101,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
   /** From an offer's expiry on, anyone returns it to its owner, tagged, and keeps its batcher fee. */
   def refundOffer(offerId: String): Prepared = {
     val o = protocol.asOffer(unspent(offerId)).getOrElse(fail(s"$offerId is not a ZC Standard lend offer"))
-    if (height.toLong + 1L < o.expiry) fail(s"the offer expires at height ${o.expiry}; it can be refunded from then on")
-    if (o.batcherFee < 0L || o.batcherFee > o.box.value - MinBox) fail("the offer's fee leaves no box minimum: only its owner can cancel it")
-    val refund = UTXO(Contract(ownerTree(o.ownerHash, o.box, "offer owner")), o.box.value - o.batcherFee, o.box.tokens,
-      Seq(bytesValue(o.box.id.getBytes)))
-    prepare(s"Refund offer $offerId", plan(Seq(o.box.withCtxVar(0.toByte, intValue(0))), Seq(refund)),
-      Seq(s"returns ${Fmt.contents(refund.value, refund.tokens)} to the owner; you keep ${Fmt.erg(o.batcherFee)}, less the miner fee"))
+    packed(s"Refund offer $offerId", Seq(offerRefund(o)))
   }
 
   // ═══ THE OFFER'S OWN CHECKS, OFF CHAIN ════════════════════════════════════
@@ -181,15 +192,13 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     offerRefusal(o, bond, order.principal, 1L, 1L, oracle).foreach(r => fail(s"the offer refuses this order: $r"))
 
     val rule = protocol.ruleOf(order.liqHash).getOrElse(fail("the order names a liquidation expression this client does not know"))
-    val eip4 = Seq(utf8Value(StandardMetadata.name(asset)),
-      utf8Value(StandardMetadata.description(order, rule, start, maturity, o.feeReserve)), utf8Value("0"))
-    val (delivery, funding) = unitDelivery(o, asset, eip4)
+    val (delivery, funding) = unitDelivery(o, asset, bondMetadata(order, rule, start, maturity))
     val bondOut = UTXO(protocol.market(order.market).bond, addAmount(order.collateralErg, o.feeReserve),
       Token(asset, 2L) +: order.collateral,
       Seq(bytesValue(asset.getBytes), bytesValue(order.borrowerHash), longsValue(order.terms: _*),
         tokensValue(order.principalTokens), bytesValue(order.liqHash), longsValue(o.feeReserve, start, maturity)),
       Some(start.toInt))
-    val principal = UTXO(Contract(borrowerTree(order.borrowerHash, order.box, treesReg(order.box, 8))),
+    val principal = UTXO(Contract(borrowerTree(order.borrowerHash, order.box)),
       addAmount(order.expiryFee, order.principalErg), order.principalTokens)
     val ergOut = o.batcherFee + funding + o.feeReserve + (if (o.market.token.isEmpty) order.principal else order.principalErg)
     val rest = offerRest(o, order.principal, ergOut)

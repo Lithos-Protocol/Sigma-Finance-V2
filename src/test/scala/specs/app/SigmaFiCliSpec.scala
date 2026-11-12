@@ -60,7 +60,7 @@ class SigmaFiCliSpec extends AnyPropSpec with Matchers {
 
   property("the share, ask, offer and batch options parse, including a negative margin") {
     val offer = Args.parse(Args.tokenize("create-offer --capital 10 --yield 5 --collateral-floor 130 " +
-      "--deliver-shares 100 --dutch --auction-opening 150 --auction-floor 90 --auction-length 500 --min-auction-floor 80 " +
+      "--deliver-shares --shares 100 --dutch --auction-opening 150 --auction-floor 90 --auction-length 500 --min-auction-floor 80 " +
       "--max-auction-length 1000 --batcher-fee 0.005 --fees 0.5 --min-price 1 --min-blocks 10 --max-blocks 20"))
     offer.flag("dutch") shouldBe true
     offer.opt("auction-floor") shouldBe Some("90")

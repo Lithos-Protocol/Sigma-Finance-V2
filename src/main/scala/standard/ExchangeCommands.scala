@@ -19,12 +19,12 @@ object ExchangeCommands {
 
   val Commands: Set[String] = Set("shares", "fractionalize", "mint-shares", "cancel-share-request", "pull", "buy-lot",
     "claim-shares", "asks", "sell", "buy", "cancel-ask", "refund-ask", "offers", "create-offer", "cancel-offer",
-    "refund-offer", "match-offer", "batch")
+    "refund-offer", "match-offer", "pack", "batch")
 
   /** `run` executes a follow-up command line, as `batch --run` does with each piece of work. */
   def dispatch(app: StandardApp, a: Args, run: String => Boolean): Unit = a.command.get match {
     case "shares" => listShares(app, a.flag("mine"))
-    case "fractionalize" => app.submit(app.fractionalize(one(a, "bond asset id"), shareTerms(a, None)))
+    case "fractionalize" => app.submit(app.fractionalize(one(a, "bond asset id"), shareTerms(a)))
     case "mint-shares" => app.submit(app.mintShares(one(a, "request box id")))
     case "cancel-share-request" => app.submit(app.cancelShareRequest(one(a, "request box id")))
     case "pull" => app.submit(app.pull(one(a, "share vault box id")))
@@ -49,6 +49,9 @@ object ExchangeCommands {
         case _ => throw CliError("match-offer needs exactly one of --order <order box id> or --ask <ask box id>")
       }
 
+    case "pack" =>
+      if (a.positional.isEmpty) throw CliError("pack takes the box ids of expired orders, offers and asks and of liquidatable bonds")
+      app.submit(app.pack(a.positional))
     case "batch" => batch(app, a, run)
     case other => throw CliError(s"unknown command $other; run help for the list")
   }
@@ -63,20 +66,22 @@ object ExchangeCommands {
 
   private def needPercent(a: Args, key: String): Long = percent(a, key).getOrElse(throw CliError(s"missing --$key <percent>"))
 
-  /** Share terms from --shares (or the given count), the fees, the EIP-4 fields and any --dutch auction. */
-  private def shareTerms(a: Args, count: Option[String]): ShareTerms = {
-    val shares = parseLong(count.orElse(a.opt("shares")).getOrElse(throw CliError("missing --shares <count>")), "--shares")
+  /**
+   * Share terms: --shares (default zcs1's 1,000,000), the fees, any --dutch auction, and the EIP-4 fields, which
+   * default to zcs1's template; giving one overrides it, and the command then says the shares are nonstandard.
+   */
+  private def shareTerms(a: Args): ShareTerms = {
     val auction = if (!a.flag("dutch")) {
       if (Seq("auction-opening", "auction-floor", "auction-length").exists(a.opt(_).isDefined))
         throw CliError("the auction options need --dutch")
       None
     } else Some(AuctionTerms(needPercent(a, "auction-opening"), needPercent(a, "auction-floor"),
       parseLong(a.need("auction-length"), "--auction-length")))
-    val decimals = a.opt("decimals").getOrElse("0")
-    if (Try(decimals.toInt).filter(d => d >= 0 && d <= 18).isFailure) throw CliError("--decimals takes 0 to 18")
-    ShareTerms(shares, parseErg(a.opt("pull-fee").getOrElse(DefaultShareFee)), parseErg(a.opt("mint-fee").getOrElse(DefaultShareFee)),
-      a.opt("share-name").getOrElse("SigmaFi bond shares"), a.opt("share-description").getOrElse("Shares of one SigmaFi ZC Standard bond"),
-      decimals, auction)
+    val decimals = a.opt("decimals")
+    if (decimals.exists(d => Try(d.toInt).filter(n => n >= 0 && n <= 18).isFailure)) throw CliError("--decimals takes 0 to 18")
+    ShareTerms(a.opt("shares").map(parseLong(_, "--shares")).getOrElse(StandardMetadata.ShareCount),
+      parseErg(a.opt("pull-fee").getOrElse(DefaultShareFee)), parseErg(a.opt("mint-fee").getOrElse(DefaultShareFee)),
+      a.opt("share-name"), a.opt("share-description"), decimals, auction)
   }
 
   private def market(a: Args): Market = a.opt("market").map(n => Market.named(n).getOrElse(
@@ -91,7 +96,7 @@ object ExchangeCommands {
       a.opt("price").map(Units.parse(_, m, "--price")))
     else FixedPrice(Units.parse(a.opt("price").getOrElse(throw CliError("give --price <total> or --nav")), m, "--price"))
     app.sell(one(a, "token id"), parseLong(a.need("amount"), "--amount"), m, price,
-      a.opt("min-fill").map(parseLong(_, "--min-fill")).getOrElse(1L), expiry(app, a),
+      a.opt("min-fill").map(parseLong(_, "--min-fill")), expiry(app, a),
       parseErg(a.opt("refund-fee").getOrElse(DefaultRefundFee)))
   }
 
@@ -104,8 +109,12 @@ object ExchangeCommands {
 
   private def offerSpec(app: StandardApp, a: Args): OfferSpec = {
     val m = market(a)
-    val delivery = a.opt("deliver-shares").map(n => OfferDelivery(shareTerms(a, Some(n))))
-    if (delivery.isEmpty && a.flag("dutch")) throw CliError("--dutch on an offer needs --deliver-shares <count>")
+    if (a.positional.nonEmpty)
+      throw CliError(s"create-offer takes no arguments, but was given ${a.positional.mkString(" ")}; " +
+        "--deliver-shares is a flag, and --shares <N> sets the count")
+    val delivery = if (a.flag("deliver-shares")) Some(OfferDelivery(shareTerms(a))) else None
+    if (delivery.isEmpty && (a.flag("dutch") || Seq("shares", "share-name", "share-description", "decimals").exists(a.opt(_).isDefined)))
+      throw CliError("share options on an offer need --deliver-shares")
     OfferSpec(m,
       capital = Units.parse(a.need("capital"), m, "--capital"),
       fees = if (m.token.isDefined) parseErg(a.opt("fees").getOrElse(DefaultOfferFees)) else 0L,
@@ -131,12 +140,15 @@ object ExchangeCommands {
     if (requests.isEmpty && vaults.isEmpty) println("No share requests or vaults.")
     requests.foreach { r =>
       println(s"Request ${r.box.id}  ${r.shares} shares of bond ${r.bondAsset}" + r.dutch.fold("")(m => s" (Dutch, $m)"))
+      println(s"  named '${r.metadata.headOption.map(StandardMetadata.text).getOrElse("")}'")
       println(s"  mint fee ${Fmt.erg(r.mintFee)}, pull fee ${Fmt.erg(r.pullFee)}: anyone may `mint-shares ${r.box.id}`")
+      metadataLine(app.requestMetadataIssues(r))
       if (app.isOwnHash(r.ownerHash)) println("  (your request)")
     }
     vaults.foreach { v =>
       println(s"Share ${v.shareId}  vault ${v.box.id}  (${if (v.dutch) "Dutch auction" else "fractional"})")
       println(s"  bond ${v.bondAsset}: ${v.outstanding} of ${v.n} shares outstanding")
+      metadataLine(app.shareMetadataIssues(v.shareId))
       val status =
         if (v.holding) "holds the bond unit; pull its settlement once the bond is repaid or liquidated"
         else if (v.auctionOpen) {
@@ -164,7 +176,9 @@ object ExchangeCommands {
     asks.foreach { a =>
       println(s"Ask ${a.box.id}  ${a.token.amount} of ${a.token.id}  (${if (a.nav) "NAV" else "fixed price"}, paid in ${a.market})")
       val price = Try(app.askPrice(a, a.token.amount)._1).toOption
+      val face = price.flatMap(p => app.faceBps(a.token.id, p, a.token.amount))
       println("  price:  " + price.fold("not fillable now (its bond is not live)")(p => s"${Units.amount(p, a.market)} for all") +
+        face.fold("")(f => s" (${Units.percent(f)} of face)") +
         (if (a.nav) s"; NAV ${if (a.margin >= 0) "+" else "-"}${Units.percent(a.margin.abs)}, ${a.wholeUnits} unit(s) per bond" else ""))
       println(s"  minimum fill ${a.minFill}; expires at height ${a.expiry}" +
         (if (app.height.toLong + 1L >= a.expiry) " (EXPIRED: anyone may refund-ask it)" else ""))
@@ -186,30 +200,41 @@ object ExchangeCommands {
       println(s"  oracle-rule bonds at a ratio of at least ${Units.percent(o.floorBps)}, oracle at most ${o.maxAge} blocks old")
       println(s"  batcher fee ${Fmt.erg(o.batcherFee)}; new-bond fee reserve ${Fmt.erg(o.feeReserve)}" +
         (if (o.terms(10) > 0L) s"; Dutch shares with a floor of at least ${Units.percent(o.terms(9))} and at most ${o.terms(10)} blocks" else ""))
-      if (o.delivers) println(s"  delivers bond units into ${o.fractional.headOption.getOrElse(0L)} shares" +
-        (if (o.fractional.size > 3) " with a Dutch auction" else ""))
+      if (o.delivers) {
+        println(s"  delivers bond units into ${o.fractional.headOption.getOrElse(0L)} shares" +
+          (if (o.fractional.size > 3) " with a Dutch auction" else "") +
+          s", named '${o.metadata.headOption.map(StandardMetadata.text).getOrElse("")}'")
+        metadataLine(app.offerMetadataIssues(o))
+      }
       println(s"  expires at height ${o.expiry}" + (if (app.height.toLong + 1L >= o.expiry) " (EXPIRED: anyone may refund-offer it)" else ""))
       if (app.isOwnHash(o.ownerHash)) println("  (your offer)")
     }
   }
 
-  /** List the work, or with --run do each piece, skipping any that would spend a box an earlier one spent. */
+  /** "metadata: zcs1", or what departs from it. */
+  private[standard] def metadataLine(issues: Seq[String]): Unit =
+    println(if (issues.isEmpty) "  metadata: zcs1" else s"  metadata: NONSTANDARD: ${issues.mkString("; ")}")
+
+  /**
+   * List the work, and with --run do it in rounds (StandardBatch.runBatch): refunds and liquidations packed into
+   * shared transactions, the rest one by one, and a fresh scan after each round so fills chain through an
+   * offer's continuation.
+   */
   private def batch(app: StandardApp, a: Args, run: String => Boolean): Unit = {
-    val work = app.batchable()
-    if (work.isEmpty) println("Nothing to batch.")
-    work.foreach(w => println(f"${Fmt.erg(w.reward)}%-14s ${w.summary}%n               ${w.command}"))
-    if (a.flag("run") && work.nonEmpty) {
-      val spent = scala.collection.mutable.Set.empty[String]
-      val done = work.filter { w =>
-        if (w.spends.exists(spent.contains)) false
-        else {
-          println(s"\n> ${w.command}")
-          val ok = run(w.command)
-          if (ok) spent ++= w.spends
-          ok
-        }
+    val scan = app.batchScan()
+    if (scan.work.isEmpty) println("Nothing to batch.")
+    scan.work.foreach(w => println(f"${Fmt.erg(w.reward)}%-14s ${w.summary}" + (if (w.packable) " (packs)" else "") +
+      f"%n               ${w.command}"))
+    if (scan.skipped.nonEmpty) {
+      println("\nPassed over:")
+      scan.skipped.foreach(s => println(s"  $s"))
+    }
+    if (a.flag("run") && scan.work.nonEmpty) {
+      val log = app.runBatch { command =>
+        println(s"\n> $command")
+        run(command)
       }
-      println(s"\n${done.size} of ${work.size} built" + (if (a.flag("send")) " and submitted." else "; run with --send to submit them."))
+      println(s"\n${log.count(_._2)} of ${log.size} built" + (if (a.flag("send")) " and submitted." else "; run with --send to submit them."))
     }
   }
 }

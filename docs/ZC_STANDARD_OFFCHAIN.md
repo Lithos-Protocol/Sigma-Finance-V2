@@ -5,7 +5,8 @@ client writes into the boxes it creates, how a batcher finds and serves work, an
 shows bonds and shares. This document is that off-chain part of the ZC Standard, versioned as profile
 `zcs1`. [SigmaBonds.MD](../SigmaBonds.MD) describes the contracts.
 
-Status: **draft**. The CLI follows only some of it so far; see "CLI status" at the end.
+Status: **draft**. The CLI follows all of it, specced offline in `StandardOffchainSpec`; nothing has
+run against a live node yet. See "CLI status" at the end.
 
 Three principles:
 
@@ -73,13 +74,14 @@ address, variable 64 is left out.
    `/blockchain/transaction/byId/{txId}` on the indexed node, or
    `/transactions/unconfirmed/byTransactionId/{txId}` for one still in the mempool. Match the hash
    against variable 64 in `INPUTS(0)`'s `spendingProof.extension`, then against every input's and
-   output's `ergoTree`.
+   output's `ergoTree`. Writers always use `INPUTS(0)`; a reader may accept variable 64 on any input,
+   as the CLI does.
 3. Nothing else. A box whose script is not found this way breaks the rule, and batchers skip it.
 
 **Reserved variables.** Context variables 64 to 127 are reserved for off-chain data. No standard
 contract or expression reads them, and new ones must not.
 
-This replaces the borrower-tree hint the CLI writes in an order's R8, and the CLI's walk back through
+This replaced the borrower-tree hint the CLI used to write in an order's R8, and its walk back through
 up to 64 earlier transactions. The walk's cost grew with every partial fill. A lend offer that
 delivers shares never pays an output to its owner, so its owner's script was found only by walking
 back to where the offer was posted.
@@ -141,7 +143,8 @@ the chain, not the description.
 | Shares, bond unknown | `zcs1 shares: 1.000000 = one {market} bond.{auction} Verify on chain.` |
 
 - `{rule}` is `liquidates at maturity` for `MaturityLiquidation`, `liquidates below {ratio}% or at
-  maturity` for an oracle rule, and `liquidation rule {first 8 hex of its hash}` for any other.
+  maturity` for an oracle rule with a ratio (borrower value 7), and `liquidation rule {first 8 hex of
+  its hash}` for any other.
 - `{auction}` is empty for standard shares, and for Dutch shares
   ` If liquidated, auctioned from {opening}% to {floor}% of the repayment over {length} blocks.`
 - Example, about 120 bytes: `zcs1 bond: repays 105 SigUSD at height 1733600; lent 100 at height
@@ -240,16 +243,19 @@ Series pools are the later on-chain version of the same idea: a pool can require
 A batcher following this profile:
 
 - **Packs independent work into one transaction** where the contracts allow it. Each input reads its
-  own context variables, so expiry refunds of orders, offers and asks, liquidations, and probably
-  pulls can share one transaction, one miner fee and one change box. Share mints and new-order fills
-  cannot: each mints the id of `INPUTS(0)`, and a transaction mints only one token. Two lend offers
-  never share a transaction. Packed transactions are not yet specced.
+  own context variables, so expiry refunds of orders, offers and asks and liquidations share one
+  transaction, one miner fee and one change box (the CLI's `pack`, at most 20 boxes; specced). Pulls
+  probably can too, but are not packed yet. Share mints and new-order fills cannot: each mints the id
+  of `INPUTS(0)`, and a transaction mints only one token. Two lend offers never share a transaction.
 - **Counts fees per transaction.** Work is worth running when the fees it collects exceed the miner
   fee. Then a 0.002 ERG fee is worth collecting as part of a packed transaction even though it barely
-  covers a transaction of its own.
+  covers a transaction of its own. A pack that fails is retried piece by piece, for the pieces that
+  pay their own miner fee.
 - **Chains through continuations.** An offer that can take three orders needs three transactions,
-  each spending the last one's continuation. The batcher builds on its own unconfirmed outputs, so
-  all three can land in one block.
+  each spending the last one's continuation. The batcher runs in rounds, scanning again after each,
+  and reads the mempool: unspent listings with `includeUnconfirmed=true&excludeMempoolSpent=true`,
+  a box by id from `/utxo/withPool/byId/{boxId}`, and wallet boxes with `minConfirmations=-1`. So
+  all three can land in one block. It never builds on a box it has already spent.
 - **Uses a fixed matching order.** Offers are taken by batcher fee, highest first. Each takes the order
   or ask that gives it the highest yield, `(R / P − 1) × 262800 / D`. Ties go to the lower box id. No
   contract enforces this, but every batcher following the profile behaves the same way.
@@ -307,20 +313,25 @@ floor, an ask's price or `--nav`, and a Dutch auction's opening, floor and lengt
 1. Confirm on a live indexed node that `/blockchain/transaction/byId` returns each input's
    `spendingProof.extension`. The node renders inputs as indexed boxes with their `spendingProof`, and
    sigma's JSON codecs write `proofBytes` and `extension`, but neither has been checked against a live
-   node.
+   node. The offline specs render it with the same codec.
 2. Confirm that browser wallets (EIP-12) keep context extensions on the user's own inputs when they
-   sign, so a dApp can write variable 64.
-3. Specs for packed transactions: several refunds, liquidations or pulls in one transaction.
-4. Check how wallets show the supply of a bond unit (3, issued across two outputs) and of shares (2N+1).
+   sign, so a dApp can write variable 64. The node wallet's `/wallet/transaction/sign` takes them.
+3. Confirm the mempool lookups on a live node: the parameter names come from the node's source
+   (`BlockchainApiRoute`, `UtxoApiRoute`, `WalletApiRoute`), but whether the wallet's
+   `minConfirmations=-1` also leaves out boxes spent in the mempool was not established. The CLI also
+   remembers what its own session spent.
+4. Specs for packing pulls, and for several refunds or liquidations of one owner in a single
+   transaction, in the contract harness.
+5. Check how wallets show the supply of a bond unit (3, issued across two outputs) and of shares (2N+1).
 
 ## CLI status
 
-| Rule | The CLI today |
+| Rule | The CLI |
 |---|---|
-| Script disclosure | Not written. Orders carry the borrower's tree in R8; other boxes are resolved by walking back up to 64 transactions. |
-| Bond metadata | Name `SigmaFi-ZCS-{id6}`; a JSON description of about 500 bytes plus about 85 per collateral token |
-| Share metadata | `SigmaFi bond shares` and `Shares of one SigmaFi ZC Standard bond`, decimals 0 unless `--decimals` |
-| Share count | Required: `--shares` or `--deliver-shares` |
-| Maturity grid | None |
-| Batching | One piece of work per transaction; each fee must exceed the miner fee; the first match found is taken |
+| Script disclosure | Every transaction it builds discloses, in variable 64 of `INPUTS(0)`, each script its outputs name that no input or output carries; a summary line says so. It resolves a script in one lookup, keeps what it found for the session, and refuses or passes over a box that does not disclose. Orders no longer carry the R8 hint. |
+| Bond metadata | The zcs1 template on every fill, by a wallet or a matched offer. `bonds` prints `metadata: zcs1` or what departs from it. |
+| Share metadata | The zcs1 template: with the bond for `fractionalize`, without it for an offer's delivery. `--share-name`, `--share-description` and `--decimals` override it and are flagged NONSTANDARD. `shares` and `offers` check every request, vault and offer. |
+| Share count | 1,000,000 by default (`--shares` overrides, flagged). `create-offer --deliver-shares` is a flag. `asks` quotes a percentage of face; a share ask's `--min-fill` defaults to the least lot; a partial claim warns when an asset rounds to nothing. |
+| Maturity grid | `create-order --maturity` and `--term` snap to the grid; `--exact-maturity` keeps the height. |
+| Batching | `pack` for refunds and liquidations; `batch --run` packs, ranks offers and their sources, and runs up to 5 rounds with mempool lookups. `--mempool` turns those lookups on for any command. |
 | Defaults | As in the table above |

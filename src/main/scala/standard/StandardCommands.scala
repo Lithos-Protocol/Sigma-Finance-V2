@@ -48,7 +48,14 @@ object StandardCommands {
       throw CliError("a ZC Standard loan is lent in its market's asset: use --market SigUSD --principal <amount>")
     val market = a.opt("market").map(n => Market.named(n).getOrElse(
       throw CliError(s"unknown market $n; known: ${Market.all.mkString(", ")}"))).getOrElse(Market.Erg)
-    val schedule = SigmaFiCli.schedule(a, app.height)
+    // zcs1: a fixed maturity snaps to the 21,600-block grid unless --exact-maturity keeps it.
+    val asked = SigmaFiCli.schedule(a, app.height)
+    val schedule = asked match {
+      case FixedMaturity(h) if !a.flag("exact-maturity") => FixedMaturity(StandardProtocol.snapMaturity(h, app.height.toLong))
+      case other =>
+        if (a.flag("exact-maturity") && other.isInstanceOf[OnClose]) throw CliError("--exact-maturity needs --maturity or --term")
+        other
+    }
     val rule = a.opt("liquidation").getOrElse("maturity").toLowerCase match {
       case "maturity" =>
         if (a.opt("ratio").isDefined || a.opt("oracle-age").isDefined)
@@ -73,7 +80,11 @@ object StandardCommands {
       collateralErg = parseErg(a.need("collateral-erg")),
       collateralTokens = a.opts("collateral-token").map(parseToken),
       schedule = schedule, rule = rule, expiry = expiry,
-      expiryFee = parseErg(a.opt("expiry-fee").getOrElse(DefaultExpiryFee)))
+      expiryFee = parseErg(a.opt("expiry-fee").getOrElse(DefaultExpiryFee)),
+      requestedMaturity = asked match {
+        case FixedMaturity(h) => Some(h)
+        case OnClose(_) => None
+      })
   }
 
   /** "150" or "150.5" percent as basis points. */
@@ -158,6 +169,7 @@ object StandardCommands {
         println("  recollateralize: " + (if (next >= b.recollateralizableFrom) "open now"
           else s"from height ${b.recollateralizableFrom}"))
       if (!app.originVerified(b)) println("  WARNING: its asset was not minted by a standard order: this box proves nothing")
+      else ExchangeCommands.metadataLine(app.bondMetadataIssues(b.asset))
       if (app.isOwnHash(b.borrowerHash)) println("  (you are its borrower)")
       if (app.walletAvailable && app.walletHolds(b.asset)) println("  (you hold its bond asset)")
     }

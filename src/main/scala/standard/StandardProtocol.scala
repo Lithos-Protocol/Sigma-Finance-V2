@@ -249,6 +249,22 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
   def nameOf(tree: ErgoTree): Option[String] =
     contracts.entries.find(e => !e.expression && sameTree(tree, e.contract.ergoTree)).map(e => s"ZC_Standard_${e.label}")
 
+  /** Whether a script is one of the share mint requests: ZC_Standard_FractionalMint or a Dutch mint. */
+  def isShareMint(tree: ErgoTree): Boolean =
+    sameTree(tree, contracts.fractionalMint.ergoTree) || marketWhere(tree, _.dutchMint).isDefined
+
+  /**
+   * The register in which a box under `tree` names a script by its hash, which zcs1 script disclosure
+   * covers: an order's borrower (R6), a bond's borrower (R5), a lend offer's owner and an ask's seller (R4),
+   * and a share mint request's owner (R7).
+   */
+  def namedScriptRegister(tree: ErgoTree): Option[Int] =
+    if (orderMarket(tree).isDefined) Some(6)
+    else if (bondMarket(tree).isDefined) Some(5)
+    else if (Seq[MarketContracts => Contract](_.offer, _.saleOrder, _.navAsk).exists(marketWhere(tree, _).isDefined)) Some(4)
+    else if (isShareMint(tree)) Some(7)
+    else None
+
   // ─── oracle ──────────────────────────────────────────────────────────────
 
   /** The oracle pool's state, from boxes holding its NFT: exactly one, holding exactly one unit. */
@@ -289,4 +305,18 @@ object StandardProtocol {
 
   /** The floor every standard batching fee shares on-chain: 0.002 ERG. */
   val MinBatchingFee: Long = 2000000L
+
+  /** zcs1's maturity grid: fixed maturities are multiples of 21,600 blocks, about 30 days of 2-minute blocks. */
+  val MaturityGrid: Long = 21600L
+
+  /**
+   * The grid height nearest `target` that still lies more than 2 blocks above `height`, so an order made now
+   * can be filled; a tie goes to the later height.
+   */
+  def snapMaturity(target: Long, height: Long): Long = {
+    val below = Math.floorDiv(target, MaturityGrid) * MaturityGrid
+    Seq(below, below + MaturityGrid, below + 2 * MaturityGrid)
+      .filter(_ > height + 2L)
+      .minBy(g => (math.abs(g - target), -g))
+  }
 }

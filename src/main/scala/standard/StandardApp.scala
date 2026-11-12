@@ -1,7 +1,6 @@
 package ksingh.sigmabonds
 package standard
 
-import io.circe.Json
 import ksingh.sigmabonds.app.Protocol._
 import ksingh.sigmabonds.app._
 import org.ergoplatform.appkit.{BlockchainContext, ErgoValue}
@@ -24,20 +23,29 @@ case class OracleChoice(ratioBps: Long, maxAge: Long) extends RuleChoice
  */
 case class StdLoan(market: Market, principal: Long, repayment: Long, collateralErg: Long,
                    collateralTokens: Seq[Token], schedule: Schedule, rule: RuleChoice,
-                   expiry: Long, expiryFee: Long)
+                   expiry: Long, expiryFee: Long, requestedMaturity: Option[Long] = None)
 
 /**
  * The ZC Standard set over a single Ergo node: the CLI's default commands. It builds with the pinned trees
  * (`StandardPins`), never with a fresh compile. Boxes come from the node's extra index, keys and signatures
- * from its wallet; protocol inputs sit at the positions their contracts read, wallet boxes after them.
+ * from its wallet; protocol inputs sit at the positions their contracts read, wallet boxes after them. Every
+ * transaction follows the zcs1 off-chain rules (docs/ZC_STANDARD_OFFCHAIN.md).
  */
 class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, out: String => Unit = println,
-                  val protocol: StandardProtocol = new StandardProtocol())
-  extends AppBase(ctx, node, settings, out) with StandardShares with StandardAsks with StandardOffers with StandardBatch {
+                  val protocol: StandardProtocol = new StandardProtocol(), scripts: ScriptBook = new ScriptBook)
+  extends AppBase(ctx, node, settings, out, scripts)
+    with StandardShares with StandardAsks with StandardOffers with StandardBatch {
 
   import StandardProtocol._
 
   protected def nameOf(tree: ErgoTree): Option[String] = protocol.nameOf(tree)
+
+  /** The borrower, owner or seller hash in each output's named-script register. */
+  override protected def namedScripts(outputs: Seq[UTXO]): Seq[Array[Byte]] =
+    outputs.flatMap { o =>
+      protocol.namedScriptRegister(o.contract.ergoTree).flatMap(r => o.registers.lift(r - 4))
+        .flatMap(v => Try(v.getValue.asInstanceOf[sigma.Coll[Byte]].toArray).toOption).filter(_.length == 32)
+    }
 
   // ═══ LOOKING AROUND ═══════════════════════════════════════════════════════
 
@@ -64,11 +72,54 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
         Try(NodeJson.box(json)).toOption.exists(o => sameTree(o.input.getErgoTree, protocol.market(bond.market).order.ergoTree))
     }
 
+  /**
+   * A bond asset's bond as its terms stand: the live bond, or once settled, the bond box the settlement
+   * names (spent, read from the index). None when neither is found.
+   */
+  def bondRecord(asset: ErgoId): Option[StdBond] = {
+    val holders = decoded(node.unspentByTokenId(asset.toString)).filter(_.tokens.headOption.contains(Token(asset, 2L)))
+    holders.flatMap(protocol.asBond).headOption.orElse {
+      holders.flatMap(protocol.asSettlement).headOption.flatMap { s =>
+        node.boxById(Base16.encode(s.bondId)).flatMap(j => Try(NodeJson.box(j)).toOption).flatMap(protocol.asBond)
+      }
+    }
+  }
+
+  /**
+   * How a bond unit's metadata departs from zcs1: the fill's OUTPUTS(0) is the issuing box and OUTPUTS(1) the
+   * first bond, so one lookup of the fill rebuilds the expected bytes. Also flags R7 to R9 set on an issuing
+   * box that is not a share mint request. Empty when it matches.
+   */
+  def bondMetadataIssues(asset: ErgoId): Seq[String] = {
+    val fill = node.boxById(asset.toString).flatMap(NodeJson.spentBy).flatMap(node.transactionById)
+    val outputs = fill.toSeq.flatMap(_.hcursor.downField("outputs").focus.flatMap(_.asArray).getOrElse(Vector.empty))
+      .flatMap(j => Try(NodeJson.box(j)).toOption)
+    (outputs.lift(0), outputs.lift(1).flatMap(protocol.asBond)) match {
+      case (Some(issuing), Some(first)) =>
+        val expected = StandardMetadata.bond(StandardMetadata.BondFacts.of(first, protocol.ruleOf(first.liqHash)))
+        metadataIssues(issuing, expected, Seq(expected)) ++
+          (if (!protocol.isShareMint(issuing.input.getErgoTree) && issuing.registers.size > 3)
+            Seq("its issuing box sets R7 to R9, which zcs1 leaves empty") else Seq.empty)
+      case _ => Seq("cannot read the fill that minted it")
+    }
+  }
+
+  /** Where `box`'s R4 to R6 differ from every one of `allowed`, described against `expected`. */
+  private[standard] def metadataIssues(box: InputUTXO, expected: Seq[String], allowed: Seq[Seq[String]]): Seq[String] = {
+    val found = (4 to 6).map(r => bytesReg(box, r).map(StandardMetadata.text))
+    if (allowed.exists(a => found == a.map(Some(_)))) Seq.empty
+    else Seq("name", "description", "decimals").zip(found).zip(expected).collect {
+      case ((field, actual), want) if !actual.contains(want) =>
+        val is = actual.fold("missing")(a => "'" + a.take(60) + "'")
+        s"its $field is $is, not zcs1's '${want.take(60)}'"
+    }
+  }
+
   // ═══ BORROWER ═════════════════════════════════════════════════════════════
 
   /**
-   * The collateral, under the market's order. R4 to R7 are the terms the bond will copy; R8 hints this
-   * wallet's ErgoTree, which no contract reads, so a lender can pay the principal without asking for it.
+   * The collateral, under the market's order. R4 to R7 are the terms the bond will copy. The wallet funds it,
+   * so the transaction discloses the borrower's script (zcs1): a lender pays the principal without asking.
    */
   def createOrder(loan: StdLoan): Prepared = {
     val m = loan.market
@@ -101,13 +152,15 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
     val terms = Seq(loan.repayment, principalErg, floor, maturityTerm, loan.expiry, loan.expiryFee, mode) ++ payload
     val order = UTXO(protocol.market(m).order, addAmount(loan.collateralErg, loan.expiryFee), loan.collateralTokens,
       Seq(longsValue(terms: _*), tokensValue(principalTokens), bytesValue(hashOf(myTree)),
-        bytesValue(rule.hashedValueBytes), treesValue(myTree)))
+        bytesValue(rule.hashedValueBytes)))
 
     val notes = Seq(
       s"borrow: ${Units.amount(loan.principal, m)}; repay ${Units.amount(loan.repayment, m)}",
       s"collateral: ${Fmt.contents(loan.collateralErg, loan.collateralTokens)}",
       loan.schedule match {
-        case FixedMaturity(h) => s"maturity: height $h (${h - height} blocks from now)"
+        case FixedMaturity(h) => s"maturity: height $h (${h - height} blocks from now)" +
+          loan.requestedMaturity.filter(_ != h).fold("")(r => s", the zcs1 grid height nearest the $r asked for " +
+            "(--exact-maturity keeps an exact height)")
         case OnClose(d) => s"maturity: $d blocks after a lender fills it"
       },
       "liquidation: " + (loan.rule match {
@@ -133,15 +186,7 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
    */
   def refundOrder(orderId: String): Prepared = {
     val order = protocol.asOrder(unspent(orderId)).getOrElse(fail(s"$orderId is not a ZC Standard order"))
-    if (height.toLong + 1L < order.expiry) fail(s"the order expires at height ${order.expiry}; it can be refunded from then on")
-    if (order.expiryFee < MinBatchingFee || order.expiryFee > order.box.value - MinBox)
-      fail("the order's expiry fee is outside its contract's bounds, so only its borrower can cancel it")
-    val borrower = borrowerTree(order.borrowerHash, order.box, treesReg(order.box, 8))
-    val refund = UTXO(Contract(borrower), order.box.value - order.expiryFee, order.collateral,
-      Seq(bytesValue(order.box.id.getBytes)))
-    prepare(s"Refund order $orderId", plan(Seq(order.box.withCtxVar(0.toByte, intValue(0))), Seq(refund)),
-      Seq(s"returns ${Fmt.contents(refund.value, refund.tokens)} to the borrower; you keep the " +
-        s"${Fmt.erg(order.expiryFee)} expiry fee, less the miner fee"))
+    packed(s"Refund order $orderId", Seq(orderRefund(order)))
   }
 
   /**
@@ -164,12 +209,10 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
     }
     val start = height.toLong
     val maturity = if (order.onClose) addAmount(start, order.terms(3)) else order.terms(3)
-    val borrower = borrowerTree(order.borrowerHash, order.box, treesReg(order.box, 8))
+    val borrower = borrowerTree(order.borrowerHash, order.box)
     val asset = order.box.id
 
-    val unit = UTXO(Contract(myTree), MinBox, Seq(Token(asset, 1L)),
-      Seq(utf8Value(StandardMetadata.name(asset)),
-        utf8Value(StandardMetadata.description(order, rule, start, maturity, feeReserve)), utf8Value("0")))
+    val unit = UTXO(Contract(myTree), MinBox, Seq(Token(asset, 1L)), bondMetadata(order, rule, start, maturity))
     // The order pins the bond's creation height to its start: the recollateralize wait counts from it.
     val bond = UTXO(protocol.market(m).bond, addAmount(order.collateralErg, feeReserve),
       Token(asset, 2L) +: order.collateral,
@@ -187,6 +230,11 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
       s"Your bond asset is $asset. Claim the bond's payout with `claim $asset`.")
     prepare(s"Fill order $orderId", plan(Seq(order.box), Seq(unit, bond, principal), minted = Some(asset)), notes)
   }
+
+  /** A new bond unit's zcs1 metadata, as EIP-4 registers, from the order and the fill's heights. */
+  private[standard] def bondMetadata(order: StdOrder, rule: LiquidationRule, start: Long, maturity: Long): Seq[ErgoValue[_]] =
+    StandardMetadata.bond(StandardMetadata.BondFacts(order.market, order.box.id, order.principal, order.repayment,
+      start, maturity, StandardMetadata.ruleText(Some(rule), order.payload, order.liqHash))).map(utf8Value)
 
   /** The fill's own checks, so a lender learns why before the node refuses. */
   private[standard] def checkOrder(o: StdOrder): Unit = {
@@ -227,7 +275,7 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
     val bond = liveBond(bondId)
     val m = bond.market
     if (height.toLong + 1L >= bond.maturity) fail(s"the bond matures at height ${bond.maturity}: repayment is closed")
-    val borrower = borrowerTree(bond.borrowerHash, bond.box, originHints(bond))
+    val borrower = borrowerTree(bond.borrowerHash, bond.box)
 
     val tag = Seq(bytesValue(bond.box.id.getBytes), ErgoValue.of(0.toByte))
     val settlement = m.token match {
@@ -307,37 +355,8 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
    */
   def liquidate(bondIds: Seq[String]): Prepared = {
     if (bondIds.isEmpty) fail("name at least one bond box id")
-    val bonds = bondIds.distinct.map(liveBond)
-    lazy val price = oracle().getOrElse(fail("the node's index has no single USD oracle pool box"))
-    var needsOracle = false
-    val rules = bonds.map { b =>
-      val rule = protocol.ruleOf(b.liqHash).getOrElse(fail(s"bond ${b.box.id} names a liquidation expression this client does not know"))
-      val matured = height.toLong + 1L >= b.maturity
-      rule match {
-        case AtMaturity(_) if !matured => fail(s"bond ${b.box.id} matures at height ${b.maturity}; it can be liquidated from then on")
-        case OracleRatio(_, _) if !matured =>
-          if (b.payload.size < 2) fail(s"bond ${b.box.id} has no oracle terms; it can be liquidated from maturity, height ${b.maturity}")
-          val (ratio, age) = (b.payload(0), b.payload(1))
-          if (height.toLong + 1L - price.created > age)
-            fail(s"the oracle price is from height ${price.created}, older than bond ${b.box.id} accepts ($age blocks)")
-          val below = protocol.cover(b, price.price).exists { case (c, d) => c * 10000 < d * ratio }
-          if (!below) fail(s"bond ${b.box.id} is at ${protocol.ratioBps(b, price.price).fold("?")(Units.percent)}, " +
-            s"not below its ${Units.percent(ratio)}; it can be liquidated at maturity, height ${b.maturity}")
-          needsOracle = true
-        case _ =>
-      }
-      rule
-    }
-    val inputs = bonds.zip(rules).zipWithIndex.map { case ((b, rule), i) =>
-      b.box.withCtxVar(0.toByte, bytesValue(rule.expression.valueBytes)).withCtxVar(1.toByte, intValue(i))
-    }
-    val outputs = bonds.map(b => UTXO(protocol.contracts.vault, b.box.value - b.feeReserve, b.box.tokens,
-      Seq(bytesValue(b.box.id.getBytes), ErgoValue.of(1.toByte))))
-    val notes = Seq(s"${bonds.size} bond(s); fee reserves total ${Fmt.erg(bonds.map(_.feeReserve).sum)}, less the " +
-      "miner fee, to this wallet") ++ (if (needsOracle) Seq(s"oracle price: ${price.price} nanoERG per USD, " +
-      s"from height ${price.created}") else Seq.empty)
-    prepare(s"Liquidate ${bonds.size} bond(s)",
-      plan(inputs, outputs, dataInputs = if (needsOracle) Seq(price.box) else Seq.empty), notes)
+    val pieces = bondIds.distinct.map(id => liquidation(liveBond(id)))
+    packed(s"Liquidate ${pieces.size} bond(s)", pieces)
   }
 
   // ═══ HELPERS ══════════════════════════════════════════════════════════════
@@ -345,33 +364,23 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
   private[standard] def liveBond(bondId: String): StdBond =
     protocol.asBond(unspent(bondId)).getOrElse(fail(s"$bondId is not a live ZC Standard bond"))
 
-  /** The order the bond came from carries the borrower's tree in R8, when a client like this one made it. */
-  private[standard] def originHints(bond: StdBond): Seq[ErgoTree] =
-    node.boxById(bond.asset.toString).flatMap(j => Try(NodeJson.box(j)).toOption).toSeq.flatMap(treesReg(_, 8))
+  private[standard] def borrowerTree(hash: Array[Byte], box: InputUTXO): ErgoTree = scriptOf(hash, box, "borrower")
 
-  private[standard] def borrowerTree(hash: Array[Byte], box: InputUTXO, hints: Seq[ErgoTree]): ErgoTree =
-    treeFor(hash, box, hints).getOrElse(fail("cannot find the borrower's ErgoTree: no hint, wallet address or box " +
-      "in the transaction that created this box hashes to the borrower hash"))
+  private[standard] def ownerTree(hash: Array[Byte], box: InputUTXO, who: String): ErgoTree = scriptOf(hash, box, who)
 
   /**
-   * The ErgoTree an owner or seller hash commits to. As `treeFor`, and when the box's creating transaction
-   * holds no such tree, back through the boxes it was made from: an earlier state of the same contract (an
-   * offer or ask continuation), or a box naming the same hash in R4 (the offer that delivered a mint
-   * request). The first state was funded from the owner's own address, so the walk ends there.
+   * The script a box names by hash, found as zcs1 script disclosure promises: in one lookup of the
+   * transaction that created the box (see `treeFor`). A box that does not disclose it cannot be served by
+   * anyone but `who`, whose own wallet knows it.
    */
-  private[standard] def ownerTree(hash: Array[Byte], box: InputUTXO, who: String, depth: Int = 64): ErgoTree = {
-    def step(current: InputUTXO, left: Int): Option[ErgoTree] =
-      treeFor(hash, current, Seq.empty).orElse {
-        if (left <= 0) None
-        else node.transactionById(current.input.getTransactionId).flatMap { tx =>
-          tx.hcursor.downField("inputs").focus.flatMap(_.asArray).getOrElse(Vector.empty)
-            .flatMap(j => Try(NodeJson.box(j)).toOption)
-            .find(b => sameTree(b.input.getErgoTree, current.input.getErgoTree) || bytesReg(b, 4).exists(_.sameElements(hash)))
-            .flatMap(step(_, left - 1))
-        }
-      }
-    step(box, depth).getOrElse(fail(s"cannot find the $who's ErgoTree from this wallet or the box's history"))
-  }
+  private[standard] def scriptOf(hash: Array[Byte], box: InputUTXO, who: String): ErgoTree =
+    treeFor(hash, box, Seq.empty).getOrElse(fail(s"box ${box.id} does not disclose its $who's script (zcs1 script " +
+      s"disclosure): its creating transaction neither carries it in context variable ${DisclosureVar.toInt} nor " +
+      s"spends from or pays to it, so only the $who can act on it"))
+
+  /** Whether `box` discloses the script `hash` names, so a batcher can serve it. */
+  private[standard] def discloses(hash: Array[Byte], box: InputUTXO): Boolean =
+    Try(treeFor(hash, box, Seq.empty)).toOption.flatten.isDefined
 
   def describeRule(rule: LiquidationRule, payload: Seq[Long]): String = rule match {
     case AtMaturity(_) => "at maturity"
@@ -396,29 +405,4 @@ object Units {
   }
 
   def percent(bps: Long): String = (BigDecimal(bps) / 100).bigDecimal.stripTrailingZeros.toPlainString + "%"
-}
-
-/** EIP-4 display metadata for a standard bond unit. Protocol verification never trusts it. */
-object StandardMetadata {
-  def name(asset: ErgoId): String = "SigmaFi-ZCS-" + asset.toString.take(6)
-
-  def description(order: StdOrder, rule: LiquidationRule, start: Long, maturity: Long, feeReserve: Long): String = {
-    def contents(value: Long, tokens: Seq[Token]): Json = Json.obj(
-      "nanoErgs" -> Json.fromLong(value),
-      "tokens" -> Json.fromValues(tokens.map(t => Json.obj("id" -> Json.fromString(t.id.toString), "amount" -> Json.fromLong(t.amount)))))
-    Json.obj(
-      "type" -> Json.fromString("SigmaFi ZC Standard bond"),
-      "bondAsset" -> Json.fromString(order.box.id.toString),
-      "market" -> Json.fromString(order.market.name),
-      "principal" -> Json.fromLong(order.principal),
-      "repayment" -> Json.fromLong(order.repayment),
-      "start" -> Json.fromLong(start),
-      "maturity" -> Json.fromLong(maturity),
-      "collateral" -> contents(order.collateralErg, order.collateral),
-      "feeReserve" -> Json.fromLong(feeReserve),
-      "liquidation" -> Json.fromString(rule.name),
-      "liquidationTerms" -> Json.fromValues(order.payload.take(2).map(Json.fromLong)),
-      "liquidationHash" -> Json.fromString(Base16.encode(order.liqHash)),
-      "borrowerHash" -> Json.fromString(Base16.encode(order.borrowerHash))).noSpaces
-  }
 }

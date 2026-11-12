@@ -68,28 +68,33 @@ sbt "runMain ksingh.sigmabonds.app.SigmaFiCli help"
 `src/main/resources/zc-standard/contracts.tsv`, never from a fresh compile.
 - Look around: `info`, `orders`, `bonds` (oracle ratios, recollateralize timing, and whether each bond
   asset was really minted by a standard order), `claims`
-- Borrower: `create-order` (ERG or SigUSD market; maturity or oracle-ratio liquidation),
-  `cancel-order`, `repay [--from-collateral]`, `recollateralize`
+- Borrower: `create-order` (ERG or SigUSD market; maturity or oracle-ratio liquidation; a fixed
+  maturity snaps to the 21,600-block grid unless `--exact-maturity`), `cancel-order`,
+  `repay [--from-collateral]`, `recollateralize`
 - Lender: `fill-order [--fee-reserve <ERG>]` (CLI minimum and default 0.05 ERG), `claim`
-- Anyone: `liquidate`, which keeps the bonds' fee reserves, and `refund-order`, which returns an expired
-  order to its borrower for its expiry fee
+- Anyone: `liquidate`, which keeps the bonds' fee reserves, `refund-order`, which returns an expired
+  order to its borrower for its expiry fee, and `pack`, which refunds expired orders, offers and asks
+  and liquidates bonds in one transaction with one miner fee
 - Shares: `shares`, `fractionalize` (fractional, or `--dutch` with an auction of a liquidated bond's
   collateral), `mint-shares` and `pull` (anyone, for the fees the owner committed), `buy-lot` (anyone,
   at an open auction's current price), `claim-shares`, `cancel-share-request`
-- Asks: `asks`, `sell` (a fixed `--price`, or `--nav` at a bond's accrued value plus a margin), `buy`,
-  `cancel-ask`, `refund-ask`
+- Asks: `asks` (prices also as a percentage of face), `sell` (a fixed `--price`, or `--nav` at a bond's
+  accrued value plus a margin), `buy`, `cancel-ask`, `refund-ask`
 - Lend offers: `offers`, `create-offer` (a yearly yield, a maturity window, a collateral floor, and
-  optionally delivery into fractional or Dutch shares), `cancel-offer`, `refund-offer`, and
+  optionally `--deliver-shares` into fractional or Dutch shares), `cancel-offer`, `refund-offer`, and
   `match-offer --order | --ask`, which anyone runs for the offer's batcher fee. An offer's policy buys
   only bonds with the oracle liquidation rule, since it measures their collateral at the oracle price.
-- `batch` lists every mint, pull, expiry refund, liquidation and offer match that pays its runner more
-  than the miner fee, with the command for each; `batch --run` builds them all, skipping any that would
-  spend a box an earlier one spent, and submits them with `--send`
+- `batch` lists every mint, pull, expiry refund, liquidation and offer match that pays its runner, and
+  any box it passes over because it does not disclose a script it names; `batch --run` does the work
+  in rounds, packing refunds and liquidations, matching each offer to its best-yield source, and
+  scanning again with mempool lookups so fills chain through an offer's continuation. `--send` submits.
 
-`create-order` writes an R8 hint that no contract reads: the borrower's ErgoTree, whose hash is an
-order term, so any lender can pay the principal without asking for it. A fill mints three bond-asset
-units, two in the bond and one for the lender, named `SigmaFi-ZCS-<first6>` with the loan's terms as
-EIP-4 JSON. `help` lists every option.
+Every transaction follows the zcs1 off-chain rules in
+[docs/ZC_STANDARD_OFFCHAIN.md](./docs/ZC_STANDARD_OFFCHAIN.md). It discloses each script its boxes name
+by hash in context variable 64, unless an input or output already carries it, so any batcher can pay
+it. A fill names the lender's bond unit `ZCS-<market>-B-<maturity>-<first6>`, with a one-sentence
+description. Shares default to 1,000,000 with 6 decimals and a zcs1 name. The listings flag anything
+nonstandard. `help` lists every option.
 
 **First generation, with `--old`.** `info`, `orders`, `bonds`, `claims`, `fill-order [--batching-fee
 <ERG>]`, `claim`, `cancel-order`, `repay` and `liquidate`, as before, for first-generation boxes. Those

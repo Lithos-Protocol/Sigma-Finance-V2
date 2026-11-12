@@ -188,6 +188,12 @@ object Protocol {
   /** Every protocol output that holds a token or registers carries at least this: 0.001 ERG. */
   final val MinBox: Long = Parameters.MinChangeValue
 
+  /**
+   * zcs1 script disclosure: the context variable, on INPUTS(0), holding the ErgoTrees of scripts the
+   * transaction's outputs name by hash. Variables 64 to 127 are reserved for off-chain data.
+   */
+  final val DisclosureVar: Byte = 64
+
   def hashOf(tree: ErgoTree): Array[Byte] = Blake2b256.hash(tree.bytes)
   def templateHash(tree: ErgoTree): Array[Byte] = Blake2b256.hash(tree.template)
   def sameTree(a: ErgoTree, b: ErgoTree): Boolean = java.util.Arrays.equals(a.bytes, b.bytes)

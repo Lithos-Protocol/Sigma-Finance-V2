@@ -4,7 +4,7 @@ package specs.app
 import io.circe.Json
 import ksingh.sigmabonds.app.{NodeApi, NodeJson}
 import org.ergoplatform.ErgoBox
-import org.ergoplatform.appkit.impl.InputBoxImpl
+import org.ergoplatform.appkit.impl.{InputBoxImpl, SignedTransactionImpl}
 import org.ergoplatform.appkit.{ErgoProver, SignedTransaction, UnsignedTransaction}
 import org.ergoplatform.wallet.serialization.JsonCodecsWrapper
 import scorex.crypto.hash.Blake2b256
@@ -14,26 +14,34 @@ import scala.collection.JavaConverters._
 import scala.collection.mutable
 
 /**
+ * A transaction the chain recorded: its input boxes, each input's `spendingProof` as the node renders it
+ * (context extension included; empty for a seeded transaction), and its outputs.
+ */
+case class FakeTx(inputs: Seq[ErgoBox], outputs: Seq[ErgoBox], proofs: Seq[Json] = Seq.empty)
+
+/**
  * An in-memory chain with an extra index: a UTXO set, the boxes it has spent and the transactions that
  * did, fed by the transactions a spec signs.
  */
 class FakeChain {
   val unspent: mutable.LinkedHashMap[String, ErgoBox] = mutable.LinkedHashMap.empty
   val spent: mutable.Map[String, (ErgoBox, String)] = mutable.Map.empty
-  val txs: mutable.Map[String, (Seq[ErgoBox], Seq[ErgoBox])] = mutable.Map.empty
+  val txs: mutable.Map[String, FakeTx] = mutable.Map.empty
 
   def add(box: ErgoBox): Unit = unspent(Base16.encode(box.id)) = box
 
   def apply(uTx: UnsignedTransaction, signed: SignedTransaction): Unit = {
     val ins = uTx.getInputs.asScala.map(_.asInstanceOf[InputBoxImpl].getErgoBox)
     val outs = signed.getOutputsToSpend.asScala.map(_.asInstanceOf[InputBoxImpl].getErgoBox)
+    val proofs = NodeJson.v6(signed.asInstanceOf[SignedTransactionImpl].getTx.inputs.map(i =>
+      JsonCodecsWrapper.inputEncoder(i).hcursor.downField("spendingProof").focus.getOrElse(Json.Null)))
     ins.foreach { b =>
       val id = Base16.encode(b.id)
       require(unspent.remove(id).isDefined, s"double spend of $id")
       spent(id) = (b, signed.getId)
     }
     outs.foreach(add)
-    txs(signed.getId) = (ins, outs)
+    txs(signed.getId) = FakeTx(ins, outs, proofs)
   }
 
   /** As `/blockchain` renders a box. */
@@ -68,12 +76,18 @@ class FakeNode(chain: FakeChain, wallet: ErgoProver) extends NodeApi("http://fak
   override def boxById(boxId: String): Option[Json] =
     chain.unspent.get(boxId).map(chain.json(_)).orElse(chain.spent.get(boxId).map { case (b, tx) => chain.json(b, Some(tx)) })
 
+  /** As the indexed node renders it: inputs are boxes with the `spendingProof` they were spent with. */
   override def transactionById(txId: String): Option[Json] =
-    chain.txs.get(txId).map { case (ins, outs) =>
+    chain.txs.get(txId).map { tx =>
       Json.obj("id" -> Json.fromString(txId),
-        "inputs" -> Json.fromValues(ins.map(chain.json(_))),
-        "outputs" -> Json.fromValues(outs.map(chain.json(_))))
+        "inputs" -> Json.fromValues(tx.inputs.zipWithIndex.map { case (b, i) =>
+          chain.json(b, Some(txId)).deepMerge(Json.obj("spendingProof" -> tx.proofs.lift(i).getOrElse(Json.Null)))
+        }),
+        "outputs" -> Json.fromValues(tx.outputs.map(chain.json(_))))
     }
+
+  /** Everything here is confirmed at once: the mempool is always empty. */
+  override def unconfirmedTransactionById(txId: String): Option[Json] = None
 
   override def walletStatus(): Json = Json.obj(
     "isInitialized" -> Json.True, "isUnlocked" -> Json.True,
