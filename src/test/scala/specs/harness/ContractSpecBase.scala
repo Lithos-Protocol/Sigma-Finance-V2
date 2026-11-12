@@ -25,6 +25,34 @@ object ContractSpecBase {
   }
 
   def silenceMockWebServer(): Unit = quieted
+
+  /**
+   * Opt-in cost log. With the environment variable SIGMAFI_COST set to a file path, every accepted
+   * transaction appends one tab-separated line: appkit's cost estimate from signing, the scripts of
+   * its inputs in order, its data-input and output counts, and its signed size in bytes. Run it with
+   * `SIGMAFI_COST=costs.tsv sbt test`. Signing also enforces the mocked node's maxBlockCost of
+   * 1000000, which equals the reference node's default per-transaction limit (maxTransactionCost),
+   * so every accepted transaction is already under it.
+   */
+  private val costLog: Option[java.io.File] = sys.env.get("SIGMAFI_COST").map(new java.io.File(_))
+  private val scriptNames = scala.collection.concurrent.TrieMap.empty[String, String]
+
+  /** Names a script in the cost log. Unnamed inputs show as `wallet` (a public key) or `other`. */
+  def nameScript(contract: Contract, name: String): Unit = scriptNames.putIfAbsent(contract.ergoTreeHex, name)
+
+  def logCost(tx: UnsignedTransaction, signed: SignedTransaction): Unit = costLog.foreach { file =>
+    val inputs = tx.getInputs.asScala.map { box =>
+      val tree = box.getErgoTree
+      scriptNames.getOrElse(org.bouncycastle.util.encoders.Hex.toHexString(tree.bytes),
+        if (tree.toSigmaBooleanOpt.isDefined) "wallet" else "other")
+    }
+    val line = s"${signed.getCost}\t${inputs.mkString(" + ")}\t${tx.getDataInputs.size} data, ${tx.getOutputs.size} out" +
+      s"\t${signed.toBytes.length}\n"
+    synchronized {
+      val out = new java.io.FileWriter(file, true)
+      try out.write(line) finally out.close()
+    }
+  }
 }
 
 /**
@@ -116,7 +144,9 @@ trait ContractSpecBase extends Matchers {
   /** The spend must be accepted by the contract. */
   protected def accepts(prover: ErgoProver, tx: UnsignedTransaction): SignedTransaction =
     Try(prover.sign(tx)) match {
-      case Success(signed) => signed
+      case Success(signed) =>
+        ContractSpecBase.logCost(tx, signed)
+        signed
       case Failure(ex) =>
         fail(s"expected the contract to accept this spend, but it was rejected: ${ex.getMessage}", ex)
     }

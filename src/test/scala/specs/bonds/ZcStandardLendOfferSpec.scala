@@ -232,8 +232,12 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
     def blocks: Long = f.maturity - height
   }
 
-  private def live(ctx: BlockchainContext, kind: Kind, unit: UTXO = null): Live = {
-    val f = flow(ctx, kind)
+  /** The order's id is the bond asset, and it depends on every order register, the rule included. */
+  private def liveFlow(ctx: BlockchainContext, kind: Kind, liq: Contract): Flow =
+    if (liq == null) flow(ctx, kind) else flow(ctx, kind, extra = Seq(15000L, 30L), liq = liq)
+
+  private def live(ctx: BlockchainContext, kind: Kind, unit: UTXO = null, liq: Contract = null): Live = {
+    val f = liveFlow(ctx, kind, liq)
     val fill = accepts(f.holder, standardFillTx(f, unit = unit))
     Live(f, spendOutput(fill, 1), f.height + 300, fill)
   }
@@ -256,15 +260,16 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
   private def buyTx(l: Live, offer: UTXO, ask: UTXO, units: Long, paid: Long, request: InputUTXO = null,
                     origin: Array[Byte] = null, state: InputUTXO = null, delivery: UTXO = null,
                     payout: UTXO = null, askNext: UTXO = null, policy: Contract = null,
-                    data: Seq[InputUTXO] = Seq.empty, height: Int = -1): UnsignedTransaction = {
+                    data: Seq[InputUTXO] = Seq.empty, height: Int = -1,
+                    askVars: Seq[(Byte, ErgoValue[_])] = Seq.empty): UnsignedTransaction = {
     val ctx = l.f.ctx
     val kind = l.f.kind
     val askIn = inputAt(ask, ctx, 2)
     val token = ask.tokens.head.id
     val left = ask.tokens.head.amount - units
     val nextAsk = if (askNext != null) askNext else if (left > 0L) ask.setTokens(Token(token, left)) else null
-    val askWithVars = if (nextAsk == null) askIn.withCtxVar(0.toByte, ErgoValue.of(0))
-      else askIn.withCtxVar(0.toByte, ErgoValue.of(0)).withCtxVar(1.toByte, ErgoValue.of(3))
+    val askBase = askVars.foldLeft(askIn.withCtxVar(0.toByte, ErgoValue.of(0))) { case (in, (k, v)) => in.withCtxVar(k, v) }
+    val askWithVars = if (nextAsk == null) askBase else askBase.withCtxVar(1.toByte, ErgoValue.of(3))
     val base = inputAt(offer, ctx, 1)
       .withCtxVar(0.toByte, ErgoValue.of(2)).withCtxVar(1.toByte, liqVar(policyOf(ctx, policy)))
       .withCtxVar(2.toByte, ErgoValue.of(0)).withCtxVar(3.toByte, ErgoValue.of(0))
@@ -345,9 +350,10 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
   }
 
   /** A bond whose unit went into a mint request at the fill; the request's id is the share id. */
-  private def wrapped(ctx: BlockchainContext, kind: Kind, mint: Contract, longs: Seq[Long]): Wrapped = {
-    val probe = flow(ctx, kind)
-    val l = live(ctx, kind, unit = requestBox(ctx, mint, probe.asset, longs))
+  private def wrapped(ctx: BlockchainContext, kind: Kind, mint: Contract, longs: Seq[Long],
+                      liq: Contract = null): Wrapped = {
+    val probe = liveFlow(ctx, kind, liq)
+    val l = live(ctx, kind, unit = requestBox(ctx, mint, probe.asset, longs), liq = liq)
     Wrapped(l, spendOutput(l.fill, 0), longs.head)
   }
 
@@ -408,6 +414,50 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
       // The Dutch mint compiled for the other repayment asset is not this offer's.
       val tokenDutch = wrapped(ctx, ErgBond, marketOf(ctx, TokenBond).dutchMint, Seq(1000L, pullFee, mintFee, 15000L, 10000L, 500L))
       rejectsAtSigning(executor(ctx), shareBuy(tokenDutch, offer(0L, 1000000L), 30L, 195000000L))
+    }
+  }
+
+  // ─── from a NAV ask ───────────────────────────────────────────────────────
+
+  /** A NAV ask for `amount` of `token`, `whole` of which make one bond, at accrued value with no margin. */
+  private def navAskBox(ctx: BlockchainContext, kind: Kind, token: ErgoId, amount: Long, whole: Long,
+                        asset: ErgoId): UTXO =
+    UTXO(marketOf(ctx, kind).navAsk, minBox, Seq(Token(token, amount)),
+      Seq(bytesValue(hashOf(otherTree(ctx))), longsValue(1L, 1000000000L, 1L, ctx.getHeight + 5000L, 0L, whole),
+        bytesValue(marketOf(ctx, kind).pricing.hashedValueBytes), bytesValue(asset.getBytes)))
+
+  /** Accrued value of `sold` of `whole` at the live bond's height, rounded up as the expression requires. */
+  private def accrued(l: Live, sold: Long, whole: Long): Long = {
+    val term = l.f.maturity - l.f.start
+    val elapsed = l.height - l.f.start
+    val principal = if (l.f.kind == ErgBond) l.f.data(1) else 600L
+    ceilDiv(BigInt(sold) * (BigInt(principal) * (term - elapsed) + BigInt(l.f.data(0)) * elapsed),
+      BigInt(whole) * term)
+  }
+
+  for (kind <- kinds) {
+    property(s"$kind from a NAV ask: an offer buys a unit and shares, each side running its own expression") {
+      withCtx { ctx =>
+        val policy = marketOf(ctx, kind).policy
+        val offer = offerBox(ctx, kind, policy = policy)
+        val askVars = Seq[(Byte, ErgoValue[_])](2.toByte -> liqVar(marketOf(ctx, kind).pricing), 3.toByte -> ErgoValue.of(0))
+        // A whole unit: the ask's pricing expression and the offer's policy share the state box.
+        val l = live(ctx, kind, liq = oracleRuleOf(ctx, kind))
+        val unitAsk = navAskBox(ctx, kind, l.f.asset, 1L, 1L, l.f.asset)
+        val unitPrice = accrued(l, 1L, 1L)
+        def unitTx(paid: Long): UnsignedTransaction = buyTx(l, offer, unitAsk, 1L, paid, policy = policy,
+          askVars = askVars, data = Seq(oracleBox(l.f, created = l.height)))
+        accepts(executor(ctx), unitTx(unitPrice))
+        rejectsAtSigning(executor(ctx), unitTx(unitPrice - 1L))
+        // 30 of 1000 shares: the offer also reads the mint request's bytes. The heaviest match there is.
+        val w = wrapped(ctx, kind, scripts(ctx).fractionalMint, Seq(1000L, pullFee, mintFee), liq = oracleRuleOf(ctx, kind))
+        val shareAsk = navAskBox(ctx, kind, w.shareId, 100L, 1000L, w.l.f.asset)
+        val sharePrice = accrued(w.l, 30L, 1000L)
+        def shareTx(paid: Long): UnsignedTransaction = buyTx(w.l, offer, shareAsk, 30L, paid, request = w.request,
+          policy = policy, askVars = askVars, data = Seq(oracleBox(w.l.f, created = w.l.height)))
+        accepts(executor(ctx), shareTx(sharePrice))
+        rejectsAtSigning(executor(ctx), shareTx(sharePrice - 1L))
+      }
     }
   }
 

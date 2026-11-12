@@ -27,7 +27,13 @@ object ZcStandardSpecBase {
     val constants = terms.foldLeft(ConstantsBuilder.create()) {
       case (builder, (key, value)) => builder.item(key, value)
     }.build()
-    Contract.fromErgoContract(ctx.compileContract(constants, ScriptGenerator.mkScript(path)))
+    val contract = Contract.fromErgoContract(ctx.compileContract(constants, ScriptGenerator.mkScript(path)))
+    // Named for the opt-in cost log, with its market where it is compiled per asset.
+    val market = terms.collectFirst {
+      case ("CONST_REPAYMENT_TOKEN" | "CONST_PAYMENT_TOKEN", token: sigma.Coll[_]) => if (token.length == 0) " ERG" else " SigUSD"
+    }.getOrElse("")
+    specs.harness.ContractSpecBase.nameScript(contract, path.split('/').last.stripPrefix("ZC_Standard_") + market)
+    contract
   }
 
   private def hash(c: Contract) = Colls.fromArray(c.hashedPropBytes)
