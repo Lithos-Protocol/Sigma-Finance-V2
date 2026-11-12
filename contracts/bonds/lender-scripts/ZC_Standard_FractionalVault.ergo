@@ -1,5 +1,5 @@
 {
-    // Standard fractional vault. No off-chain code exists yet.
+    // Standard fractional vault.
     // Created only by ZC_Standard_FractionalMint. Holds one circulating bond unit on behalf of N shares,
     // pulls the bond's settlement out of ZC_Standard_BondVault, and pays share holders pro rata.
     // No constants.

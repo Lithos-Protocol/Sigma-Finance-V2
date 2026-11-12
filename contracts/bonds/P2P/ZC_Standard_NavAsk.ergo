@@ -1,5 +1,5 @@
 {
-    // Standard NAV-priced ask (the shell). No specs and no off-chain code exist yet.
+    // Standard NAV-priced ask (the shell).
     // An ZC_Standard_SaleOrder with one more condition on a fill: a pricing expression the seller chose
     // must also pass. The expression works a price out of on-chain state, so the seller never
     // updates the ask. A new way to price is a new expression, not a new ask contract.

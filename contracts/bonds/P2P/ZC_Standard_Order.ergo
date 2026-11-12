@@ -1,5 +1,5 @@
 {
-    // Standard SigmaFi V2 order. No off-chain code exists yet.
+    // Standard SigmaFi V2 order.
     // Use only with ZC_Standard_Bond and ZC_Standard_BondVault. One order script serves ERG and token repayment,
     // fixed and on-close maturity: every term is in a register, so every open order of this
     // repayment asset sits at ONE address and is read without parsing ErgoTree constants.

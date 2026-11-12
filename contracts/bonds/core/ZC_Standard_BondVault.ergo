@@ -1,5 +1,5 @@
 {
-    // Standard SigmaFi V2 bond vault. No off-chain code exists yet.
+    // Standard SigmaFi V2 bond vault.
     // Receives every ZC_Standard_Bond settlement. One vault serves every bond: it has no constants.
     // The holder of the circulating bond unit claims the whole box by burning all 3 units.
     //

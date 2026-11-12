@@ -2,7 +2,6 @@ package org.lithosprotocol.sigmafi
 package specs.bonds
 
 import ksingh.sigmabonds.app.Protocol
-import ksingh.sigmabonds.client.ScriptGenerator
 import org.ergoplatform.appkit._
 import org.ergoplatform.sdk.ErgoId
 import sigma.Colls
@@ -10,9 +9,14 @@ import work.lithos.mutations.{Contract, InputUTXO, Token, UTXO}
 
 import scala.collection.JavaConverters._
 
-/** Test-only compilation of the ZC_Standard_* contracts: no production off-chain code builds them yet. */
+/**
+ * Views of the ZC_Standard_* contracts for the specs. They compile through `StandardContracts.compile`,
+ * the same code path the client's pinned trees are checked against, never a spec-local re-derivation.
+ */
 object ZcStandardSpecBase {
-  val SigUSD: ErgoId = ErgoId.create("03faf2cb329f2e90d6d23b58d91bbb6c046aa143261cc21f52fbe2824bfcbf04")
+  import ksingh.sigmabonds.standard.{StandardContracts, Market => StdMarket}
+
+  val SigUSD: ErgoId = StdMarket.SigUsdId
   val OracleNFT: ErgoId = ErgoId.create("6a2b821b5727e85beb5e78b4efb9f0250d59cd48481d2ded2c23e91ba1d07c66")
 
   /** One bond and one order tree per repayment asset; each pair shares a template. */
@@ -20,23 +24,6 @@ object ZcStandardSpecBase {
                      ergOrder: Contract, tokenOrder: Contract,
                      fractionalVault: Contract, fractionalMint: Contract,
                      maturity: Contract, ergOracle: Contract, tokenOracle: Contract)
-
-  private var cache: Option[Scripts] = None
-
-  private def compile(ctx: BlockchainContext, path: String, terms: Seq[(String, Any)]): Contract = {
-    val constants = terms.foldLeft(ConstantsBuilder.create()) {
-      case (builder, (key, value)) => builder.item(key, value)
-    }.build()
-    val contract = Contract.fromErgoContract(ctx.compileContract(constants, ScriptGenerator.mkScript(path)))
-    // Named for the opt-in cost log, with its market where it is compiled per asset.
-    val market = terms.collectFirst {
-      case ("CONST_REPAYMENT_TOKEN" | "CONST_PAYMENT_TOKEN", token: sigma.Coll[_]) => if (token.length == 0) " ERG" else " SigUSD"
-    }.getOrElse("")
-    specs.harness.ContractSpecBase.nameScript(contract, path.split('/').last.stripPrefix("ZC_Standard_") + market)
-    contract
-  }
-
-  private def hash(c: Contract) = Colls.fromArray(c.hashedPropBytes)
 
   /**
    * The contracts compiled per repayment (or payment) asset beyond the bond and order: the lend offer,
@@ -47,65 +34,28 @@ object ZcStandardSpecBase {
 
   case class Exchange(erg: Market, token: Market, dutchVault: Contract)
 
-  private var exchangeCache: Option[Exchange] = None
-
-  /** The P2P exchange, the Dutch auction pair and the policies, compiled once per JVM. */
-  def exchange(ctx: BlockchainContext): Exchange = synchronized {
-    exchangeCache.getOrElse {
-      val s = scripts(ctx)
-      val dutchVault = compile(ctx, "bonds/lender-scripts/ZC_Standard_DutchAuctionVault", Seq.empty)
-      def market(token: Array[Byte], order: Contract, bond: Contract, rule: Contract): Market = {
-        val asset = Colls.fromArray(token)
-        val dutchMint = compile(ctx, "bonds/lender-scripts/ZC_Standard_DutchAuctionMint",
-          Seq("CONST_DUTCH_VAULT_HASH" -> hash(dutchVault), "CONST_BOND_HASH" -> hash(bond),
-            "CONST_REPAYMENT_TOKEN" -> asset))
-        Market(
-          compile(ctx, "bonds/P2P/ZC_Standard_LendOffer",
-            Seq("CONST_REPAYMENT_TOKEN" -> asset, "CONST_ORDER_HASH" -> hash(order),
-              "CONST_BOND_HASH" -> hash(bond), "CONST_FRACTIONAL_MINT_HASH" -> hash(s.fractionalMint),
-              "CONST_DUTCH_MINT_HASH" -> hash(dutchMint))),
-          compile(ctx, "bonds/P2P/ZC_Standard_SaleOrder", Seq("CONST_PAYMENT_TOKEN" -> asset)),
-          compile(ctx, "bonds/P2P/ZC_Standard_NavAsk", Seq("CONST_PAYMENT_TOKEN" -> asset)),
-          compile(ctx, "bonds/policies/ZC_Standard_AccruedValue_Pricing",
-            Seq("CONST_REPAYMENT_TOKEN" -> asset, "CONST_BOND_HASH" -> hash(bond))),
-          compile(ctx, "bonds/policies/ZC_Standard_ERG_SigUSD_CollateralPolicy",
-            Seq("CONST_REPAYMENT_TOKEN" -> asset, "CONST_LIQUIDATION_HASH" -> Colls.fromArray(rule.hashedValueBytes))),
-          dutchMint)
-      }
-      val e = Exchange(market(Array.empty[Byte], s.ergOrder, s.ergBond, s.ergOracle),
-        market(SigUSD.getBytes, s.tokenOrder, s.tokenBond, s.tokenOracle), dutchVault)
-      exchangeCache = Some(e)
-      e
-    }
+  /** Compiled once per JVM; every script is named, with its market, for the opt-in cost log. */
+  def compiled(ctx: BlockchainContext): StandardContracts = synchronized {
+    val set = StandardContracts.compile(ctx)
+    set.entries.foreach(e => specs.harness.ContractSpecBase.nameScript(e.contract, e.label))
+    set
   }
 
-  /** Compiled once per JVM: the sigma compiler mutates shared AST nodes. */
-  def scripts(ctx: BlockchainContext): Scripts = synchronized {
-    cache.getOrElse {
-      def compile(path: String, terms: Seq[(String, Any)] = Seq.empty): Contract =
-        ZcStandardSpecBase.compile(ctx, path, terms)
-      val vault = compile("bonds/core/ZC_Standard_BondVault")
-      def bond(token: Array[Byte]) = compile("bonds/core/ZC_Standard_Bond",
-        Seq("CONST_VAULT_HASH" -> hash(vault), "CONST_REPAYMENT_TOKEN" -> Colls.fromArray(token)))
-      // The order compiles in the same repayment token as its bond, for the one-asset rule.
-      def order(b: Contract, token: Array[Byte]) = compile("bonds/P2P/ZC_Standard_Order",
-        Seq("CONST_BOND_HASH" -> hash(b), "CONST_REPAYMENT_TOKEN" -> Colls.fromArray(token)))
-      val ergBond = bond(Array.empty[Byte])
-      val tokenBond = bond(SigUSD.getBytes)
-      val fractionalVault = compile("bonds/lender-scripts/ZC_Standard_FractionalVault")
-      val fractionalMint = compile("bonds/lender-scripts/ZC_Standard_FractionalMint",
-        Seq("CONST_FRACTIONAL_VAULT_HASH" -> hash(fractionalVault)))
-      val c = Scripts(vault, ergBond, tokenBond, order(ergBond, Array.empty[Byte]), order(tokenBond, SigUSD.getBytes),
-        fractionalVault, fractionalMint,
-        compile("bonds/liquidations/ZC_Standard_MaturityLiquidation"),
-        // The oracle rule measures the repayment, so it is compiled per repayment asset like the bond.
-        compile("bonds/liquidations/ZC_Standard_ERG_SigUSD_Liquidation",
-          Seq("CONST_REPAYMENT_TOKEN" -> Colls.fromArray(Array.empty[Byte]))),
-        compile("bonds/liquidations/ZC_Standard_ERG_SigUSD_Liquidation",
-          Seq("CONST_REPAYMENT_TOKEN" -> Colls.fromArray(SigUSD.getBytes))))
-      cache = Some(c)
-      c
+  def scripts(ctx: BlockchainContext): Scripts = {
+    val s = compiled(ctx)
+    val (erg, token) = (s.market(StdMarket.Erg), s.market(StdMarket.SigUsd))
+    Scripts(s.vault, erg.bond, token.bond, erg.order, token.order, s.fractionalVault, s.fractionalMint,
+      s.maturity, erg.oracleRule, token.oracleRule)
+  }
+
+  /** The P2P exchange, the Dutch auction pair and the policies. */
+  def exchange(ctx: BlockchainContext): Exchange = {
+    val s = compiled(ctx)
+    def market(m: StdMarket): Market = {
+      val c = s.market(m)
+      Market(c.offer, c.saleOrder, c.navAsk, c.pricing, c.policy, c.dutchMint)
     }
+    Exchange(market(StdMarket.Erg), market(StdMarket.SigUsd), s.dutchVault)
   }
 }
 

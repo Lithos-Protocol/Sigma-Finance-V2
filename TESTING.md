@@ -14,6 +14,15 @@ client rewrite. Regenerate its marked block with
 `--check`. `BondProbeSpec` checks for drift in the default suite. The exporter uses the same offline
 V6 context and `ScriptGenerator` as the contract specs; it never contacts a live node.
 
+The ZC Standard set is pinned the same way. `StandardContracts.compile` is the one compile path: the
+specs use it, and `ZcStandardReference` writes its output to the trees the CLI loads
+(`src/main/resources/zc-standard/contracts.tsv`) and to
+[docs/ZC_STANDARD_REFERENCE.md](./docs/ZC_STANDARD_REFERENCE.md). `ZcStandardProbeSpec` fails while either
+is stale, and also checks that every cross-contract hash appears in the tree that pins it. After any
+change to a `ZC_Standard_*` contract, regenerate both with
+`sbt "Test / runMain org.lithosprotocol.sigmafi.specs.bonds.ZcStandardReference --write"`. A comment-only
+change leaves them as they are.
+
 The rules behind the method are in [ERGOSCRIPT_TESTING_GENERAL.MD](./ERGOSCRIPT_TESTING_GENERAL.MD)
 and [ERGOSCRIPT_RULES_GENERAL.MD](./ERGOSCRIPT_RULES_GENERAL.MD). Both are project-neutral and
 shared with c-bonds; anything in this file or the repository takes precedence over them.
@@ -27,8 +36,8 @@ shared with c-bonds; anything in this file or the repository takes precedence ov
 | `src/test/scala/specs/harness/` | `ContractSpecBase`, `HarnessProbeSpec` |
 | `src/test/scala/specs/<product>/` | one `<Product>SpecBase` plus one suite per contract |
 | `src/test/scala/specs/bonds/` | `BondSpecBase`; suites for the first-generation bonds, orders, `MaturityLiquidation`, `BondAssetVault`, template verification and collateral conversion |
-| `src/test/scala/specs/bonds/ZcStandard*` | `ZcStandardSpecBase`, which compiles every ZC Standard contract once per JVM and per market (`scripts`, `exchange`, `marketOf`) and builds an order-to-bond `Flow`; suites for the bond, order and vault, the fractional pair, the asks, the lend offer and the Dutch auction pair |
-| `src/test/scala/specs/app/` | `SigmaFiAppSpec`: the CLI's App end to end, over `FakeNode`, an in-memory chain served as the node's index and wallet JSON |
+| `src/test/scala/specs/bonds/ZcStandard*` | `ZcStandardSpecBase`, which views `StandardContracts.compile` per market (`scripts`, `exchange`, `marketOf`) and builds an order-to-bond `Flow`; suites for the bond, order and vault, the fractional pair, the asks, the lend offer and the Dutch auction pair; `ZcStandardProbeSpec` and `ZcStandardReference` for the pins |
+| `src/test/scala/specs/app/` | `SigmaFiAppSpec` (first generation) and `StandardAppSpec` (ZC Standard): the CLI's apps end to end, over `FakeNode`, an in-memory chain served as the node's index and wallet JSON; `SigmaFiCliSpec` for argument and shell-line parsing |
 
 The mutations package keeps its Lithos name rather than the `org.lithosprotocol.sigmafi` prefix so
 it can be re-synced with Lithos and c-bonds by copying. `BoxLoader`, `UTXOSelector` and
@@ -107,6 +116,10 @@ their second column to get the heaviest case of each transaction shape.
   output fails on funding, not on the contract, which is exactly what `rejectsAtSigning` catches.
 - **A preHeader is the only way to move HEIGHT** off the mocked context's `123413`. Every maturity
   and expiry boundary needs `buildAt`.
+- **Offline signing runs scripts at the context's own height.** appkit 6.0.0's default pre-header has
+  `ctx.getHeight`, where a node includes a transaction at `ctx.getHeight + 1` at the earliest. The apps
+  plan for the node's `+ 1`, so an app spec that seeds a box at a boundary (a recollateralize wait, an
+  expiry) seeds it one block further back than the contract alone would need.
 - **Attach context vars in ascending id order.** Offline signing does not care. A live node does,
   because appkit signs them in attachment order and transmits them in `HashMap` order. Exposure is
   exactly two to four variables.

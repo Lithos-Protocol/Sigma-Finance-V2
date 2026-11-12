@@ -1,5 +1,5 @@
 {
-    // Standard Dutch auction fractionalization request. No specs and no off-chain code exist yet.
+    // Standard Dutch auction fractionalization request.
     // A ZC_Standard_FractionalMint that also commits to an auction. It holds one circulating bond
     // unit and turns it into N fungible shares backed by an ZC_Standard_DutchAuctionVault. If the bond is
     // repaid, that vault behaves like the standard fractional vault. If the bond is liquidated, the

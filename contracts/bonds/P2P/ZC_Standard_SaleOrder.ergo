@@ -1,5 +1,5 @@
 {
-    // Standard sale order (an ask). No specs and no off-chain code exist yet.
+    // Standard sale order (an ask).
     // Sells one token for a fixed price per raw unit, with partial fills. It is generic: the token
     // can be a bond unit, fractional shares, or anything else. Nothing here verifies what the token
     // is: a buyer, or a buying contract such as ZC_Standard_LendOffer, does that.

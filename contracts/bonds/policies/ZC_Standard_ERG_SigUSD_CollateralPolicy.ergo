@@ -1,5 +1,5 @@
 {
-    // Standard collateral policy expression for ZC_Standard_LendOffer. No specs and no off-chain code exist yet.
+    // Standard collateral policy expression for ZC_Standard_LendOffer.
     // Executed through the offer's context var 1 with the OFFER as SELF. It is the lender's whole
     // risk decision for a bond: which liquidation rule the bond must carry, how early that rule
     // must fire, and how much collateral must be there now. The offer pins this expression's hash

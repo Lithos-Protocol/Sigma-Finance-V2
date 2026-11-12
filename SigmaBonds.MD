@@ -6,9 +6,12 @@ liquidated into a vault, and whoever holds the asset claims the vault. Around th
 fractional shares, a Dutch auction for liquidated collateral, asks for selling bonds and shares, and
 a lend offer that buys them on a yield target.
 
-Status: the set is **not deployed** and has **no off-chain code** yet. Every contract has offline
-specs (see [TESTING.md](./TESTING.md)). The CLI still builds the first-generation contracts in
-`contracts/old/`, described in [docs/SIGMABONDS_OLD.md](./docs/SIGMABONDS_OLD.md).
+Status: the set is **not deployed**. Every contract has offline specs (see [TESTING.md](./TESTING.md)),
+and its compiled trees are pinned in [docs/ZC_STANDARD_REFERENCE.md](./docs/ZC_STANDARD_REFERENCE.md).
+The CLI builds the core lifecycle from those pinned trees: orders, fills, repayment (also from
+collateral), recollateralization, liquidation, expiry refunds and claims. The exchange, fractional
+shares and the Dutch auction have no off-chain code yet. The CLI's `--old` commands still serve the
+first-generation contracts in `contracts/old/`, described in [docs/SIGMABONDS_OLD.md](./docs/SIGMABONDS_OLD.md).
 
 Each contract's header comment is its authoritative schema: registers, context variables and every
 condition. This document explains how the pieces fit together.
@@ -319,7 +322,7 @@ of 7,030,268 and a size of 1,271,009 bytes.
 | Offer fills a new bond, with policy and oracle | 21,655 | 4,258 |
 | Offer buys from a sale order | 20,626 | 5,226 |
 | Dutch vault claim / pull / sale | 18,858 / 18,533 / 16,503 | up to 2,272 |
-| Bond repayment / liquidation | 18,501 / 16,438 | 1,461 / 1,019 |
+| Bond repayment / liquidation | 19,096 / 16,841 | 743 / 1,019 |
 | Order fill by a wallet | 16,777 | 2,638 |
 | Wallet-to-wallet payment, for scale | 12,205 | 166 |
 

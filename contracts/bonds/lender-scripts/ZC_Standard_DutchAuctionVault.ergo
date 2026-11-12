@@ -1,5 +1,5 @@
 {
-    // Standard Dutch auction vault. No specs and no off-chain code exist yet.
+    // Standard Dutch auction vault.
     // Created only by ZC_Standard_DutchAuctionMint. It is ZC_Standard_FractionalVault with one more step:
     // when the bond it holds a unit of was LIQUIDATED, the collateral pulled in is sold as one lot
     // in a Dutch auction for the bond's repayment asset, and share holders are then paid pro rata

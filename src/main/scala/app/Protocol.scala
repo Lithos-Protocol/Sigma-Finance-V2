@@ -215,6 +215,9 @@ object Protocol {
   def intReg(box: InputUTXO, r: Int): Option[Int] =
     register(box, r).filter(_.tpe == SInt).map(_.value.asInstanceOf[Int])
 
+  def byteReg(box: InputUTXO, r: Int): Option[Byte] =
+    register(box, r).filter(_.tpe == sigma.ast.SByte).map(_.value.asInstanceOf[Byte])
+
   def longReg(box: InputUTXO, r: Int): Option[Long] =
     register(box, r).filter(_.tpe == SLong).map(_.value.asInstanceOf[Long])
 

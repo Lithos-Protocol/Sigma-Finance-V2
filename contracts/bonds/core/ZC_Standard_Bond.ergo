@@ -1,5 +1,5 @@
 {
-    // Standard SigmaFi V2 zero-coupon bond. No off-chain code exists yet.
+    // Standard SigmaFi V2 zero-coupon bond.
     // Use only with ZC_Standard_Order and ZC_Standard_BondVault. One script serves ERG and token repayment: the
     // repayment asset is a constant, so each repayment asset has its own bond address and all of
     // them share one template. An indexed node lists one market by ErgoTree and every bond by

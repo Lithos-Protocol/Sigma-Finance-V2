@@ -7,7 +7,8 @@ Sigma Finance V2 is an open standard for decentralized P2P contracts on Ergo.
 [SigmaBonds.MD](./SigmaBonds.MD) describes the ZC Standard: P2P zero-coupon bonds on any collateral,
 with a tradeable bond asset, pluggable liquidation, fractional shares, a Dutch auction for liquidated
 collateral, and an exchange where a lender's yield bid buys new and existing bonds. It is not
-deployed and has no off-chain code yet. Every contract has offline specs.
+deployed. Every contract has offline specs, and the CLI below builds its core lifecycle; the exchange,
+fractional shares and the Dutch auction have no off-chain code yet.
 
 | Folder (`contracts/bonds/`) | Contracts (`ZC_Standard_*`) |
 |---|---|
@@ -30,53 +31,66 @@ How it works, in brief:
 
 ## First generation (`contracts/old/`)
 
-The CLI below builds the first-generation contracts, now in `contracts/old/`:
-`ZC_Order`, `ZC_OrderOnClose`, `ZC_ERG_Bond`, `ZC_Token_Bond`, `BondAssetVault` and
-`MaturityLiquidation`. [docs/SIGMABONDS_OLD.md](./docs/SIGMABONDS_OLD.md) describes them.
+The first-generation contracts are `ZC_Order`, `ZC_OrderOnClose`, `ZC_ERG_Bond`, `ZC_Token_Bond`,
+`BondAssetVault` and `MaturityLiquidation`, in `contracts/old/`.
+[docs/SIGMABONDS_OLD.md](./docs/SIGMABONDS_OLD.md) describes them. The CLI still serves boxes already on
+chain under them through its `--old` commands, but new orders use the ZC Standard only.
 
 ## CLI
-`SigmaFiCli` runs the first-generation SigmaBonds from the command line against a single Ergo node.
-It needs no explorer and holds no keys. Boxes come from the node's extra index
-(`ergo.node.extraIndex = true`), and the node's wallet signs. Run it from the repository root:
+`SigmaFiCli` runs SigmaBonds against a single Ergo node. It needs no explorer and holds no keys. Boxes
+come from the node's extra index (`ergo.node.extraIndex = true`), and the node's wallet signs. Run it
+from the repository root. Started without a command it is a shell: the JVM and the node connection
+start once, and you type one command per line until `exit`.
 
 ```bash
-sbt "runMain ksingh.sigmabonds.app.SigmaFiCli --help"
+sbt "sigmafi --node http://127.0.0.1:9053 --api-key <key> --wallet-pass <pass>"
 ```
+
+```text
+sigmafi> orders
+sigmafi> fill-order <order box id> --fee-reserve 0.05
+sigmafi> fill-order <order box id> --fee-reserve 0.05 --send
+sigmafi> bonds --old
+sigmafi> exit
+```
+
+`sigmafi` is an sbt alias for `runMain ksingh.sigmabonds.app.SigmaFiCli`; given a command, it runs that
+one command and exits, so scripts keep working:
 
 ```bash
-sbt "runMain ksingh.sigmabonds.app.SigmaFiCli orders --node http://127.0.0.1:9053"
+sbt "runMain ksingh.sigmabonds.app.SigmaFiCli help"
 ```
 
-```bash
-sbt "runMain ksingh.sigmabonds.app.SigmaFiCli fill-order <order box id> --batching-fee 0.05 --api-key <key> --wallet-pass <pass>"
-```
+**ZC Standard, the default.** Commands build from the pinned trees in
+`src/main/resources/zc-standard/contracts.tsv`, never from a fresh compile.
+- Look around: `info`, `orders`, `bonds` (oracle ratios, recollateralize timing, and whether each bond
+  asset was really minted by a standard order), `claims`
+- Borrower: `create-order` (ERG or SigUSD market; maturity or oracle-ratio liquidation),
+  `cancel-order`, `repay [--from-collateral]`, `recollateralize`
+- Lender: `fill-order [--fee-reserve <ERG>]` (CLI minimum and default 0.05 ERG), `claim`
+- Anyone: `liquidate`, which keeps the bonds' fee reserves, and `refund-order`, which returns an expired
+  order to its borrower for its expiry fee
 
-List commands (`orders`, `bonds`, `claims`) find boxes and check their scripts and shapes. Actions take
-the box ids they print:
-- Lender: `fill-order`, `claim`
-- Borrower: `create-order`, `cancel-order`, `repay`
-- Executor: `liquidate`
+`create-order` writes an R8 hint that no contract reads: the borrower's ErgoTree, whose hash is an
+order term, so any lender can pay the principal without asking for it. A fill mints three bond-asset
+units, two in the bond and one for the lender, named `SigmaFi-ZCS-<first6>` with the loan's terms as
+EIP-4 JSON. `help` lists every option.
+
+**First generation, with `--old`.** `info`, `orders`, `bonds`, `claims`, `fill-order [--batching-fee
+<ERG>]`, `claim`, `cancel-order`, `repay` and `liquidate`, as before, for first-generation boxes. Those
+bonds' units are named `SigmaFi-ZC-Bond-<first6>`; filling mints two units, one in the bond and one for
+the lender.
 
 Every action is a dry run unless you pass `--send`: it is built, signed by the node wallet, and checked
-by the node (`/transactions/check`), but never submitted. `--node`, `--api-key` and `--wallet-pass` can
-also come from `SIGMAFI_NODE`, `SIGMAFI_API_KEY` and `SIGMAFI_WALLET_PASS`. If the CLI unlocks the
-wallet, it locks it again when it is done.
-
-The CLI writes an optional order R4 hint that no contract reads: the borrower's ErgoTree, whose hash
-is an order term (see [SIGMABONDS_OLD.md](./docs/SIGMABONDS_OLD.md)). It lets any lender fill an order without asking
-the borrower for that tree. Filling mints two bond-asset units, one in the bond and one for the lender.
-The lender chooses and funds an extra liquidation reserve on fill (`--batching-fee`, CLI minimum and default 0.05 ERG).
-Repayment refunds the reserve into the lender's vault and returns the borrower collateral in full.
-Bonds store agreed principal ERG/tokens and a Long maturity height for liquidation expressions.
-Settlement R6 is a Byte: 0 repaid, 1 liquidated, enforced by the bond.
-The lender's unit is named `SigmaFi-ZC-Bond-<first6>`, using the first six token-ID characters. Its EIP-4
-description is generated JSON containing the loan terms and identifiers available when building the fill;
-there are no manual `--name` or `--description` options.
-Bond recognition does not establish mint provenance; the complete on-chain verification mechanism
-remains to be designed. The CLI currently builds `MaturityLiquidation`; contracts permit custom
-liquidation expressions to control both the vault's ERG and its tokens.
+by the node (`/transactions/check`), but never submitted. In the shell `--send` applies only to the
+command it is typed with; a `--send` given at launch is ignored. `--node`, `--api-key` and
+`--wallet-pass` can also come from `SIGMAFI_NODE`, `SIGMAFI_API_KEY` and `SIGMAFI_WALLET_PASS`. If the
+CLI unlocks the wallet for a command, it locks it again afterwards.
 
 ## Development
+- [ZC Standard reference](./docs/ZC_STANDARD_REFERENCE.md): every standard contract's tree hash, template
+  hash and addresses, and each expression's hash, generated from the compiler alongside the pinned trees
+  the CLI loads.
 - [Lithos integration reference](./docs/LITHOS_SIGMAFI_V2_REFERENCE.md): generated ErgoTrees, template hex,
   hashes, constant registries, box/transaction layouts and the Lithos migration map, for the first
   generation.

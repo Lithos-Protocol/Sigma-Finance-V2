@@ -1,224 +1,231 @@
 package ksingh.sigmabonds
 package app
 
-import org.ergoplatform.appkit.NetworkType
+import ksingh.sigmabonds.standard.{StandardApp, StandardCommands, StandardProtocol}
+import org.ergoplatform.appkit.{BlockchainContext, NetworkType}
 import org.ergoplatform.appkit.impl.{BlockchainContextBuilderImpl, NodeDataSourceImpl}
 import org.ergoplatform.restapi.client.ApiClient
 import org.ergoplatform.sdk.ErgoId
-import scorex.util.encode.Base16
 import work.lithos.mutations.Token
 
+import java.util.Scanner
 import scala.util.Try
 
 /**
- * The SigmaFi V2 command line, over a single Ergo node:
+ * The SigmaFi V2 command line, over a single Ergo node. Started without a command it is a shell: it reads
+ * one command per line until `exit`, so the JVM and the node connection start once.
  *
- *   sbt "runMain ksingh.sigmabonds.app.SigmaFiCli <command> [options]"
+ *   sbt sigmafi                                      (the alias for runMain ksingh.sigmabonds.app.SigmaFiCli)
+ *   sbt "runMain ksingh.sigmabonds.app.SigmaFiCli <command> [options]"   (one command, then exit)
  *
- * Run it from the repository root, where `contracts/` is. Without --send, an action is built, signed by
- * the node wallet and checked by the node, but never submitted.
+ * Commands build the ZC Standard contracts. `--old` routes a command to the first-generation contracts in
+ * `contracts/old/`, which stay supported for boxes already on chain. Run it from the repository root. Without
+ * --send, an action is built, signed by the node wallet and checked by the node, but never submitted.
  */
 object SigmaFiCli {
 
-  private val MinimumBatchingFee = "0.05"
+  /** The CLI's floor for a lender-funded liquidation reserve, in both generations. */
+  val MinimumReserve = "0.05"
 
   val Usage: String =
     s"""SigmaFi V2 CLI. It talks to one Ergo node, with the extra index enabled, and nothing else.
       |
-      |Usage: sbt "runMain ksingh.sigmabonds.app.SigmaFiCli <command> [arguments] [options]"
+      |Start the shell with `sbt sigmafi [node options]`, then type commands; `help` lists them, `exit` quits.
+      |Or run one command: sbt "runMain ksingh.sigmabonds.app.SigmaFiCli <command> [arguments] [options]"
       |
-      |Node (each option can also be set by environment variable):
+      |Node (set once when starting the shell, or per command; each also reads an environment variable):
       |  --node <url>          the node's REST URL (SIGMAFI_NODE; default http://127.0.0.1:9053)
       |  --api-key <key>       the node's API key, for anything that uses its wallet (SIGMAFI_API_KEY)
       |  --wallet-pass <pass>  unlocks the node wallet if it is locked, and locks it again afterwards
       |                        (SIGMAFI_WALLET_PASS)
       |  --address <address>   the wallet address to lend, borrow and execute as (default: the change address)
       |  --fee <ERG>           the miner fee (default 0.001)
-      |  --send                submit the transaction. Without it, the node only signs and checks it.
+      |  --send                submit the transaction. Without it, the node only signs and checks it. In the
+      |                        shell it applies only to the command it is typed with.
       |
-      |Look around (no API key needed, except with --mine or for claims):
-      |  info                               heights, protocol addresses and hashes, your wallet address
-      |  orders [--mine]                    open borrower orders
-      |  bonds [--mine] [--liquidatable]    live bonds
+      |ZC Standard (the default):
+      |  info                               heights, pinned contract addresses and hashes, your wallet address
+      |  orders [--mine]                    open borrow orders, every market
+      |  bonds [--mine] [--liquidatable]    live bonds, with oracle ratios and whether each asset is genuine
       |  claims                             bond assets in your wallet whose bond has paid the vault
       |
-      |Lender:
-      |  fill-order <order box id> [--batching-fee <ERG>]  mint the named bond asset with its terms as JSON metadata
-      |  --batching-fee <ERG>              lender-funded reserve on fill (minimum and default $MinimumBatchingFee)
+      |  Borrower:
+      |  create-order --principal <amount> --repayment <amount> --collateral-erg <ERG>
+      |               (--maturity <height> | --term <blocks> | --duration <blocks>)
+      |               [--market ERG|SigUSD] [--collateral-token <token id>:<n> ...]
+      |               [--liquidation maturity|oracle] [--ratio <percent>] [--oracle-age <blocks>]
+      |               [--expires-in <blocks>] [--expiry-fee <ERG>]
+      |      Amounts are in the market's unit (ERG, or SigUSD with 2 decimals); a loan is lent and repaid in
+      |      that one asset. --duration makes an on-close order: the bond matures that many blocks after the
+      |      fill. --liquidation oracle liquidates below --ratio (e.g. 150) of the repayment at a USD oracle
+      |      price at most --oracle-age blocks old (default 60), as well as at maturity.
+      |      The order expires after --expires-in blocks (default 5040); then anyone may return it to you for
+      |      the --expiry-fee (default 0.005 ERG, at least 0.002), which a fill refunds to you instead.
+      |  cancel-order <order box id>
+      |  repay <bond box id> [--from-collateral]
+      |      --from-collateral repays out of the bond's own ERG or repayment token, as far as it holds them
+      |  recollateralize <bond box id> [--add-erg <ERG>] [--add-token <token id>:<n> ...]
+      |      at most once per 60 blocks; a token bond may add its repayment token even if it holds none
+      |
+      |  Lender:
+      |  fill-order <order box id> [--fee-reserve <ERG>]
+      |      --fee-reserve: the liquidation reserve you fund in the bond (minimum and default $MinimumReserve)
       |  claim <bond asset id>               collect a repaid or liquidated bond from the vault
       |
-      |Borrower:
-      |  create-order <loan terms> (--maturity <height> | --term <blocks> | --duration <blocks>)
-      |               --duration makes an on-close order: the bond matures that many blocks after the fill
-      |  cancel-order <order box id>
-      |  repay <bond box id>
+      |  Anyone:
+      |  liquidate <bond box id> [...]       keeps each bond's fee reserve
+      |  refund-order <order box id>        return an expired order to its borrower; keeps its expiry fee
       |
-      |Executor:
-      |  liquidate <bond box id> [<bond box id> ...]  liquidate matured bonds and keep their batching fees
-      |
-      |Loan terms:
-      |  --principal <ERG>                 lend ERG, or
-      |  --principal-token <token id>:<n>  lend n units of one token, repaid in the same token
-      |  --repayment <amount>              ERG for an ERG loan, token units for a token loan
-      |  --collateral-erg <ERG>
-      |  --collateral-token <token id>:<n> repeat for each collateral token
-      |  --liquidation <name>              default MaturityLiquidation
+      |First generation (add --old to a command): info, orders, bonds, claims, fill-order [--batching-fee
+      |<ERG>], claim, cancel-order, repay, liquidate. New orders use the ZC Standard only.
       |""".stripMargin
 
   private val DefaultNode = "http://127.0.0.1:9053"
 
   def main(args: Array[String]): Unit = {
-    val code =
-      try {
-        run(Args.parse(args))
-        0
-      } catch {
-        case e: CliError =>
-          System.err.println(s"error: ${e.message}")
-          1
-        case e: NodeError =>
-          System.err.println(s"error: ${e.getMessage}")
-          1
-        case e: java.io.IOException =>
-          System.err.println(s"error: cannot reach the node: ${e.getMessage}")
-          1
-        case e: org.ergoplatform.appkit.ErgoClientException =>
-          System.err.println(s"error: ${e.getMessage}")
-          1
+    val a = Try(Args.parse(args)).fold(e => { report(e); sys.exit(1) }, identity)
+    if (a.command.isEmpty && !a.flag("help")) {
+      new Session(a).shell()
+      sys.exit(0)
+    } else sys.exit(if (new Session(a).execute(a)) 0 else 1)
+  }
+
+  /** Prints an error the way the person at the CLI should see it. */
+  def report(e: Throwable): Unit = e match {
+    case e: CliError => System.err.println(s"error: ${e.message}")
+    case e: NodeError => System.err.println(s"error: ${e.getMessage}")
+    case e: java.io.IOException => System.err.println(s"error: cannot reach the node: ${e.getMessage}")
+    case e: org.ergoplatform.appkit.ErgoClientException => System.err.println(s"error: ${e.getMessage}")
+    case e => System.err.println(s"error: ${e.getClass.getSimpleName}: ${e.getMessage}")
+  }
+
+  /**
+   * One node connection: the launch options, the network, and the first generation's compiled contracts,
+   * which compile once per JVM (the sigma compiler cannot compile a script twice).
+   */
+  class Session(launch: Args) {
+    private val nodeUrl = launch.opt("node").orElse(env("SIGMAFI_NODE")).getOrElse(DefaultNode).stripSuffix("/")
+    private var network: Option[NetworkType] = None
+    private var oldProtocol: Option[Protocol] = None
+    private lazy val standard = new StandardProtocol()
+
+    /** Reads commands until `exit` or the end of input. */
+    def shell(): Unit = {
+      println("SigmaFi V2 shell. Commands build the ZC Standard; add --old for the first-generation contracts.")
+      println("Type `help` for the commands, `exit` to quit.")
+      if (launch.flag("send")) println("note: --send at launch is ignored; type it with each command to submit")
+      Try(connected(apiKeyFor(launch))).fold(report, n => println(s"Node $nodeUrl ($n)"))
+      val in = new Scanner(System.in)
+      var open = true
+      while (open) {
+        print("sigmafi> ")
+        System.out.flush()
+        if (!in.hasNextLine) open = false
+        else in.nextLine().trim match {
+          case "" =>
+          case "exit" | "quit" => open = false
+          case line => Try(Args.parse(Args.tokenize(line))).fold(report, a => execute(a.withDefaults(launch)))
+        }
       }
-    sys.exit(code)
-  }
-
-  def run(a: Args): Unit = {
-    if (a.command.isEmpty || a.flag("help")) {
-      println(Usage)
-      return
-    }
-    val nodeUrl = a.opt("node").orElse(env("SIGMAFI_NODE")).getOrElse(DefaultNode).stripSuffix("/")
-    val apiKey = a.opt("api-key").orElse(env("SIGMAFI_API_KEY"))
-    val node = new NodeApi(nodeUrl, apiKey)
-    val network =
-      if (node.info().hcursor.downField("network").as[String].toOption.exists(_.equalsIgnoreCase("testnet")))
-        NetworkType.TESTNET
-      else NetworkType.MAINNET
-    val settings = AppSettings(
-      address = a.opt("address"),
-      walletPass = a.opt("wallet-pass").orElse(env("SIGMAFI_WALLET_PASS")),
-      fee = a.opt("fee").map(parseErg).getOrElse(org.ergoplatform.appkit.Parameters.MinFee),
-      send = a.flag("send"))
-
-    // appkit 6.0.0's RestApiErgoClient.createWithoutExplorer throws, so the context is built over its node-only
-    // data source directly. It reads /info and the last headers: the height, and the state to build against.
-    val ctx = new BlockchainContextBuilderImpl(
-      new NodeDataSourceImpl(new ApiClient(nodeUrl + "/", "ApiKeyAuth", apiKey.getOrElse(""))), network).build()
-    val app = new SigmaFiApp(ctx, node, settings)
-    try dispatch(app, node, a)
-    finally app.close()
-  }
-
-  private def dispatch(app: SigmaFiApp, node: NodeApi, a: Args): Unit = {
-    def one(what: String): String = a.positional match {
-      case Seq(id) => id
-      case _ => throw CliError(s"${a.command.get} takes one argument: the $what")
     }
 
-    a.command.get match {
-      case "info" => info(app, node, a)
-      case "orders" => listOrders(app, node, a.flag("mine"))
-      case "bonds" => listBonds(app, node, a.flag("mine"), a.flag("liquidatable"))
-      case "claims" => listClaims(app, node)
+    /** Runs one command; false if it failed. A fresh context per command: the height moves between them. */
+    def execute(a: Args): Boolean =
+      try {
+        if (a.command.isEmpty || a.command.contains("help") || a.flag("help")) println(Usage)
+        else {
+          val apiKey = apiKeyFor(a)
+          val node = new NodeApi(a.opt("node").map(_.stripSuffix("/")).getOrElse(nodeUrl), apiKey)
+          val ctx = context(node, a.opt("node").map(_.stripSuffix("/")).getOrElse(nodeUrl), apiKey)
+          val settings = AppSettings(
+            address = a.opt("address"),
+            walletPass = a.opt("wallet-pass").orElse(env("SIGMAFI_WALLET_PASS")),
+            fee = a.opt("fee").map(parseErg).getOrElse(org.ergoplatform.appkit.Parameters.MinFee),
+            send = a.flag("send"))
+          if (a.flag("old")) {
+            val app = new SigmaFiApp(ctx, node, settings, compiled = Some(old(ctx)))
+            try OldCommands.dispatch(app, node, a, apiKey.isDefined) finally app.close()
+          } else {
+            val app = new StandardApp(ctx, node, settings, protocol = standard)
+            try StandardCommands.dispatch(app, node, a, apiKey.isDefined) finally app.close()
+          }
+        }
+        true
+      } catch {
+        case e: Exception =>
+          report(e)
+          false
+      }
 
-      case "fill-order" => app.submit(app.fillOrder(one("order box id"), batchingFee(a)))
-      case "claim" => app.submit(app.claim(one("bond asset id")))
+    private def apiKeyFor(a: Args): Option[String] = a.opt("api-key").orElse(env("SIGMAFI_API_KEY"))
 
-      case "create-order" =>
-        if (a.opt("batching-fee").isDefined) throw CliError("--batching-fee is chosen by the lender on fill-order")
-        app.submit(app.createOrder(loan(a), schedule(a, app)))
-      case "cancel-order" => app.submit(app.cancelOrder(one("order box id")))
-      case "repay" => app.submit(app.repay(one("bond box id")))
+    private def connected(apiKey: Option[String]): NetworkType =
+      network.getOrElse {
+        val n = if (new NodeApi(nodeUrl, apiKey).info().hcursor.downField("network").as[String].toOption
+          .exists(_.equalsIgnoreCase("testnet"))) NetworkType.TESTNET else NetworkType.MAINNET
+        network = Some(n)
+        n
+      }
 
-      case "liquidate" => app.submit(app.liquidate(a.positional))
+    /**
+     * appkit 6.0.0's RestApiErgoClient.createWithoutExplorer throws, so the context is built over its node-only
+     * data source directly. It reads /info and the last headers: the height, and the state to build against.
+     */
+    private def context(node: NodeApi, url: String, apiKey: Option[String]): BlockchainContext =
+      new BlockchainContextBuilderImpl(
+        new NodeDataSourceImpl(new ApiClient(url + "/", "ApiKeyAuth", apiKey.getOrElse(""))), connected(apiKey)).build()
 
-      case other => throw CliError(s"unknown command $other; run with --help for the list")
+    private def old(ctx: BlockchainContext): Protocol = oldProtocol.getOrElse {
+      val p = new Protocol(ctx)
+      oldProtocol = Some(p)
+      p
     }
   }
 
-  // ═══ LISTINGS ═════════════════════════════════════════════════════════════
+  // ═══ SHARED ARGUMENT PARSING ══════════════════════════════════════════════
 
-  private def info(app: SigmaFiApp, node: NodeApi, a: Args): Unit = {
-    val p = app.protocol
-    val network = app.networkType
-    println(s"Network: $network; height ${app.height}")
-    indexStatus(node).foreach(println)
-    println(s"BondAssetVault:     ${p.vault.address(network)}")
-    println(s"  hash (CONST_VAULT_HASH):   ${p.vault.hashedPropBytesHex}")
-    println(s"ZC_ERG_Bond:        ${p.ergBond.address(network)}")
-    println(s"  hash:             ${p.ergBond.hashedPropBytesHex}")
-    println(s"ZC_Token_Bond template hash:  ${Base16.encode(p.tokenBondTemplateHash)}")
-    println(s"ZC_Order template hash:       ${Base16.encode(p.orderTemplate.templateHash)}")
-    println(s"ZC_OrderOnClose template hash: ${Base16.encode(p.onCloseTemplate.templateHash)}")
-    p.liquidations.foreach(l => println(s"Liquidation ${l.name}: ${Base16.encode(l.hash)}"))
-    if (a.opt("api-key").orElse(env("SIGMAFI_API_KEY")).isDefined)
-      println(s"Wallet address: ${app.myAddress}")
+  /** The one positional argument a command takes. */
+  def one(a: Args, what: String): String = a.positional match {
+    case Seq(id) => id
+    case _ => throw CliError(s"${a.command.get} takes one argument: the $what")
   }
 
-  private def listOrders(app: SigmaFiApp, node: NodeApi, mine: Boolean): Unit = {
-    indexStatus(node).foreach(System.err.println)
-    val orders = app.orders().filter(o => !mine || app.isWalletHash(o.borrowerHash))
-    if (orders.isEmpty) println("No open orders.")
-    orders.foreach { o =>
-      val bond = app.protocol.pairedBond(o.bondHash, o.principalTokens)
-      println(s"Order ${o.box.id}  " + (o.schedule match {
-        case FixedMaturity(_) => "(fixed maturity)"
-        case OnClose(_) => "(on-close)"
-      }))
-      println(s"  borrow:      ${Fmt.principal(o.principalErg, o.principalTokens)}; repay " +
-        bond.fold("?")(t => Fmt.amount(o.repayment, t)))
-      println("  maturity:    " + (o.schedule match {
-        case FixedMaturity(h) => s"height $h (${h - app.height} blocks from now)"
-        case OnClose(d) => s"$d blocks after the fill"
-      }))
-      println(s"  collateral:  ${Fmt.contents(o.box.value, o.box.tokens)}")
-      println(s"  liquidation: ${liqName(app, o.liqScriptHash)}; fee reserve chosen and funded by lender on fill")
-      if (bond.isEmpty) println("  WARNING: its bond contract does not match its principal; fill-order refuses it")
-      if (app.isOwnHash(o.borrowerHash)) println("  (your order)")
+  /** A lender-funded liquidation reserve: at least the CLI's floor of 0.05 ERG. */
+  def reserve(a: Args, option: String): Long = {
+    val fee = parseErg(a.opt(option).getOrElse(MinimumReserve))
+    if (fee < parseErg(MinimumReserve)) throw CliError(s"--$option must be at least $MinimumReserve ERG")
+    fee
+  }
+
+  /** The first generation's `fill-order --batching-fee`. */
+  def batchingFee(a: Args): Long = reserve(a, "batching-fee")
+
+  def parseErg(s: String): Long = {
+    val nano = Try(BigDecimal(s) * BigDecimal(1000000000L)).getOrElse(throw CliError(s"$s is not an ERG amount"))
+    if (!nano.isWhole || nano < 0) throw CliError(s"$s is not an ERG amount (at most 9 decimals, not negative)")
+    Try(nano.toLongExact).getOrElse(throw CliError(s"$s is too large an ERG amount"))
+  }
+
+  def parseLong(s: String, what: String): Long =
+    Try(s.toLong).filter(_ > 0).getOrElse(throw CliError(s"$what takes a positive whole number, not $s"))
+
+  def parseToken(s: String): Token = s.split(":") match {
+    case Array(id, n) if id.length == 64 && Try(ErgoId.create(id)).isSuccess => Token(ErgoId.create(id), parseLong(n, s"token $id"))
+    case _ => throw CliError(s"$s is not <token id>:<amount>")
+  }
+
+  /** --maturity <height>, --term <blocks> (from now) or --duration <blocks> (from the fill): exactly one. */
+  def schedule(a: Args, height: Int): Schedule =
+    Seq("maturity", "term", "duration").flatMap(k => a.opt(k).map(k -> _)) match {
+      case Seq(("maturity", h)) => FixedMaturity(parseLong(h, "--maturity"))
+      case Seq(("term", n)) => FixedMaturity(Try(Math.addExact(height.toLong, parseLong(n, "--term")))
+        .getOrElse(throw CliError("--term overflows a Long")))
+      case Seq(("duration", n)) => OnClose(parseLong(n, "--duration"))
+      case _ => throw CliError("give exactly one of --maturity <height>, --term <blocks> or --duration <blocks>")
     }
-  }
-
-  private def listBonds(app: SigmaFiApp, node: NodeApi, mine: Boolean, liquidatable: Boolean): Unit = {
-    indexStatus(node).foreach(System.err.println)
-    def matured(b: BondInfo) = app.height.toLong + 1L >= b.maturity
-    val bonds = app.bonds()
-      .filter(b => !liquidatable || matured(b) && app.protocol.liquidationOf(b.liqScriptHash).nonEmpty)
-      .filter(b => !mine || app.isWalletHash(b.borrowerHash) || app.walletHolds(b.asset))
-    if (bonds.isEmpty) println("No bonds.")
-    bonds.foreach { b =>
-      println(s"Bond ${b.box.id}  bond asset ${b.asset}")
-      println(s"  repay:       ${Fmt.amount(b.repayment, b.repayToken)} " + (
-        if (matured(b)) s"(matured at ${b.maturity}: liquidatable by ${liqName(app, b.liqScriptHash)})"
-        else s"before height ${b.maturity} (${b.maturity - app.height} blocks left)"))
-      println(s"  principal:   ${Fmt.principal(b.principalErg, b.principalTokens)}")
-      println(s"  collateral:  ${Fmt.contents(b.collateralErg, b.collateral)}; batching fee ${Fmt.erg(b.batchingFee)}")
-      if (app.isOwnHash(b.borrowerHash)) println("  (you are its borrower)")
-      if (mine && app.walletHolds(b.asset)) println("  (you hold its bond asset)")
-    }
-  }
-
-  private def listClaims(app: SigmaFiApp, node: NodeApi): Unit = {
-    indexStatus(node).foreach(System.err.println)
-    val claimable = app.vaultBoxes().filter { case (asset, _) => app.walletHolds(asset) }
-    if (claimable.isEmpty) println("Nothing to claim.")
-    claimable.foreach { case (asset, boxes) =>
-      println(s"Bond asset $asset: ${Fmt.contents(boxes.map(_.value).sum, boxes.flatMap(_.tokens))} " +
-        s"in ${boxes.size} vault box(es). Claim with: claim $asset")
-    }
-  }
-
-  private def liqName(app: SigmaFiApp, hash: Array[Byte]): String =
-    app.protocol.liquidationOf(hash).fold(s"UNKNOWN (${Base16.encode(hash)})")(_.name)
 
   /** A warning when the node's index trails the chain, since every listing comes from it. */
-  private def indexStatus(node: NodeApi): Option[String] = {
+  def indexStatus(node: NodeApi): Option[String] = {
     val c = node.indexedHeight().hcursor
     for {
       indexed <- c.downField("indexedHeight").as[Int].toOption
@@ -227,59 +234,7 @@ object SigmaFiCli {
     } yield s"warning: the node's index is at height $indexed of $full; results may be incomplete"
   }
 
-  // ═══ ARGUMENTS ════════════════════════════════════════════════════════════
-
-  private def loan(a: Args): Loan = {
-    val token = a.opt("principal-token").map(parseToken)
-    val principalErg = (a.opt("principal"), token) match {
-      case (Some(p), None) => parseErg(p)
-      case (None, Some(_)) => Protocol.MinBox
-      case (Some(_), Some(_)) => throw CliError("give --principal (an ERG loan) or --principal-token (a token loan), not both")
-      case (None, None) => throw CliError("missing --principal <ERG> or --principal-token <token id>:<amount>")
-    }
-    val repayment = a.need("repayment")
-    Loan(
-      principalErg = principalErg,
-      principalToken = token,
-      repayment = if (token.isDefined) parseLong(repayment, "--repayment") else parseErg(repayment),
-      collateralErg = parseErg(a.need("collateral-erg")),
-      collateralTokens = a.opts("collateral-token").map(parseToken),
-      liquidation = a.opt("liquidation").getOrElse("MaturityLiquidation"))
-  }
-
-  private def schedule(a: Args, app: SigmaFiApp): Schedule =
-    Seq("maturity", "term", "duration").flatMap(k => a.opt(k).map(k -> _)) match {
-      case Seq(("maturity", h)) => FixedMaturity(parseLong(h, "--maturity"))
-      case Seq(("term", n)) => FixedMaturity(Try(Math.addExact(app.height.toLong, parseLong(n, "--term"))).getOrElse(throw CliError("--term overflows a Long")))
-      case Seq(("duration", n)) => OnClose(parseLong(n, "--duration"))
-      case _ => throw CliError("give exactly one of --maturity <height>, --term <blocks> or --duration <blocks>")
-    }
-
-  def batchingFee(a: Args): Long = {
-    val fee = parseErg(a.opt("batching-fee").getOrElse(MinimumBatchingFee))
-    if (fee < parseErg(MinimumBatchingFee))
-      throw CliError(s"--batching-fee must be at least $MinimumBatchingFee ERG")
-    fee
-  }
-
-  def parseErg(s: String): Long = {
-    val nano = Try(BigDecimal(s) * BigDecimal(1000000000L)).getOrElse(throw CliError(s"$s is not an ERG amount"))
-    if (!nano.isWhole || nano < 0) throw CliError(s"$s is not an ERG amount (at most 9 decimals, not negative)")
-    nano.toLongExact
-  }
-
-  private def parseLong(s: String, what: String): Long =
-    Try(s.toLong).filter(_ > 0).getOrElse(throw CliError(s"$what takes a positive whole number, not $s"))
-
-  private def parseInt(s: String, what: String): Int =
-    Try(s.toInt).filter(_ > 0).getOrElse(throw CliError(s"$what takes a positive whole number, not $s"))
-
-  private def parseToken(s: String): Token = s.split(":") match {
-    case Array(id, n) if Try(ErgoId.create(id)).isSuccess && id.length == 64 => Token(ErgoId.create(id), parseLong(n, s"token $id"))
-    case _ => throw CliError(s"$s is not <token id>:<amount>")
-  }
-
-  private def env(name: String): Option[String] = sys.env.get(name).filter(_.nonEmpty)
+  def env(name: String): Option[String] = sys.env.get(name).filter(_.nonEmpty)
 }
 
 /** Positional arguments, `--key value` (or `--key=value`) options, and bare flags. */
@@ -288,13 +243,39 @@ case class Args(command: Option[String], positional: Seq[String], options: Map[S
   def opts(key: String): Seq[String] = options.getOrElse(key, Seq.empty)
   def flag(key: String): Boolean = flags.contains(key)
   def need(key: String): String = opt(key).getOrElse(throw CliError(s"missing --$key"))
+
+  /** The shell's launch options fill in the node options a command line leaves out; --send never carries. */
+  def withDefaults(launch: Args): Args =
+    copy(options = launch.options.filter { case (k, _) => Args.SessionOptions.contains(k) } ++ options)
 }
 
 object Args {
-  val Flags: Set[String] = Set("send", "mine", "liquidatable", "help")
-  val Options: Set[String] = Set("node", "api-key", "wallet-pass", "address", "fee",
+  val Flags: Set[String] = Set("send", "mine", "liquidatable", "help", "old", "from-collateral")
+  val SessionOptions: Set[String] = Set("node", "api-key", "wallet-pass", "address", "fee")
+  val Options: Set[String] = SessionOptions ++ Set(
     "principal", "principal-token", "repayment", "collateral-erg", "collateral-token", "batching-fee",
-    "liquidation", "maturity", "term", "duration")
+    "liquidation", "maturity", "term", "duration",
+    "market", "ratio", "oracle-age", "expires-in", "expiry-fee", "fee-reserve", "add-erg", "add-token")
+
+  /** Splits a shell line on whitespace, keeping "double" or 'single' quoted text together. */
+  def tokenize(line: String): Seq[String] = {
+    val out = Vector.newBuilder[String]
+    val cur = new StringBuilder
+    var quote: Option[Char] = None
+    var started = false
+    line.foreach { ch =>
+      quote match {
+        case Some(q) if ch == q => quote = None
+        case Some(_) => cur += ch
+        case None if ch == '"' || ch == '\'' => quote = Some(ch); started = true
+        case None if ch.isWhitespace => if (started || cur.nonEmpty) { out += cur.toString; cur.clear(); started = false }
+        case None => cur += ch
+      }
+    }
+    if (quote.isDefined) throw CliError("unterminated quote")
+    if (started || cur.nonEmpty) out += cur.toString
+    out.result()
+  }
 
   def parse(args: Seq[String]): Args = {
     val positional = Vector.newBuilder[String]
@@ -321,7 +302,7 @@ object Args {
             }
             options(key) = options.getOrElse(key, Vector.empty) :+ value
             rest = after
-          } else throw CliError(s"unknown option --$key; run with --help for the list")
+          } else throw CliError(s"unknown option --$key; run help for the list")
         case arg :: tail =>
           positional += arg
           rest = tail

@@ -1,5 +1,5 @@
 {
-    // Standard fractionalization request. No off-chain code exists yet.
+    // Standard fractionalization request.
     // Holds one circulating bond unit and turns it into N fungible shares backed by a
     // ZC_Standard_FractionalVault. Fractionalization is optional and separate from the bond: an order
     // fill can name this script as its OUTPUTS(0), or a holder can deposit the unit at any later

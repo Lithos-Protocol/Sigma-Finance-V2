@@ -1,5 +1,5 @@
 {
-    // Standard lend offer (a yield bid). No specs and no off-chain code exist yet.
+    // Standard lend offer (a yield bid).
     // Holds a lender's capital and buys standard bonds that clear a minimum simple-interest yield:
     // new ones, by filling a ZC_Standard_Order, and existing ones, from any ask that follows the ask
     // convention below (ZC_Standard_SaleOrder, ZC_Standard_NavAsk, or a later one). The lender is never assumed to

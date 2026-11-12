@@ -37,3 +37,11 @@ resolvers ++= Seq(
 
 fork := true
 javaOptions ++= Seq("-Xmx2g")
+
+// The CLI is a shell that reads commands from stdin: a forked run needs its input connected, and its
+// output written straight to the terminal rather than through sbt's logger.
+Compile / run / connectInput := true
+Compile / run / outputStrategy := Some(StdoutOutput)
+
+// `sbt sigmafi` starts the shell; anything after it is passed on, e.g. `sbt "sigmafi --node <url>"`.
+addCommandAlias("sigmafi", "runMain ksingh.sigmabonds.app.SigmaFiCli")

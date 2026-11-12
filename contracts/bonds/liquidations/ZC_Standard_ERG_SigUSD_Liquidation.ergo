@@ -1,5 +1,5 @@
 {
-    // Standard ERG/SigUSD liquidation expression. No off-chain code exists yet.
+    // Standard ERG/SigUSD liquidation expression.
     // For ZC_Standard_Bond only, executed via host context var 0 with the bond as SELF.
     // CONST_REPAYMENT_TOKEN: Coll[Byte] - the bond's repayment asset: EMPTY for ERG, or SigUSD. It must
     //   match the bond tree this rule is used with; one compiled rule, and one hash, per asset.

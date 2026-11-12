@@ -1,5 +1,5 @@
 {
-    // Standard maturity liquidation expression. No off-chain code exists yet.
+    // Standard maturity liquidation expression.
     // For ZC_Standard_Bond only, executed through the bond's context var 0 with the bond as SELF.
     // Bond R9 = (lender liquidation fee reserve, start height, maturity height).
     // At or after maturity, send every bond token (the reserve, then all collateral) and at least
