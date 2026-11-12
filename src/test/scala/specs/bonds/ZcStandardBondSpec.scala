@@ -122,15 +122,19 @@ class ZcStandardBondSpec extends AnyPropSpec with ZcStandardSpecBase {
     }
   }
 
-  property("order: the start height must lie within 8 blocks of the fill") {
+  property("order: the start height must lie within 8 blocks of the fill and be the bond's creation height") {
     withCtx { ctx =>
       val f = flow(ctx)
-      def startAt(start: Long): UnsignedTransaction =
-        standardFillTx(f, bond = f.bond.withRegNum(9, longsValue(f.fee, start, f.maturity)))
+      def startAt(start: Long): UnsignedTransaction = standardFillTx(f, bond = startingAt(f, start))
       accepts(f.holder, startAt(f.height.toLong))
       accepts(f.holder, startAt(f.height - 8L))
       rejectsAtSigning(f.holder, startAt(f.height - 9L))
       rejectsAtSigning(f.holder, startAt(f.height + 1L))
+      // The bond counts its recollateralize wait from its creation height: a later stamp would lock
+      // the borrower out, an earlier one would let the first wait be skipped.
+      Seq(f.height - 1, f.height + 1, f.height + 1000, 0).foreach { stamp =>
+        rejectsAtSigning(f.holder, standardFillTx(f, bond = f.bond.setCreationHeight(stamp)))
+      }
     }
   }
 
@@ -151,9 +155,9 @@ class ZcStandardBondSpec extends AnyPropSpec with ZcStandardSpecBase {
       val f = flow(ctx, style = OnClose, duration = 30L)
       accepts(f.holder, standardFillTx(f))
       val early = f.height - 8L
-      accepts(f.holder, standardFillTx(f, bond = f.bond.withRegNum(9, longsValue(f.fee, early, early + 30L))))
+      accepts(f.holder, standardFillTx(f, bond = startingAt(f, early, early + 30L)))
       // A start in the past cannot keep the later maturity: the two move together.
-      rejectsAtSigning(f.holder, standardFillTx(f, bond = f.bond.withRegNum(9, longsValue(f.fee, early, f.maturity))))
+      rejectsAtSigning(f.holder, standardFillTx(f, bond = startingAt(f, early, f.maturity)))
       rejectsAtSigning(f.holder, standardFillTx(f, bond = f.bond.withRegNum(9, longsValue(f.fee, f.start, f.maturity + 1L))))
       val short = flow(ctx, style = OnClose, duration = 29L)
       rejectsAtSigning(short.holder, standardFillTx(short))
@@ -262,9 +266,11 @@ class ZcStandardBondSpec extends AnyPropSpec with ZcStandardSpecBase {
           settle.setTokens(Token(f.asset, 1L) +: settle.tokens.drop(1): _*),
           settle.setTokens(settle.tokens :+ Token(secondCollateral, 1L): _*))
         bad.foreach(out => rejectsAtSigning(f.owner, standardRepayTx(f, bond, settle = out)))
+        // A third party repays: only the borrower's co-spend lets the return keep anything back.
+        accepts(other(ctx), standardRepayTx(f, bond, payer = other(ctx)))
         Seq(returned.subValue(1L), returned.setContract(otherTree(ctx)),
           returned.withRegNum(4, bytesValue(originOrderId)), returned.setTokens()).foreach { out =>
-          rejectsAtSigning(f.owner, standardRepayTx(f, bond, returned = out))
+          rejectsAtSigning(other(ctx), standardRepayTx(f, bond, returned = out, payer = other(ctx)))
         }
       }
     }
@@ -292,24 +298,28 @@ class ZcStandardBondSpec extends AnyPropSpec with ZcStandardSpecBase {
 
   // ═══ RECOLLATERALIZE ══════════════════════════════════════════════════════
 
-  property("recollateralize: the borrower adds at least 1% of one collateral asset before maturity") {
+  property("recollateralize: the borrower adds ERG or a held token once the bond has rested 60 blocks") {
     withCtx { ctx =>
       val f = flow(ctx)
-      val bond = spendOutput(filled(f), 1).withCtxVar(3.toByte, ErgoValue.of(0))
+      val bond = spendOutput(filled(f), 1)
       val same = bond.toUTXO
-      val onePercent = f.collateralValue / 100L
-      def tx(out: UTXO, by: ErgoProver = f.owner, height: Int = f.height + 1): UnsignedTransaction =
-        buildAt(ctx, height, Seq(bond, funding(ctx, by, 6, slack, Seq(Token(collateralToken, 50L)))),
-          Seq(out), by.getAddress)
+      val open = f.height + recollateralizeWait
+      def tx(out: UTXO, by: ErgoProver = f.owner, height: Int = open, stamp: Int = -1): UnsignedTransaction =
+        recollateralizeTx(f, bond, out, height, by, stamp, Seq(Token(collateralToken, 50L)))
       val moreTokens = same.setTokens(Token(f.asset, 2L), Token(collateralToken, 101L))
 
-      accepts(f.owner, tx(same.addValue(onePercent)))
+      // One unit of anything is enough: the wait, not the amount, stops a borrower dodging a liquidation.
+      accepts(f.owner, tx(same.addValue(1L)))
       accepts(f.owner, tx(moreTokens))
-      rejectsAtSigning(f.owner, tx(same.addValue(onePercent - 1L)))
       rejectsAtSigning(f.owner, tx(same))
       // Open to nobody else: a stranger could otherwise re-spend the bond and void pending repayments.
-      rejectsAtSigning(other(ctx), tx(same.addValue(onePercent), by = other(ctx)))
-      rejectsAtSigning(f.owner, tx(same.addValue(onePercent), height = f.maturity.toInt))
+      rejectsAtSigning(other(ctx), tx(same.addValue(1L), by = other(ctx)))
+      rejectsAtSigning(f.owner, tx(same.addValue(1L), height = open - 1))
+      rejectsAtSigning(f.owner, tx(same.addValue(1L), height = f.maturity.toInt))
+      // The successor's stamp restarts the wait: at most 15 blocks old, and never ahead of inclusion.
+      accepts(f.owner, tx(same.addValue(1L), stamp = open - stampSlack))
+      rejectsAtSigning(f.owner, tx(same.addValue(1L), stamp = open - stampSlack - 1))
+      rejectsAtSigning(f.owner, tx(same.addValue(1L), stamp = open + 1))
       val changed = Seq(
         same.withRegNum(9, longsValue(f.fee, f.start, f.maturity + 1L)),
         same.withRegNum(9, longsValue(0L, f.start, f.maturity)),
@@ -317,24 +327,146 @@ class ZcStandardBondSpec extends AnyPropSpec with ZcStandardSpecBase {
         same.withRegNum(5, bytesValue(hashOf(otherTree(ctx)))),
         same.withRegNum(8, bytesValue(alwaysTrue(ctx).hashedValueBytes)),
         same.setContract(otherTree(ctx)))
-      changed.foreach(out => rejectsAtSigning(f.owner, tx(out.addValue(onePercent))))
+      changed.foreach(out => rejectsAtSigning(f.owner, tx(out.addValue(1L))))
       // More ERG cannot pay for taking a collateral token out.
-      rejectsAtSigning(f.owner, tx(same.addValue(onePercent).setTokens(Token(f.asset, 2L), Token(collateralToken, 99L))))
+      rejectsAtSigning(f.owner, tx(same.addValue(1L).setTokens(Token(f.asset, 2L), Token(collateralToken, 99L))))
+    }
+  }
+
+  property("recollateralize: moves land at least 45 blocks apart, 60 after a fresh stamp") {
+    withCtx { ctx =>
+      val f = flow(ctx, kind = ErgBond)
+      val bond = spendOutput(filled(f), 1)
+      val first = f.height + recollateralizeWait
+      def moved(stamp: Int): InputUTXO =
+        spendOutput(accepts(f.owner, recollateralizeTx(f, bond, bond.toUTXO.addValue(1L), first, stamp = stamp)), 0)
+      def again(from: InputUTXO, height: Int): UnsignedTransaction =
+        recollateralizeTx(f, from, from.toUTXO.addValue(1L), height)
+      // The oldest stamp allowed opens the next move 45 blocks after this one lands.
+      val stale = moved(first - stampSlack)
+      accepts(f.owner, again(stale, first + 45))
+      rejectsAtSigning(f.owner, again(stale, first + 44))
+      val fresh = moved(first)
+      accepts(f.owner, again(fresh, first + 60))
+      rejectsAtSigning(f.owner, again(fresh, first + 59))
+    }
+  }
+
+  property("recollateralize: a bond maturing within 60 blocks of its start never can") {
+    withCtx { ctx =>
+      Seq(60L -> false, 61L -> true).foreach { case (duration, possible) =>
+        val f = flow(ctx, kind = ErgBond, style = OnClose, duration = duration)
+        val bond = spendOutput(filled(f), 1)
+        def at(height: Int): UnsignedTransaction = recollateralizeTx(f, bond, bond.toUTXO.addValue(1L), height)
+        rejectsAtSigning(f.owner, at(f.height + recollateralizeWait - 1))
+        if (possible) accepts(f.owner, at(f.height + recollateralizeWait))
+        else rejectsAtSigning(f.owner, at(f.height + recollateralizeWait))
+      }
+    }
+  }
+
+  property("recollateralize: a token bond may take on its repayment token, appended last, and nothing else new") {
+    withCtx { ctx =>
+      val f = flow(ctx, TokenBond)
+      val bond = spendOutput(filled(f), 1)
+      val same = bond.toUTXO
+      val open = f.height + recollateralizeWait
+      val funds = Seq(Token(SigUSD, 1000L), Token(stableToken, 10L))
+      def tx(out: UTXO): UnsignedTransaction = recollateralizeTx(f, bond, out, open, funds = funds)
+      accepts(f.owner, tx(same.setTokens(same.tokens :+ Token(SigUSD, 1L): _*)))
+      accepts(f.owner, tx(same.setTokens(same.tokens :+ Token(SigUSD, 1000L): _*).addValue(1L)))
+      Seq(
+        same.setTokens(same.tokens :+ Token(stableToken, 1L): _*),
+        same.setTokens(Token(f.asset, 2L), Token(SigUSD, 1L), Token(collateralToken, 100L)),
+        same.setTokens(same.tokens ++ Seq(Token(SigUSD, 1L), Token(stableToken, 1L)): _*)
+      ).foreach(out => rejectsAtSigning(f.owner, tx(out)))
+
+      // An ERG bond's repayment asset is ERG, which it always holds: it takes on no token at all.
+      val e = flow(ctx, ErgBond)
+      val ergBond = spendOutput(filled(e), 1)
+      rejectsAtSigning(e.owner, recollateralizeTx(e, ergBond,
+        ergBond.toUTXO.setTokens(ergBond.tokens :+ Token(SigUSD, 1L): _*), e.height + recollateralizeWait, funds = funds))
+      // A bond that already holds its repayment token grows that entry instead.
+      val held = flow(ctx, TokenBond, collateral = Seq(Token(SigUSD, 100L)))
+      val heldBond = spendOutput(filled(held), 1)
+      // A second entry of the held token cannot be tested here: the signer refuses the duplicate id
+      // before the script runs, so the bond's own check against it is defensive only.
+      accepts(held.owner, recollateralizeTx(held, heldBond,
+        heldBond.toUTXO.setTokens(Token(held.asset, 2L), Token(SigUSD, 101L)), held.height + recollateralizeWait,
+        funds = funds))
     }
   }
 
   property("recollateralize: the new bond box repays and returns the larger collateral") {
     withCtx { ctx =>
       val f = flow(ctx, kind = ErgBond)
-      val bond = spendOutput(filled(f), 1).withCtxVar(3.toByte, ErgoValue.of(0))
+      val bond = spendOutput(filled(f), 1)
       val added = f.collateralValue / 2L
-      val grown = accepts(f.owner, buildAt(ctx, f.height + 1, Seq(bond, funding(ctx, f.owner, 6)),
-        Seq(bond.toUTXO.addValue(added)), f.owner.getAddress))
+      val grown = accepts(f.owner, recollateralizeTx(f, bond, bond.toUTXO.addValue(added), f.height + recollateralizeWait))
       val next = repayInput(spendOutput(grown, 0))
       next.id should not be bond.id
       val repaid = accepts(f.owner, standardRepayTx(f, next))
       repaid.getOutputsToSpend.get(1).getValue shouldBe f.collateralValue + added
       repaid.getOutputsToSpend.get(0).getRegisters.get(0) shouldBe bytesValue(next.id.getBytes)
+    }
+  }
+
+  property("recollateralize: a token bond appends its repayment token, then repays from it alone") {
+    withCtx { ctx =>
+      val f = flow(ctx, TokenBond)
+      val bond = spendOutput(filled(f), 1)
+      val owed = Token(SigUSD, f.data(0))
+      val grown = accepts(f.owner, recollateralizeTx(f, bond, bond.toUTXO.setTokens(bond.tokens :+ owed: _*),
+        f.height + recollateralizeWait, funds = Seq(owed)))
+      val next = repayInput(spendOutput(grown, 0))
+      // The borrower brings no SigUSD: the appended collateral pays the vault, the rest comes back.
+      val repaid = accepts(f.owner, standardRepayTx(f, next,
+        returned = returnedBox(f, next).setTokens(f.collateral: _*), funds = Seq.empty))
+      repaid.getOutputsToSpend.get(0).getTokens.get(1).getValue.longValue shouldBe f.data(0)
+    }
+  }
+
+  // ═══ REPAY FROM COLLATERAL ════════════════════════════════════════════════
+
+  property("repay from collateral: an ERG bond's borrower keeps back up to the repayment in nanoERG") {
+    withCtx { ctx =>
+      val f = flow(ctx, ErgBond)
+      val bond = repayInput(spendOutput(filled(f), 1))
+      val netted = returnedBox(f, bond).subValue(f.data(0))
+      // The vault is paid exactly as before; the borrower's own box only pays the miner.
+      val repaid = accepts(f.owner, standardRepayTx(f, bond, returned = netted))
+      repaid.getOutputsToSpend.get(0).getValue shouldBe repaymentValue(f)
+      rejectsAtSigning(f.owner, standardRepayTx(f, bond, returned = netted.subValue(1L)))
+      rejectsAtSigning(f.owner, standardRepayTx(f, bond, settle = repaidBox(f, bond).subValue(1L), returned = netted))
+      // Only the borrower: a third party who repays returns every nanoERG.
+      rejectsAtSigning(other(ctx), standardRepayTx(f, bond, returned = netted, payer = other(ctx)))
+    }
+  }
+
+  property("repay from collateral: a token bond's borrower keeps back up to the repayment in its token") {
+    withCtx { ctx =>
+      // 1000 SigUSD of collateral against a 700 repayment: 700 pay the vault and 300 come back.
+      val f = flow(ctx, TokenBond, collateral = Seq(Token(collateralToken, 100L), Token(SigUSD, 1000L)))
+      val bond = repayInput(spendOutput(filled(f), 1))
+      val returned = returnedBox(f, bond)
+      val netted = returned.setTokens(Token(collateralToken, 100L), Token(SigUSD, 300L))
+      def repay(out: UTXO, payer: ErgoProver = f.owner): UnsignedTransaction =
+        standardRepayTx(f, bond, returned = out, payer = payer, funds = Seq.empty)
+      accepts(f.owner, repay(netted))
+      Seq(
+        returned.setTokens(Token(collateralToken, 100L), Token(SigUSD, 299L)),
+        // Only the repayment token, never another collateral token or the collateral ERG.
+        returned.setTokens(Token(collateralToken, 99L), Token(SigUSD, 300L)),
+        netted.subValue(1L)
+      ).foreach(out => rejectsAtSigning(f.owner, repay(out)))
+      rejectsAtSigning(other(ctx), repay(netted, payer = other(ctx)))
+
+      // Less held than owed: the token leaves the return entirely and the borrower brings the rest.
+      val short = flow(ctx, TokenBond, collateral = Seq(Token(collateralToken, 100L), Token(SigUSD, 400L)))
+      val shortBond = repayInput(spendOutput(filled(short), 1))
+      accepts(short.owner, standardRepayTx(short, shortBond,
+        returned = returnedBox(short, shortBond).setTokens(Token(collateralToken, 100L)),
+        funds = Seq(Token(SigUSD, 300L))))
     }
   }
 
@@ -439,16 +571,31 @@ class ZcStandardBondSpec extends AnyPropSpec with ZcStandardSpecBase {
     }
   }
 
-  property("oracle: recollateralizing above the ratio stops a liquidation that was open") {
+  property("oracle: recollateralizing up to the ratio stops a liquidation that was open") {
     withCtx { ctx =>
       val f = oracleFlow(ctx, 6000000000L - 1L)
       val bond = spendOutput(filled(f), 1)
-      accepts(executor(ctx), standardLiquidationTx(f, liquidationInput(f, bond),
-        data = Seq(oracleBox(f)), height = f.height))
-      val grown = accepts(f.owner, buildAt(ctx, f.height, Seq(bond.withCtxVar(3.toByte, ErgoValue.of(0)),
-        funding(ctx, f.owner, 6)), Seq(bond.toUTXO.addValue(f.collateralValue / 100L)), f.owner.getAddress))
+      val at = f.height + recollateralizeWait
+      val oracle = Seq(oracleBox(f, created = at))
+      accepts(executor(ctx), standardLiquidationTx(f, liquidationInput(f, bond), data = oracle, height = at))
+      // One nanoERG lifts it to exactly the ratio, which is not below it.
+      val grown = accepts(f.owner, recollateralizeTx(f, bond, bond.toUTXO.addValue(1L), at))
       rejectsAtSigning(executor(ctx), standardLiquidationTx(f, liquidationInput(f, spendOutput(grown, 0)),
-        data = Seq(oracleBox(f)), height = f.height))
+        data = oracle, height = at))
+    }
+  }
+
+  property("oracle: the wait leaves a borrower one dodged liquidation, not one per block") {
+    withCtx { ctx =>
+      val f = oracleFlow(ctx, 6000000000L - 2L)
+      val bond = spendOutput(filled(f), 1)
+      val at = f.height + recollateralizeWait
+      val oracle = Seq(oracleBox(f, created = at))
+      // One nanoERG leaves it below the ratio but moves the box, voiding the pending liquidation.
+      val dodged = spendOutput(accepts(f.owner, recollateralizeTx(f, bond, bond.toUTXO.addValue(1L), at)), 0)
+      // The liquidator rebuilds against the new box, and the borrower cannot move it again in time.
+      rejectsAtSigning(f.owner, recollateralizeTx(f, dodged, dodged.toUTXO.addValue(1L), at + 1))
+      accepts(executor(ctx), standardLiquidationTx(f, liquidationInput(f, dodged), data = oracle, height = at + 1))
     }
   }
 }

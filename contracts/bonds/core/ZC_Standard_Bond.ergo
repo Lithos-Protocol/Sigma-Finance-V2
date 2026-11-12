@@ -14,7 +14,8 @@
     // TOKENS
     // tokens(0): (bond asset, 2) - the reserve. It is NEVER burned here: it moves to the vault on
     //   settlement, so the box holding 2 units stays the asset's state box (see ZC_Standard_Order).
-    // tokens(1..): collateral tokens
+    // tokens(1..): collateral tokens. The order's tokens, and for a token bond possibly the
+    //   repayment token, appended last by a recollateralization.
     //
     // REGISTERS (all pinned by ZC_Standard_Order)
     // R4: Coll[Byte] - originating order id, which is also the bond asset id
@@ -31,6 +32,8 @@
     // R8: Coll[Byte] - blake2b256 of the serialized liquidation expression
     // R9: Coll[Long] - (lender liquidation fee reserve, start height, maturity height)
     // Value minus R9(0) is collateral nanoERG.
+    // Creation height: when the bond last moved. The order sets it to the start height R9(1); each
+    // recollateralization stamps a new one (see RECOLLATERALIZE).
     //
     // PATHS AND CONTEXT VARS
     // Liquidation: 0 Coll[Byte] liquidation expression; 1 Int settlement output index.
@@ -44,17 +47,34 @@
     //   Collateral returns to the borrower script, tagged R4 = SELF.id. Requires HEIGHT < maturity.
     // Liquidation: the agreed expression decides eligibility and the vault's value and tokens(1..).
     //
+    // REPAYING FROM COLLATERAL
+    // With a borrower-script co-spend, the return box may hold up to R6(0) less of the repayment
+    // asset than the bond does: nanoERG for an ERG bond, the repayment token for a token bond. The
+    // settlement is unchanged, so the lender is paid exactly the same; the borrower brings only what
+    // the collateral does not cover (for a token bond, also the ERG floor beside the token). Every
+    // other collateral token returns exactly, and without the co-spend nothing may be kept back, so
+    // a third party who repays cannot take any collateral. Without this, a borrower whose spare funds
+    // sit in the bond must find the repayment elsewhere or lose everything at maturity liquidation.
+    //
     // RECOLLATERALIZE
-    // The borrower adds collateral before maturity, e.g. to stay above an oracle ratio. The successor
-    // has this script, identical registers and token ids, and no amount lower. It needs a borrower-
-    // script co-spend: an open path would let anyone re-spend the bond every block and invalidate
-    // pending repayments. At least one collateral asset must grow by >= 1% (and >= 1 unit), so the
-    // borrower cannot dodge a pending liquidation for free. The box id changes; the asset does not.
+    // The borrower adds collateral before maturity, e.g. to stay above an oracle ratio. It needs a
+    // borrower-script co-spend: an open path would let anyone re-spend the bond and invalidate
+    // pending repayments. The successor has this script, identical registers, the same tokens with no
+    // amount lower, and more of something: ERG, a held token, or, for a token bond holding none of
+    // it, the repayment token appended last. No other new token: every rule values the repayment
+    // asset, and a token nobody prices would add nothing.
+    // At most once per 60 blocks, counted from the box's creation height. The successor must stamp a
+    // creation height within 15 blocks of inclusion, so two recollateralizations land at least 45
+    // blocks apart, and a bond maturing within 60 blocks of its start can never be recollateralized.
+    // The wait is what stops a borrower dodging a pending liquidation: re-spending the bond voids the
+    // liquidator's transaction, but the liquidator rebuilds against the new box, which the borrower
+    // cannot move again in time. The box id changes; the asset does not.
     //
     // ASSUMPTIONS
     // A hand-made box with this script proves nothing: authenticate the asset's order (ZC_Standard_Order).
     // The liquidation expression controls the vault's contents; both parties must inspect it.
     // Anyone may repay in full. Liquidation may run before maturity if the expression allows it.
+    // An anyone-can-spend borrower script lets anyone recollateralize or repay from collateral.
     // Storage rent, live-node serialization and maximum cost are unverified.
 
     val borrower = SELF.R6[Coll[Long]].get
@@ -69,6 +89,14 @@
         val collateral = SELF.tokens.slice(1, SELF.tokens.size)
         val liquidationScript = getVar[Coll[Byte]](0)
         val recollateralizeIndex = getVar[Int](3)
+        val repaymentToken = CONST_REPAYMENT_TOKEN
+        // An empty collection taken from the box, not written as a literal. Testing the constant
+        // alone (its size) is folded at compile time, which gives the ERG and token bonds different
+        // templates and breaks listing every bond by template hash.
+        val noToken = SELF.id.slice(0, 0)
+        val borrowerAuth = INPUTS.exists { (b: Box) =>
+            b.id != SELF.id && blake2b256(b.propositionBytes) == borrowerHash
+        }
 
         if (fee < 0L || fee > SELF.value - 1000000L) {
             sigmaProp(false)
@@ -98,20 +126,32 @@
                     } else {
                         val returnBox = OUTPUTS(returnIndex)
                         val repayment = borrower(0)
-                        val repaymentToken = CONST_REPAYMENT_TOKEN
-                        // An empty collection taken from the box, not written as a literal. Testing the
-                        // constant alone (its size) is folded at compile time, which gives the ERG and
-                        // token bonds different templates and breaks listing every bond by template hash.
-                        val noToken = SELF.id.slice(0, 0)
+                        val repaysERG = repaymentToken == noToken
                         // Subtract the fee refund rather than add to the terms, to avoid overflow.
                         val ergPaid = settlement.value >= fee && settlement.value - fee >= borrower(2)
-                        val assetPaid = if (repaymentToken == noToken) {
+                        val assetPaid = if (repaysERG) {
                             settlement.tokens.size == 1 && settlement.value - fee >= repayment
                         } else {
                             settlement.tokens.size == 2 &&
                             settlement.tokens(1)._1 == repaymentToken &&
                             settlement.tokens(1)._2 >= repayment
                         }
+                        // What the borrower may keep back from the return box, in the repayment asset.
+                        val fromCollateral = if (borrowerAuth) repayment else 0L
+                        val heldRepayment = collateral.fold(0L, { (a: Long, t: (Coll[Byte], Long)) =>
+                            if (t._1 == repaymentToken) a + t._2 else a
+                        })
+                        val returnedRepayment = returnBox.tokens.fold(0L, { (a: Long, t: (Coll[Byte], Long)) =>
+                            if (t._1 == repaymentToken) a + t._2 else a
+                        })
+                        val otherCollateral = collateral.filter { (t: (Coll[Byte], Long)) => t._1 != repaymentToken }
+                        val otherReturned = returnBox.tokens.filter { (t: (Coll[Byte], Long)) => t._1 != repaymentToken }
+                        // No overflow: SELF.value - fee is at least 1000000, the repayment at most Long.MaxValue.
+                        val ergReturned = if (repaysERG) SELF.value - fee - fromCollateral else SELF.value - fee
+                        val collateralReturned =
+                            otherReturned == otherCollateral &&
+                            returnedRepayment >= heldRepayment - fromCollateral &&
+                            returnBox.value >= ergReturned
                         val repaid =
                             HEIGHT.toLong < maturity &&
                             toVault &&
@@ -119,8 +159,7 @@
                             ergPaid && assetPaid &&
                             blake2b256(returnBox.propositionBytes) == borrowerHash &&
                             returnBox.R4[Coll[Byte]].get == SELF.id &&
-                            returnBox.tokens == collateral &&
-                            returnBox.value >= SELF.value - fee
+                            collateralReturned
                         sigmaProp(repaid)
                     }
                 }
@@ -132,12 +171,18 @@
                 sigmaProp(false)
             } else {
                 val next = OUTPUTS(index)
-                if (next.tokens.size != SELF.tokens.size) {
+                val size = SELF.tokens.size
+                val holdsRepayment = collateral.exists { (t: (Coll[Byte], Long)) => t._1 == repaymentToken }
+                // A token bond holding none of its repayment token may take it on, appended last. No
+                // token id equals an ERG bond's empty constant, so an ERG bond can never append.
+                // holdsRepayment is defensive: offline signing already refuses a duplicate token id.
+                val appended =
+                    next.tokens.size == size + 1 &&
+                    !holdsRepayment &&
+                    next.tokens(size)._1 == repaymentToken
+                if (next.tokens.size != size && !appended) {
                     sigmaProp(false)
                 } else {
-                    val borrowerAuth = INPUTS.exists { (b: Box) =>
-                        b.id != SELF.id && blake2b256(b.propositionBytes) == borrowerHash
-                    }
                     val sameTerms =
                         next.propositionBytes == SELF.propositionBytes &&
                         next.R4[Coll[Byte]].get == SELF.R4[Coll[Byte]].get &&
@@ -152,15 +197,15 @@
                         SELF.tokens.indices.forall { (j: Int) =>
                             next.tokens(j)._1 == SELF.tokens(j)._1 && next.tokens(j)._2 >= SELF.tokens(j)._2
                         }
-                    val ergAdded = next.value - SELF.value
-                    val ergGrown = ergAdded >= 1L && ergAdded >= (SELF.value - fee) / 100L
-                    val tokenGrown = SELF.tokens.indices.exists { (j: Int) =>
-                        val added = next.tokens(j)._2 - SELF.tokens(j)._2
-                        j >= 1 && added >= 1L && added >= SELF.tokens(j)._2 / 100L
-                    }
+                    val tokenGrown = SELF.tokens.indices.exists { (j: Int) => next.tokens(j)._2 > SELF.tokens(j)._2 }
+                    val grown = appended || next.value > SELF.value || tokenGrown
+                    // The wait: 60 blocks since the bond last moved, and a fresh stamp on the successor.
+                    val stamped = next.creationInfo._1.toLong
+                    val rested = HEIGHT.toLong >= SELF.creationInfo._1.toLong + 60L
+                    val restamped = stamped >= HEIGHT.toLong - 15L && stamped <= HEIGHT.toLong
                     sigmaProp(
-                        HEIGHT.toLong < maturity && borrowerAuth && sameTerms && noneLower &&
-                        (ergGrown || tokenGrown)
+                        HEIGHT.toLong < maturity && borrowerAuth && rested && restamped &&
+                        sameTerms && noneLower && grown
                     )
                 }
             }

@@ -178,9 +178,10 @@ trait ZcStandardSpecBase extends BondSpecBase {
     val order = UTXO(orderOf(ctx, kind), collateralValue + expiryFee, collateral,
       Seq(longsValue(data: _*), Protocol.tokensValue(principalTokens), borrowerHash, liqHash))
     val input = inputAt(order, ctx, 0)
+    // Created at the start height, as the order requires: the bond's recollateralize wait counts from it.
     val bond = UTXO(bondOf(ctx, kind), collateralValue + fee, Token(input.id, 2L) +: collateral,
       Seq(bytesValue(input.id.getBytes), borrowerHash, longsValue(data: _*),
-        Protocol.tokensValue(principalTokens), liqHash, longsValue(fee, height.toLong, maturity)))
+        Protocol.tokensValue(principalTokens), liqHash, longsValue(fee, height.toLong, maturity)), Some(height))
     Flow(ctx, kind, style, order, input,
       funding(ctx, lender(ctx), 1, principalERG + fee + slack, principalTokens),
       UTXO(lenderTree(ctx), minBox, Seq(Token(input.id, 1L)), eip4()),
@@ -193,8 +194,13 @@ trait ZcStandardSpecBase extends BondSpecBase {
   protected def moveFill(f: Flow, height: Int): Flow = {
     val maturity = if (f.style == FixedHeight) f.maturity else height.toLong + f.data(3)
     f.copy(height = height, start = height.toLong, maturity = maturity,
-      bond = f.bond.withRegNum(9, longsValue(f.fee, height.toLong, maturity)))
+      bond = f.bond.withRegNum(9, longsValue(f.fee, height.toLong, maturity)).setCreationHeight(height))
   }
+
+  /** A bond starting at `start`: R9's start height and the box's creation height, which must agree. */
+  protected def startingAt(f: Flow, start: Long, maturity: Long = -1L): UTXO =
+    f.bond.withRegNum(9, longsValue(f.fee, start, if (maturity < 0L) f.maturity else maturity))
+      .setCreationHeight(start.toInt)
 
   protected def standardFillTx(f: Flow, unit: UTXO = null, bond: UTXO = null, principal: UTXO = null,
                                inputs: Seq[InputUTXO] = null, height: Int = -1): UnsignedTransaction =
@@ -228,14 +234,39 @@ trait ZcStandardSpecBase extends BondSpecBase {
   protected def returnedBox(f: Flow, bond: InputUTXO): UTXO =
     tagged(borrowerTree(f.ctx), bond.value - f.fee, bond.id, bond.tokens.drop(1))
 
-  /** `bond` must already carry the repayment context vars. Outputs: 0 the vault, 1 the collateral return. */
+  /**
+   * `bond` must already carry the repayment context vars. Outputs: 0 the vault, 1 the collateral return.
+   * The payer funds it and takes the change; by default that is the borrower, whose box is then a
+   * co-spend that lets the return keep back up to the repayment.
+   */
   protected def standardRepayTx(f: Flow, bond: InputUTXO, settle: UTXO = null, returned: UTXO = null,
-                                height: Int = -1): UnsignedTransaction =
+                                height: Int = -1, payer: ErgoProver = null,
+                                funds: Seq[Token] = null): UnsignedTransaction = {
+    val p = if (payer == null) f.owner else payer
     buildAt(f.ctx, if (height < 0) (f.maturity - 1L).toInt else height,
       // One unit of an unrelated token rides along, for negatives that try to slip it into the vault.
-      Seq(bond, funding(f.ctx, f.owner, 7, slack, repaymentAssets(f) :+ Token(secondCollateral, 1L))),
+      Seq(bond, funding(f.ctx, p, 7, slack,
+        (if (funds == null) repaymentAssets(f) else funds) :+ Token(secondCollateral, 1L))),
       Seq(if (settle == null) repaidBox(f, bond) else settle,
-        if (returned == null) returnedBox(f, bond) else returned), f.owner.getAddress)
+        if (returned == null) returnedBox(f, bond) else returned), p.getAddress)
+  }
+
+  // ─── recollateralize ──────────────────────────────────────────────────────
+
+  /** Blocks a bond must rest between moves, and how old the successor's creation stamp may be. */
+  protected val recollateralizeWait: Int = 60
+  protected val stampSlack: Int = 15
+
+  /**
+   * The borrower (or `by`) moves the bond on to `next`, output 0, at `height`. The successor is
+   * stamped at `stamp`, by default the inclusion height itself. `funds` arrive on the funding input.
+   */
+  protected def recollateralizeTx(f: Flow, bond: InputUTXO, next: UTXO, height: Int, by: ErgoProver = null,
+                                  stamp: Int = -1, funds: Seq[Token] = Seq.empty[Token]): UnsignedTransaction = {
+    val p = if (by == null) f.owner else by
+    buildAt(f.ctx, height, Seq(bond.withCtxVar(3.toByte, ErgoValue.of(0)), funding(f.ctx, p, 6, slack, funds)),
+      Seq(next.setCreationHeight(if (stamp < 0) height else stamp)), p.getAddress)
+  }
 
   protected def liquidationInput(f: Flow, bond: InputUTXO): InputUTXO =
     bond.withCtxVar(0.toByte, liqVar(f.liq)).withCtxVar(1.toByte, ErgoValue.of(0))

@@ -60,7 +60,9 @@
     // START AND MATURITY
     // Bond R9(1), the start height, must lie in [HEIGHT - 8, HEIGHT]: a script cannot pin HEIGHT
     // exactly without making the transaction valid in a single block. Consumers use it to accrue
-    // value between start and maturity. Mode 0: maturity = R4(3). Mode 1: maturity = start + R4(3).
+    // value between start and maturity. The bond box's creation height must equal it, because the
+    // bond counts its 60-block recollateralize wait from its creation height; a lender cannot
+    // stamp a later one to lock the borrower out. Mode 0: maturity = R4(3). Mode 1: maturity = start + R4(3).
     // Either way maturity > HEIGHT + 1, leaving at least one full block to repay.
     //
     // STATE-BOX RULE (the reason for 3 units)
@@ -150,7 +152,9 @@
                     bond.R7[Coll[(Coll[Byte], Long)]].get == principalTokens &&
                     bond.R8[Coll[Byte]].get == SELF.R7[Coll[Byte]].get
 
-                val startValid = start <= HEIGHT.toLong && start >= HEIGHT.toLong - 8L
+                // The bond's creation height is its start: the bond counts its recollateralize wait from it.
+                val startValid = start <= HEIGHT.toLong && start >= HEIGHT.toLong - 8L &&
+                    bond.creationInfo._1.toLong == start
                 val maturityValid = maturity > HEIGHT.toLong + 1L && (
                     if (mode == 0L) maturity == borrower(3)
                     else borrower(3) >= 30L && maturity == start + borrower(3)

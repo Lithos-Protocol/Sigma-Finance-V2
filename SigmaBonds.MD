@@ -99,7 +99,9 @@ variables. Exactly 3 units are minted.
 
 The bond records the start height, which must lie within 8 blocks of the fill's `HEIGHT` (a script
 cannot pin `HEIGHT` exactly), and the maturity: the fixed height in mode 0, or start plus duration
-in mode 1. Maturity must leave at least one full block to repay.
+in mode 1. Maturity must leave at least one full block to repay. The bond box's creation height
+must equal the start height, because the bond counts its recollateralize wait from it; a lender
+cannot stamp a later one to lock the borrower out.
 
 **Cancel and expire.** The borrower cancels at any height by co-spending a box under their script.
 From the expiry height on, anyone may return the order, tagged with its id, to the borrower and keep
@@ -121,16 +123,28 @@ context variables:
 
 1. **Repayment** (variables 1 and 2), anyone, before maturity. The settlement pays the vault with
    the bond's `(asset, 2)` first, tagged R4 = bond id and R5 = `0` (repaid), holding the repayment
-   plus the lender's reserve back. The collateral returns in full to the borrower, tagged with the
-   bond id.
+   plus the lender's reserve back. The collateral returns to the borrower, tagged with the bond id:
+   in full, unless the borrower co-spends. With a borrower co-spend the return may hold up to the
+   repayment less of the repayment asset (nanoERG for an ERG bond, the token for a token bond), so
+   the borrower **repays from collateral** and brings only the shortfall. The vault is paid the
+   same either way, and every other collateral token returns exactly. Without this, a borrower
+   whose spare funds sit in the bond would have to find the repayment elsewhere or lose all of it
+   to the maturity liquidation.
 2. **Liquidation** (variables 0 and 1), anyone. Variable 0 is the expression R8 names, and it
    decides eligibility and what the vault receives. The bond still pins the vault script, the
    reserve at `tokens(0)`, the R4 tag and R5 = `1` (liquidated). The lender's reserve pays whoever
    runs it.
 3. **Recollateralize** (variable 3), the borrower only, before maturity. Same script, registers
-   and token ids, nothing lower, and at least one collateral asset grows by 1% and at least one
-   unit. An open path would let anyone respend the bond every block and void pending repayments;
-   the 1% floor stops a borrower dodging a liquidation for free.
+   and tokens, nothing lower, and more of something: ERG, a held token, or, for a token bond that
+   holds none, its repayment token appended last. No other new token, since a token nobody prices
+   adds nothing. An open path would let anyone respend the bond and void pending repayments.
+   **At most once per 60 blocks**, counted from the box's creation height: the order sets the
+   first bond's to its start height, and each successor must stamp one within 15 blocks of
+   inclusion. Moves therefore land at least 45 blocks apart, and a bond maturing within 60 blocks
+   of its start can never be recollateralized. The wait is what stops a borrower dodging a
+   liquidation: moving the bond voids the liquidator's transaction, but the liquidator rebuilds
+   against the new box, which the borrower cannot move again in time. (It replaced a 1% growth
+   floor, which was cheap to meet whenever one collateral holding was small.)
 
 ### Vault and claim
 

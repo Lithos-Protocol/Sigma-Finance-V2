@@ -37,7 +37,8 @@
     // Context var 1 Int selects settlement. Send every bond token (reserve, then all collateral)
     // and >= collateral ERG. The host bond additionally enforces the vault script, the reserve at
     // tokens(0), the per-bond tag and the path marker. Other positions are unconstrained.
-    // The borrower can restore the ratio before maturity with the bond's recollateralize path.
+    // The borrower can restore the ratio before maturity with the bond's recollateralize path,
+    // at most once per 60 blocks.
     // This expression supplies no conversion/DEX, oracle fallback, depeg model, or loss insurance.
     // NFT identity/rate convention were source-checked; live-node execution and max cost unverified.
 
