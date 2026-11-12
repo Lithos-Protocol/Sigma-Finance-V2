@@ -103,6 +103,52 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
     }
   }
 
+  property("Dutch shares in SigUSD: the lot is bought with SigUSD, the buyer takes the collateral and ERG, and holders claim SigUSD") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, l, e) = (borrower(ctx), lender(ctx), executor(ctx))
+      w.fund(b, erg("20"), Token(collateralToken, 50L))
+      w.fund(l, erg("20"), Token(SigUsd, 600L))
+      w.fund(e, erg("1"), Token(SigUsd, 2000L))
+      // 2 ERG and 50 unpriced tokens against a 7.00 SigUSD repayment, liquidated below 150%.
+      val bond = w.liveBond(loan(Market.SigUsd, principal = 600L, repayment = 700L, collateralErg = erg("2"),
+        collateral = Seq(Token(collateralToken, 50L)), rule = OracleChoice(15000L, 30L))(w), l)
+      w.run(l, w.app(l).fractionalize(bond.asset.toString, terms(100L, Some(AuctionTerms(15000L, 9000L, 500L)))))
+      val req = w.app(e).shareRequests().loneElement
+      req.dutch shouldBe Some(Market.SigUsd)
+      w.run(e, w.app(e).mintShares(req.box.id.toString))
+
+      // At 0.5 ERG per USD the 2 ERG are worth $4, under 150% of $7.
+      w.oracle(500000000L, w.h)
+      w.run(e, w.app(e).liquidate(Seq(bond.box.id.toString)))
+      w.run(e, w.app(e).pull(w.app(e).shareVault(req.shareId).get.box.id.toString))
+      val open = w.app(e).shareVault(req.shareId).get
+      // The vault holds no SigUSD, so it is short of the floor and the auction opens.
+      open.auctionOpen shouldBe true
+      open.currencyToken shouldBe Some(SigUsd)
+      w.app(e).currencyHeld(open) shouldBe 0L
+      open.box.value shouldBe erg("2") + MinBox
+
+      // 150% of the 700 raw SigUSD repayment at the start of the auction.
+      w.app(e).lotTarget(open, w.h.toLong) shouldBe 1050L
+      val e0 = w.nano(e)
+      w.run(e, w.app(e).buyLot(open.box.id.toString))
+      w.tokens(e).get(SigUsd) shouldBe Some(2000L - 1050L)
+      w.tokens(e).get(collateralToken) shouldBe Some(50L)
+      // Everything above the box minimum was part of the lot: the buyer takes the 2 ERG too.
+      w.nano(e) shouldBe e0 + erg("2") - org.ergoplatform.appkit.Parameters.MinFee
+      val sold = w.app(e).shareVault(req.shareId).get
+      sold.state shouldBe Some(2.toByte)
+      sold.box.value shouldBe MinBox
+      w.app(e).currencyHeld(sold) shouldBe 1050L
+      sold.assets shouldBe Seq(Token(SigUsd, 1050L))
+
+      w.run(l, w.app(l).claimShares(req.shareId.toString, None))
+      w.tokens(l).get(SigUsd) shouldBe Some(1050L)
+      w.app(e).shareVaults() shouldBe empty
+    }
+  }
+
   // ═══ ASKS ═════════════════════════════════════════════════════════════════
 
   property("asks: a bond unit at a fixed price and shares at NAV, bought by wallets; the seller cancels; an expired ask is refunded") {
@@ -232,6 +278,41 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
       val o0 = w.nano(o)
       w.run(e, w.app(e).refundOffer(stale.id.toString))
       w.nano(o) shouldBe o0 + erg("2") - fee
+    }
+  }
+
+  property("lend offer: buys Dutch shares only when their auction clears its floor and length bounds") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, l, e, o) = (borrower(ctx), lender(ctx), executor(ctx), other(ctx))
+      w.fund(b, erg("20"), Token(collateralToken, 100L))
+      w.fund(l, erg("20"))
+      w.fund(e, erg("1"))
+      w.fund(o, erg("90"))
+      w.oracle(500000000L, w.h)
+      // Shares whose auction falls from 150% to a 90% floor over 500 blocks, 60 of them for sale at NAV.
+      val bond = w.liveBond(oracleLoan(w, 100L), l)
+      w.run(l, w.app(l).fractionalize(bond.asset.toString, terms(100L, Some(AuctionTerms(15000L, 9000L, 500L)))))
+      w.run(e, w.app(e).mintShares(w.app(e).shareRequests().loneElement.box.id.toString))
+      val shareId = w.app(e).shareVaults().loneElement.shareId
+      w.run(l, w.app(l).sell(shareId.toString, 60L, Market.Erg, NavPrice(0L, None), 1L, w.h + 100L, erg("0.002")))
+      val ask = w.app(e).asks().loneElement
+
+      // Three offers: one buys no Dutch shares, one wants a 95% floor, one accepts 80% over at most 1000 blocks.
+      Seq((0L, 0L), (9500L, 1000L), (8000L, 1000L)).foreach { case (floor, length) =>
+        w.run(o, w.app(o).createOffer(offerSpec(w).copy(auctionFloorBps = floor, auctionLength = length)))
+      }
+      def offerWith(floor: Long, length: Long): String =
+        w.app(e).offers().find(x => x.terms(9) == floor && x.terms(10) == length).get.box.id.toString
+      refused(w.app(e).matchAsk(offerWith(0L, 0L), ask.box.id.toString, Some(40L))) should include("buys no Dutch auction shares")
+      refused(w.app(e).matchAsk(offerWith(9500L, 1000L), ask.box.id.toString, Some(40L))) should include("outside the offer's bounds")
+      // A shorter length bound than the auction's is refused too.
+      w.run(o, w.app(o).createOffer(offerSpec(w).copy(auctionFloorBps = 8000L, auctionLength = 499L)))
+      refused(w.app(e).matchAsk(offerWith(8000L, 499L), ask.box.id.toString, Some(40L))) should include("outside the offer's bounds")
+
+      w.run(e, w.app(e).matchAsk(offerWith(8000L, 1000L), ask.box.id.toString, Some(40L)))
+      w.tokens(o).get(shareId) shouldBe Some(40L)
+      w.app(e).asks().loneElement.token.amount shouldBe 20L
     }
   }
 
