@@ -11,3 +11,6 @@
 .bloop/
 project/.bloop/
 project/metals.sbt
+
+# Local planning notes
+/SIGMAFI_PLAN.MD
