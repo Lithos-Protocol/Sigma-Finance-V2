@@ -17,10 +17,12 @@ object ScriptGenerator {
   private final val ERG = "ERG"
   private final val TOKEN = "Token"
 
-  private final val ZC_BOND_PREFIX = "bonds/P2P/ZC_"
+  // The production contracts live in contracts/old/; contracts/bonds/ holds only the ZC_Standard set.
+  private final val OLD = "old/"
+  private final val ZC_BOND_PREFIX = OLD + "ZC_"
   private final val BOND_SUFFIX = "_Bond"
-  private final val LENDER_SCRIPTS = "bonds/lender-scripts/"
-  private final val LIQUIDATIONS = "bonds/liquidations/"
+  private final val LENDER_SCRIPTS = OLD
+  private final val LIQUIDATIONS = OLD
 
   /** Every liquidation script a bond may name in R8. */
   final val LIQUIDATION_SCRIPTS: Seq[String] = Seq("MaturityLiquidation")

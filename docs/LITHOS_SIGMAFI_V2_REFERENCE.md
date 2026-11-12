@@ -532,13 +532,13 @@ blake2b256 over UTF-8 source text after normalizing CRLF to LF; these fingerprin
 
 | Compiler input | Normalized source blake2b256 |
 |---|---|
-| `contracts/bonds/P2P/ZC_ERG_Bond.ergo` | `5a331aa821cd0f8af6f3fbf1867c8e3f96f7ecf007e2d53b54e989d167d9d160` |
-| `contracts/bonds/P2P/ZC_Token_Bond.ergo` | `f4e6b8ab7ed2536c9762068ccd265531a54a10192dbcdd4c5d075cd84be2cf27` |
-| `contracts/bonds/P2P/ZC_Order.ergo` | `18ef26f52222f0deb3fe130dd2228caa4d3f39a6acae709c3fa011561fe56a83` |
-| `contracts/bonds/P2P/ZC_OrderOnClose.ergo` | `61209c052c8107b6c3300bdea9e3d3a39dc031019db9360f1d61525818aaca4c` |
-| `contracts/bonds/lender-scripts/BondAssetVault.ergo` | `3297b063e1287b33732e2f6f4bbe0a70a836460aea0af716ce6385010e7e505a` |
-| `contracts/bonds/liquidations/MaturityLiquidation.ergo` | `ba5f0f3647f5f73c3d81a61ffb599119731c89efab5dc1c65d125144520af19e` |
-| `src/main/scala/client/ScriptGenerator.scala` | `4ca08f4fa77b4b12b3a4b28e0d18895c7169192e2daf0d82bea332ed03b12372` |
+| `contracts/old/ZC_ERG_Bond.ergo` | `5a331aa821cd0f8af6f3fbf1867c8e3f96f7ecf007e2d53b54e989d167d9d160` |
+| `contracts/old/ZC_Token_Bond.ergo` | `f4e6b8ab7ed2536c9762068ccd265531a54a10192dbcdd4c5d075cd84be2cf27` |
+| `contracts/old/ZC_Order.ergo` | `18ef26f52222f0deb3fe130dd2228caa4d3f39a6acae709c3fa011561fe56a83` |
+| `contracts/old/ZC_OrderOnClose.ergo` | `61209c052c8107b6c3300bdea9e3d3a39dc031019db9360f1d61525818aaca4c` |
+| `contracts/old/BondAssetVault.ergo` | `3297b063e1287b33732e2f6f4bbe0a70a836460aea0af716ce6385010e7e505a` |
+| `contracts/old/MaturityLiquidation.ergo` | `ba5f0f3647f5f73c3d81a61ffb599119731c89efab5dc1c65d125144520af19e` |
+| `src/main/scala/client/ScriptGenerator.scala` | `9e4865d047444921bb85e57562d193602e197a60dacfd5d1eae3e1250a949dfe` |
 | `src/main/scala/work/lithos/mutations/Contract.scala` | `fe1e473783454eab1b759feb7ea3ab9c757d8e26ec0aef615dd45a5573021213` |
 | `build.sbt` | `24bff2ad1f970a11d84ac547b66b8b1e469299c18029476e447f3e16c723b6ef` |
 | `project/build.properties` | `e6023cb99f0ff57fdcb183b400632402e711320ee722372eb7a6a844ba9f4897` |

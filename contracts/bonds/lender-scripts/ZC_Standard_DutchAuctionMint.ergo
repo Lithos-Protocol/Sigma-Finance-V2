@@ -1,7 +1,7 @@
 {
-    // EXPERIMENTAL Dutch auction fractionalization request. No specs and no off-chain code exist.
+    // Standard Dutch auction fractionalization request. No specs and no off-chain code exist yet.
     // A ZC_Standard_FractionalMint that also commits to an auction. It holds one circulating bond
-    // unit and turns it into N fungible shares backed by an EXP_DutchAuctionVault. If the bond is
+    // unit and turns it into N fungible shares backed by an ZC_Standard_DutchAuctionVault. If the bond is
     // repaid, that vault behaves like the standard fractional vault. If the bond is liquidated, the
     // vault sells the collateral it receives in a Dutch auction for the bond's repayment asset, so
     // share holders are paid in one currency. The bond, its terms and its liquidation expression
@@ -10,7 +10,7 @@
     // for the mint fee.
     //
     // CONSTANTS (one address per repayment asset, under one shared template)
-    // CONST_DUTCH_VAULT_HASH: Coll[Byte] - blake2b256 of EXP_DutchAuctionVault
+    // CONST_DUTCH_VAULT_HASH: Coll[Byte] - blake2b256 of ZC_Standard_DutchAuctionVault
     // CONST_BOND_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Bond tree for the repayment asset
     // CONST_REPAYMENT_TOKEN: Coll[Byte] - that asset, EMPTY for ERG. It becomes the auction currency.
     // The deployer must compile the last two consistently; the script cannot check one against the other.
@@ -30,7 +30,7 @@
     //     offer can set them without knowing which bond it will buy.
     //   5 auction length in blocks, 1..1000000. The vault's currency target falls in a straight
     //     line from the opening to the floor over this many blocks and then stays at the floor.
-    //     See EXP_DutchAuctionVault: a floor of 0 never opens an auction.
+    //     See ZC_Standard_DutchAuctionVault: a floor of 0 never opens an auction.
     // R9: Coll[Coll[Byte]] - the share token's EIP-4 (name, description, decimals), exactly 3 items
     //
     // VALUE
@@ -50,9 +50,9 @@
     //   offline owner is never left with a request nobody can run. For a genuine bond asset only
     //   the bond or its vault can hold 2 units, and the vault cannot be claimed while this box
     //   holds the circulating unit. Global.deserializeTo[Box] on real box bytes is unverified at
-    //   runtime, as for the origin check in EXP_LendOffer.
+    //   runtime, as for the origin check in ZC_Standard_LendOffer.
     // OUTPUTS(0): N shares at tokens(0), at the owner script. R4, R5, R6 = the three items of R9.
-    // OUTPUTS(1): EXP_DutchAuctionVault with tokens ((share, N+1), (bond asset, 1)),
+    // OUTPUTS(1): ZC_Standard_DutchAuctionVault with tokens ((share, N+1), (bond asset, 1)),
     //   R4 = bond asset id, R5 = (N, N, pull fee),
     //   R7 = (repayment, opening bps, floor bps, length, 0), R8 = CONST_REPAYMENT_TOKEN.
     //
@@ -65,7 +65,7 @@
     // low floor, or a short auction, can sell the collateral cheaply after a liquidation (a floor
     // of 0 means no auction, and holders are paid in kind). This script
     // does not check that the bond asset is genuine: the depositor answers for what they wrap.
-    // EXP_LendOffer does all of this before it buys: it pins this script's hash, verifies the bond
+    // ZC_Standard_LendOffer does all of this before it buys: it pins this script's hash, verifies the bond
     // asset, and requires the floor and the length to clear the lender's bounds in its R5(9), R5(10).
 
     def numTokenInOutputs(tokenId: Coll[Byte]): Long = {

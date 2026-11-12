@@ -1,14 +1,14 @@
 {
-    // EXPERIMENTAL NAV-priced ask (the shell). No specs and no off-chain code exist.
-    // An EXP_SaleOrder with one more condition on a fill: a pricing expression the seller chose
+    // Standard NAV-priced ask (the shell). No specs and no off-chain code exist yet.
+    // An ZC_Standard_SaleOrder with one more condition on a fill: a pricing expression the seller chose
     // must also pass. The expression works a price out of on-chain state, so the seller never
     // updates the ask. A new way to price is a new expression, not a new ask contract.
-    // EXP_AccruedValue_Pricing is the first: a bond's accrued value plus or minus a margin.
+    // ZC_Standard_AccruedValue_Pricing is the first: a bond's accrued value plus or minus a margin.
     // Nothing here verifies what the token is: a buyer, or a buying contract, does that.
     //
     // CONSTANTS
     // CONST_PAYMENT_TOKEN: Coll[Byte] - the asset the seller is paid in; EMPTY for ERG. One address
-    //   per payment asset under one shared template, as for EXP_SaleOrder. The pricing expression
+    //   per payment asset under one shared template, as for ZC_Standard_SaleOrder. The pricing expression
     //   must be compiled for the same asset; this script cannot check that.
     //
     // TOKENS
@@ -30,7 +30,7 @@
     // FILL (anyone, before expiry)
     // Context var 0: Int payout index. 1: Int continuation index, absent for a full take.
     // 2: Coll[Byte] the pricing expression. Vars 3 and up belong to the expression.
-    // Payout (the ask convention, shared with EXP_SaleOrder): at the seller script, R4 = SELF.id,
+    // Payout (the ask convention, shared with ZC_Standard_SaleOrder): at the seller script, R4 = SELF.id,
     //   R5: Long = the raw units this payout pays for. For a token price the payment token is the
     //   payout's tokens(0), and the buyer funds the box's nanoERG.
     // Continuation: this script, R4 to R7 unchanged, value not lower, tokens(0) = what is left.
@@ -38,7 +38,7 @@
     // the payout to hold its price: this script only enforces the floor.
     //
     // EXPIRY REFUND (anyone, once HEIGHT >= expiry)
-    // As EXP_SaleOrder. Var 0 names the refund: at the seller script, R4 = SELF.id, every token of
+    // As ZC_Standard_SaleOrder. Var 0 names the refund: at the seller script, R4 = SELF.id, every token of
     // this box, and at least 1000000 nanoERG (all of the value, if less). nanoERG funded above
     // 1000000 is the batcher's fee and survives partial fills. This matters more here than for a
     // fixed price: the ask stops filling once its bond settles or matures, while it still holds
@@ -68,7 +68,7 @@
             payoutIndex < 0 || payoutIndex >= OUTPUTS.size) {
             sigmaProp(false)
         } else if (HEIGHT.toLong >= terms(3)) {
-            // Expiry refund, by anyone, exactly as EXP_SaleOrder: the tokens go back to the seller,
+            // Expiry refund, by anyone, exactly as ZC_Standard_SaleOrder: the tokens go back to the seller,
             // and the batcher's fee is whatever nanoERG the seller funded above 1000000.
             val refund = OUTPUTS(payoutIndex)
             sigmaProp(

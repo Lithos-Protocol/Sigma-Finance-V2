@@ -1,8 +1,8 @@
 {
-    // EXPERIMENTAL lend offer (a yield bid). No specs and no off-chain code exist.
+    // Standard lend offer (a yield bid). No specs and no off-chain code exist yet.
     // Holds a lender's capital and buys standard bonds that clear a minimum simple-interest yield:
     // new ones, by filling a ZC_Standard_Order, and existing ones, from any ask that follows the ask
-    // convention below (EXP_SaleOrder, EXP_NavAsk, or a later one). The lender is never assumed to
+    // convention below (ZC_Standard_SaleOrder, ZC_Standard_NavAsk, or a later one). The lender is never assumed to
     // be online after posting: any batcher matches the offer, for the fee the offer itself sets,
     // and the bond unit is delivered to the lender or into a fractional request.
     //
@@ -12,7 +12,7 @@
     // CONST_BOND_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Bond tree for that asset
     // CONST_FRACTIONAL_MINT_HASH: Coll[Byte] - blake2b256 of ZC_Standard_FractionalMint. Used only to
     //   verify shares being BOUGHT; where a delivery goes is the lender's choice in R9.
-    // CONST_DUTCH_MINT_HASH: Coll[Byte] - blake2b256 of EXP_DutchAuctionMint compiled for this
+    // CONST_DUTCH_MINT_HASH: Coll[Byte] - blake2b256 of ZC_Standard_DutchAuctionMint compiled for this
     //   repayment asset and CONST_BOND_HASH. Also used only to verify shares being bought.
     // No ask script is pinned: a new kind of ask needs no new offer.
     // The deployer must compile these consistently; the script cannot check one against another.
@@ -33,7 +33,7 @@
     //   6 expiry height; fills require HEIGHT < expiry, and from then on anyone may refund
     //   7 minimum price of one fill, in raw units of the repayment asset
     //   9 minimum auction floor, basis points of the repayment, and 10 maximum auction length,
-    //     blocks: the worst auction terms on EXP_DutchAuctionMint shares this offer will buy.
+    //     blocks: the worst auction terms on ZC_Standard_DutchAuctionMint shares this offer will buy.
     //     A maximum length of 0 buys none. Bond units and standard shares ignore both.
     // R6: Coll[Byte] - blake2b256 of the serialized collateral policy expression. The policy is the
     //   whole risk decision: it names the liquidation rule a bond must carry, requires that rule to
@@ -42,7 +42,7 @@
     //   mint reads, 3..16 values in all; EMPTY delivers the bond unit itself
     // R8: Coll[Coll[Byte]] - share token EIP-4 (name, description, decimals); EMPTY when R7 is empty
     // R9: Coll[Byte] - blake2b256 of the mint request script a fractional delivery goes into:
-    //   ZC_Standard_FractionalMint, EXP_DutchAuctionMint (R7 then carries its three auction terms),
+    //   ZC_Standard_FractionalMint, ZC_Standard_DutchAuctionMint (R7 then carries its three auction terms),
     //   or any script that keeps their request layout. The lender's own choice of where the unit
     //   goes, so it is not pinned; a wrong hash strands the unit. EMPTY when R7 is empty.
     //
@@ -63,7 +63,7 @@
     // output index; 7 Int the seller's payout output index. The absence of var 2 selects a
     // new-bond fill.
     // Buying fractional shares adds: 6 Coll[Byte] the serialized mint request box that minted the
-    // shares, under ZC_Standard_FractionalMint or EXP_DutchAuctionMint.
+    // shares, under ZC_Standard_FractionalMint or ZC_Standard_DutchAuctionMint.
     //
     // THE ASK CONVENTION (what this offer expects of the box at var 2, whatever its script)
     // tokens(0) is the token for sale. R4: Coll[Byte] is blake2b256 of the seller script. A fill

@@ -113,9 +113,9 @@ object LithosReference extends ContractSpecBase {
     line()
     line("| Compiler input | Normalized source blake2b256 |")
     line("|---|---|")
-    Seq("contracts/bonds/P2P/ZC_ERG_Bond.ergo", "contracts/bonds/P2P/ZC_Token_Bond.ergo",
-      "contracts/bonds/P2P/ZC_Order.ergo", "contracts/bonds/P2P/ZC_OrderOnClose.ergo",
-      "contracts/bonds/lender-scripts/BondAssetVault.ergo", "contracts/bonds/liquidations/MaturityLiquidation.ergo",
+    Seq("contracts/old/ZC_ERG_Bond.ergo", "contracts/old/ZC_Token_Bond.ergo",
+      "contracts/old/ZC_Order.ergo", "contracts/old/ZC_OrderOnClose.ergo",
+      "contracts/old/BondAssetVault.ergo", "contracts/old/MaturityLiquidation.ergo",
       "src/main/scala/client/ScriptGenerator.scala", "src/main/scala/work/lithos/mutations/Contract.scala",
       "build.sbt", "project/build.properties").foreach { p => line(s"| `$p` | `${hash(read(p).getBytes(UTF_8))}` |") }
     b.toString

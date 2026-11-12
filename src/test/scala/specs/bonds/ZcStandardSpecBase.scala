@@ -33,8 +33,8 @@ object ZcStandardSpecBase {
         Contract.fromErgoContract(ctx.compileContract(constants, ScriptGenerator.mkScript(path)))
       }
       def hash(c: Contract) = Colls.fromArray(c.hashedPropBytes)
-      val vault = compile("bonds/lender-scripts/ZC_Standard_BondVault")
-      def bond(token: Array[Byte]) = compile("bonds/P2P/ZC_Standard_Bond",
+      val vault = compile("bonds/core/ZC_Standard_BondVault")
+      def bond(token: Array[Byte]) = compile("bonds/core/ZC_Standard_Bond",
         Seq("CONST_VAULT_HASH" -> hash(vault), "CONST_REPAYMENT_TOKEN" -> Colls.fromArray(token)))
       // The order compiles in the same repayment token as its bond, for the one-asset rule.
       def order(b: Contract, token: Array[Byte]) = compile("bonds/P2P/ZC_Standard_Order",

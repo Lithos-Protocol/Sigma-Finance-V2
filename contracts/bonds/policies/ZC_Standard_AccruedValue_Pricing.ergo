@@ -1,5 +1,5 @@
 {
-    // EXPERIMENTAL pricing expression for EXP_NavAsk. No specs and no off-chain code exist.
+    // Standard pricing expression for ZC_Standard_NavAsk. No specs and no off-chain code exist yet.
     // Executed through the ask's context var 2 with the ASK as SELF. It prices a live standard bond,
     // or shares of one, at its accrued value plus or minus the seller's margin. The ask pins this
     // expression's hash in R6, so a seller chooses it and a batcher cannot swap it.
@@ -39,7 +39,7 @@
     // The origin check protects a buyer from a fake token. A seller loses nothing by underpricing a
     // fake, and for a genuine X nobody else can hold 2 units, so the state box cannot be forged
     // against the seller. For shares the seller states X and N rather than proving them. A buyer
-    // verifies the token its own way, as EXP_LendOffer does.
+    // verifies the token its own way, as ZC_Standard_LendOffer does.
     //
     // LIMITS
     // - The lender fee reserve, and for shares the fractional vault's own nanoERG and pull fee, are

@@ -26,7 +26,7 @@
     // are valued at zero, but ALL are paid to the vault. Before maturity this rule supports only
     // ERG or SigUSD repayment; any other repayment asset never liquidates early.
     // The debt is the REPAYMENT, not the principal: a ratio against principal overstates the
-    // lender's cover by the interest. EXP_ERG_SigUSD_CollateralPolicy measures the same thing.
+    // lender's cover by the interest. ZC_Standard_ERG_SigUSD_CollateralPolicy measures the same thing.
     // With oracle P nanoERG/USD, compare without division or price rounding:
     // C = 100*collateralNanoERG + P*collateralSigUSDRaw
     // L = 100*repaymentNanoERG, or P*repaymentSigUSDRaw

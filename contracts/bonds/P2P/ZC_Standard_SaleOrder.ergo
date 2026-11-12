@@ -1,8 +1,8 @@
 {
-    // EXPERIMENTAL sale order (an ask). No specs and no off-chain code exist.
+    // Standard sale order (an ask). No specs and no off-chain code exist yet.
     // Sells one token for a fixed price per raw unit, with partial fills. It is generic: the token
     // can be a bond unit, fractional shares, or anything else. Nothing here verifies what the token
-    // is: a buyer, or a buying contract such as EXP_LendOffer, does that.
+    // is: a buyer, or a buying contract such as ZC_Standard_LendOffer, does that.
     //
     // CONSTANTS
     // CONST_PAYMENT_TOKEN: Coll[Byte] - the asset the seller is paid in; EMPTY for ERG. Each payment
@@ -26,7 +26,7 @@
     //
     // FILL (anyone, before expiry)
     // Context var 0: Int payout index. Context var 1: Int continuation index, absent for a full take.
-    // Payout (the ask convention, shared with EXP_NavAsk): at the seller script, R4 = SELF.id,
+    // Payout (the ask convention, shared with ZC_Standard_NavAsk): at the seller script, R4 = SELF.id,
     //   R5: Long = the raw units this payout pays for, holding at least the price. For a token
     //   price the payment token is the payout's tokens(0), and the buyer funds the box's nanoERG.
     // Continuation: this script, R4 and R5 unchanged, value not lower, tokens(0) = what is left.
