@@ -20,7 +20,7 @@ sbt "runMain ksingh.sigmabonds.app.SigmaFiCli orders --node http://127.0.0.1:905
 ```
 
 ```bash
-sbt "runMain ksingh.sigmabonds.app.SigmaFiCli fill-order <order box id> --batching-fee 0.002 --api-key <key> --wallet-pass <pass>"
+sbt "runMain ksingh.sigmabonds.app.SigmaFiCli fill-order <order box id> --batching-fee 0.05 --api-key <key> --wallet-pass <pass>"
 ```
 
 List commands (`orders`, `bonds`, `claims`) find boxes and check their scripts and shapes. Actions take
@@ -37,7 +37,7 @@ wallet, it locks it again when it is done.
 The CLI writes an optional order R4 hint that no contract reads: the borrower's ErgoTree, whose hash
 is an order term (see [SigmaBonds](./SigmaBonds.MD)). It lets any lender fill an order without asking
 the borrower for that tree. Filling mints two bond-asset units, one in the bond and one for the lender.
-The lender chooses and funds an extra liquidation reserve on fill (`--batching-fee`, default 0.002 ERG).
+The lender chooses and funds an extra liquidation reserve on fill (`--batching-fee`, CLI minimum and default 0.05 ERG).
 Repayment refunds the reserve into the lender's vault and returns the borrower collateral in full.
 Bonds store agreed principal ERG/tokens and a Long maturity height for liquidation expressions.
 Settlement R6 is a Byte: 0 repaid, 1 liquidated, enforced by the bond.

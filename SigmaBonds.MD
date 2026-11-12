@@ -132,7 +132,7 @@ preserves the entire borrower collateral. The lender supplies the reserve in add
 issuing-unit minimum ERG and miner fee; the reserve is not deducted from the principal. It can exceed
 the collateral value if fully funded. Cancellation does not require the fill context variable.
 
-The CLI accepts `fill-order <order id> --batching-fee <ERG>` (default 0.002 ERG). It rejects
+The CLI accepts `fill-order <order id> --batching-fee <ERG>` (minimum and default 0.05 ERG). It rejects
 `--batching-fee` on `create-order`. The fill stores agreed principal ERG/tokens in bond R6(2)/R7,
 pins maturity in R6(3), and uses checked addition when funding the reserve.
 

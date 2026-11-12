@@ -155,7 +155,7 @@ Orders preserve their complete collateral token list after prepending the single
 the new bond's borrower, repayment, agreed principal ERG/tokens, schedule and liquidation hash.
 There is no `CONST_BATCHING_FEE`. Required ctx var 0: Long on the order input selects a nonnegative
 fee; bond R6(1) must match it, and `bond.value - order.value >= fee` funds it without consuming
-collateral. The CLI chooses it with `fill-order --batching-fee` (default 0.002 ERG). Cancellation
+collateral. The CLI chooses it with `fill-order --batching-fee` (CLI minimum and default 0.05 ERG). Cancellation
 requires no fill context variable. An ERG principal has no tokens;
 a token principal uses one token and an ERG floor. Pair the principal with the correct repayment bond
 off-chain: the order trusts its `CONST_BOND_HASH` and does not enforce that pairing itself.

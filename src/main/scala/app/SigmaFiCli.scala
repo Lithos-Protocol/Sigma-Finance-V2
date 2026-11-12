@@ -20,8 +20,10 @@ import scala.util.Try
  */
 object SigmaFiCli {
 
+  private val MinimumBatchingFee = "0.05"
+
   val Usage: String =
-    """SigmaFi V2 CLI. It talks to one Ergo node, with the extra index enabled, and nothing else.
+    s"""SigmaFi V2 CLI. It talks to one Ergo node, with the extra index enabled, and nothing else.
       |
       |Usage: sbt "runMain ksingh.sigmabonds.app.SigmaFiCli <command> [arguments] [options]"
       |
@@ -42,7 +44,7 @@ object SigmaFiCli {
       |
       |Lender:
       |  fill-order <order box id> [--batching-fee <ERG>]  mint the named bond asset with its terms as JSON metadata
-      |  --batching-fee <ERG>              lender-funded reserve on fill (default 0.002)
+      |  --batching-fee <ERG>              lender-funded reserve on fill (minimum and default $MinimumBatchingFee)
       |  claim <bond asset id>               collect a repaid or liquidated bond from the vault
       |
       |Borrower:
@@ -64,7 +66,6 @@ object SigmaFiCli {
       |""".stripMargin
 
   private val DefaultNode = "http://127.0.0.1:9053"
-  private val DefaultBatchingFee = "0.002"
 
   def main(args: Array[String]): Unit = {
     val code =
@@ -127,7 +128,7 @@ object SigmaFiCli {
       case "bonds" => listBonds(app, node, a.flag("mine"), a.flag("liquidatable"))
       case "claims" => listClaims(app, node)
 
-      case "fill-order" => app.submit(app.fillOrder(one("order box id"), parseErg(a.opt("batching-fee").getOrElse(DefaultBatchingFee))))
+      case "fill-order" => app.submit(app.fillOrder(one("order box id"), batchingFee(a)))
       case "claim" => app.submit(app.claim(one("bond asset id")))
 
       case "create-order" =>
@@ -253,6 +254,13 @@ object SigmaFiCli {
       case Seq(("duration", n)) => OnClose(parseLong(n, "--duration"))
       case _ => throw CliError("give exactly one of --maturity <height>, --term <blocks> or --duration <blocks>")
     }
+
+  def batchingFee(a: Args): Long = {
+    val fee = parseErg(a.opt("batching-fee").getOrElse(MinimumBatchingFee))
+    if (fee < parseErg(MinimumBatchingFee))
+      throw CliError(s"--batching-fee must be at least $MinimumBatchingFee ERG")
+    fee
+  }
 
   def parseErg(s: String): Long = {
     val nano = Try(BigDecimal(s) * BigDecimal(1000000000L)).getOrElse(throw CliError(s"$s is not an ERG amount"))
