@@ -36,6 +36,8 @@ All paths are under `contracts/bonds/`. Names drop the `ZC_Standard_` prefix.
 | `liquidations/` | `ERG_SigUSD_Liquidation` | Liquidation rule: an oracle collateral ratio, or maturity |
 | `policies/` | `ERG_SigUSD_CollateralPolicy` | The lend offer's risk rule |
 | `policies/` | `AccruedValue_Pricing` | The NAV ask's first pricing rule |
+| `policies/` | `ERG_SigUSD_FillGuard` | The borrower's guard: an order fills only at a minimum collateral ratio |
+| `policies/` | `ERG_SigUSD_GuardedNav_Pricing` | Accrued-value pricing with the seller's guard: an ask sells only at a minimum collateral ratio |
 
 Expressions in `liquidations/` and `policies/` are not box scripts. A host box (the bond, the
 offer, the ask) commits to an expression's hash in a register, and a spender supplies the
@@ -86,6 +88,7 @@ The borrower funds an `Order` box with the collateral (nanoERG and any tokens) p
 | R5 `Coll[(Coll[Byte], Long)]` | Principal tokens |
 | R6 `Coll[Byte]` | Hash of the borrower's script |
 | R7 `Coll[Byte]` | Hash of the serialized liquidation expression |
+| R8 `Coll[Byte]`, optional | Hash of a serialized fill guard expression; not copied to the bond (see "Fill and sale guards") |
 
 Constants: `CONST_BOND_HASH` (the bond for this market) and `CONST_REPAYMENT_TOKEN` (empty for ERG).
 
@@ -94,7 +97,8 @@ and a floor no higher than the repayment. A token order has exactly one principa
 repayment token, with a positive amount, and at most 1000000 nanoERG in both R4(1) and R4(2).
 
 **Fill.** The order must be `INPUTS(0)`, so the bond asset's id is the order's box id. No context
-variables. Exactly 3 units are minted.
+variables, except var 1 carrying the fill guard when R8 names one; the guard then runs too. Exactly 3
+units are minted.
 
 | Output | Contents |
 |---|---|
@@ -296,6 +300,34 @@ floor ratio and accept the lender's oracle age, and the collateral to be worth t
 Only one offer may take part in a fill, so one bond cannot be charged to two offers. Best execution
 is not enforced: a batcher chooses which ask it meets, and an offer never does worse than its terms.
 
+### Fill and sale guards
+
+Nothing else stops a trade that hands a bond's collateral surplus to the other side. A fill checks
+nothing about the collateral's value, so an order left open while the price falls can be filled into
+a bond that is liquidatable at once, or after a small move, and a liquidation sends all the
+collateral to the lender. The bond's 60-block recollateralize wait counts from its start, so the
+borrower cannot top up in time. An ask on a bond near its line has the same problem the other way:
+a buyer pays accrued value, at most the repayment, then liquidates for all the collateral. The
+guards let the owner of the resting box set a collateral ratio under which it does not trade.
+
+**Fill guard.** An order's optional R8 names a guard expression; a fill must pass it, run from the
+order's var 1 with the order as `SELF`. `ERG_SigUSD_FillGuard` requires the new bond, `OUTPUTS(1)`,
+to hold collateral worth at least R4(9) of the repayment, measured exactly as the oracle rule
+measures it (net of the lender's fee reserve) at one USD oracle no older than the rule's age R4(8).
+R4(9) must be at least the rule's ratio R4(7), so a guarded order never starts a bond already
+liquidatable; a higher one buys the borrower room after the fill. Without R8 a fill is unchanged.
+The guard binds every fill, a lend offer's included, and the order still cancels and refunds as
+before.
+
+**Sale guard.** `ERG_SigUSD_GuardedNav_Pricing` is `AccruedValue_Pricing` plus the same check on
+the live bond the ask sells, against the seller's minimum R5(6) at an oracle no older than R5(7).
+While the guard holds the ask still, anyone may liquidate the bond and the seller claims the vault
+with the unit. A margin of -99.99% leaves the ask's fixed floor as the price, so the same
+expression gives a guarded fixed-price ask without another contract.
+
+Both are compiled per repayment asset and, like the oracle rule, support ERG and SigUSD only. Each
+needs a fresh oracle at the trade, so a guarded box cannot trade while the pool is stale.
+
 ## Exits
 
 Every box that waits on someone has a way out.
@@ -351,8 +383,13 @@ input. In brief:
 - **Share count** (recommended). 100 shares with 6 decimals (N = 100,000,000), so `1.000000` is 1%
   of the bond, and share prices are quoted as a percentage of face. It stays off-chain: it protects
   no value, and enforcing it would change both mints and the lend offer.
-- **Maturity grid** (recommended). Fixed maturities snap to multiples of 21,600 blocks (about 30
-  days), so bonds of a market maturing in the same month share one height.
+- **Maturity grid** (default). New fixed maturities snap to multiples of 21,600 blocks (about 30
+  days) unless the user keeps an exact height, so most bonds of a market maturing in the same month
+  share one height and can join a series later. Every maturity stays matchable: offers, batchers and
+  readers ignore the grid.
+- **Cover at the fill.** Oracle orders carry the fill guard by default, at their own ratio. Clients
+  and batchers never fill or buy a bond under its own ratio (they liquidate it instead), and a
+  fixed-maturity order's default expiry leaves at least half its term.
 - **Batching.** Pack refunds and liquidations into one transaction (the CLI's `pack`), chain fills
   through continuations in one block, use one published matching order, and price NAV asks 3 blocks
   ahead.

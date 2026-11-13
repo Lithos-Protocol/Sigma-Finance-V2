@@ -269,16 +269,201 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
 
   // ═══ MATURITY GRID ════════════════════════════════════════════════════════
 
-  property("grid: a maturity snaps to the nearest multiple of 21600 blocks that can still be filled, a tie going later") {
+  property("grid: a maturity a grid step or more away snaps to the nearest multiple of 21600 blocks, a tie going later; a nearer one keeps its height") {
     import StandardProtocol.snapMaturity
     snapMaturity(1743200L, 1700000L) shouldBe 1749600L
     snapMaturity(1749600L, 1700000L) shouldBe 1749600L
     snapMaturity(1738800L, 1700000L) shouldBe 1749600L
     snapMaturity(1730000L, 1700000L) shouldBe 1728000L
-    // The nearest grid height is too close to the current height, so the next one is taken.
-    snapMaturity(1728005L, 1727999L) shouldBe 1749600L
+    // Exactly one step away: it may move by half a step either way, so the term stays at least 10,800 blocks.
+    snapMaturity(1749590L, 1727990L) shouldBe 1749600L
+    snapMaturity(1728010L, 1706410L) shouldBe 1728000L
+    // About 10 days asked 10 blocks before a grid line: rounding would make it a 20-minute loan, so it is kept.
+    snapMaturity(1735190L, 1727990L) shouldBe 1735190L
+    snapMaturity(1728005L, 1727999L) shouldBe 1728005L
     Args.parse(Args.tokenize("create-order --term 43200 --exact-maturity")).flag("exact-maturity") shouldBe true
     Args.parse(Args.tokenize("create-offer --deliver-shares --shares 10")).flag("deliver-shares") shouldBe true
+  }
+
+  property("expiry: a fixed-maturity order expires within half its term by default, and a later expiry warns") {
+    import StandardProtocol.defaultOrderExpiry
+    defaultOrderExpiry(1700000L, Some(1749600L), 5040L) shouldBe 1705040L
+    defaultOrderExpiry(1700000L, Some(1700400L), 5040L) shouldBe 1700200L
+    defaultOrderExpiry(1700000L, None, 5040L) shouldBe 1705040L
+    defaultOrderExpiry(1700000L, Some(1700003L), 5040L) shouldBe 1700002L
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val b = borrower(ctx)
+      w.fund(b, erg("40"), Token(collateralToken, 100L))
+      // Matures 1000 blocks out: an expiry at 500 leaves at least 501 blocks, one at 900 only 101.
+      w.app(b).createOrder(loan()(w)).notes.exists(_.startsWith("WARNING: a fill")) shouldBe false
+      w.app(b).createOrder(loan()(w).copy(expiry = w.h + 900L)).notes.find(_.startsWith("WARNING: a fill")).get should
+        include("leaves only 101 blocks")
+    }
+  }
+
+  // ═══ COVER ════════════════════════════════════════════════════════════════
+
+  property("cover: where the oracle price puts an order at its ratio, as dollars per ERG, in both markets") {
+    import StandardProtocol.{crossingPrice, usdPerErg}
+    // 10 ERG against $7 at 150%: liquidatable once ERG falls under $1.05.
+    val (sigUsd, cheaper) = crossingPrice(Market.SigUsd, erg("10"), Seq.empty, 700L, 15000L).get
+    usdPerErg(sigUsd) shouldBe "$1.0500"
+    cheaper shouldBe true
+    // 1 ERG and $10 against 6 ERG at 150%: liquidatable once ERG rises above $1.25.
+    val (ergPrice, cheaper2) = crossingPrice(Market.Erg, erg("1"), Seq(Token(SigUsd, 1000L)), erg("6"), 15000L).get
+    usdPerErg(ergPrice) shouldBe "$1.2500"
+    cheaper2 shouldBe false
+    // ERG against ERG never moves with the price.
+    crossingPrice(Market.Erg, erg("10"), Seq(Token(collateralToken, 5L)), erg("6"), 15000L) shouldBe None
+  }
+
+  property("cover: an order, fill or purchase that leaves a bond under its own ratio is refused unless allowed") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, l, e) = (borrower(ctx), lender(ctx), executor(ctx))
+      w.fund(b, erg("20"), Token(SigUsd, 1000L))
+      w.fund(l, erg("20"))
+      w.fund(e, erg("20"))
+      // 1 ERG and $10 against 6 ERG at 150%. At 0.5 ERG per USD that is 6 ERG of collateral: 100%.
+      w.oracle(500000000L, w.h)
+      val under = loan(collateralErg = erg("1"), collateral = Seq(Token(SigUsd, 1000L)), rule = OracleChoice(15000L, 30L))(w)
+      refused(w.app(b).createOrder(under)) should (include("already under the order's 150% ratio") and
+        include("--allow-liquidatable"))
+      val posted = w.app(b).createOrder(under.copy(allowLiquidatable = true))
+      posted.notes.exists(_.contains("cover now: 100% of the repayment")) shouldBe true
+      posted.notes.exists(_.contains("if ERG rises above $1.2500")) shouldBe true
+      w.run(b, posted)
+
+      val order = w.app(l).orders().loneElement.box.id.toString
+      refused(w.app(l).fillOrder(order, reserve)) should include("the bond would start at 100% of its repayment")
+      w.run(l, w.app(l).fillOrder(order, reserve, allowLiquidatable = true))
+      val bond = w.app(e).bonds().loneElement
+
+      // Its holder offers the unit; a buyer is told to liquidate it, which pays the holder all the collateral.
+      w.run(l, w.app(l).sell(bond.asset.toString, 1L, Market.Erg, FixedPrice(erg("5.5")), Some(1L), w.h + 100L, erg("0.002")))
+      val ask = w.app(e).asks().loneElement.box.id.toString
+      refused(w.app(e).buy(ask, None)) should include(s"Liquidate it instead (`liquidate ${bond.box.id}`)")
+      w.run(e, w.app(e).buy(ask, None, allowLiquidatable = true))
+      w.tokens(e).get(bond.asset) shouldBe Some(1L)
+    }
+  }
+
+  property("cover: an offer over its floor still refuses a bond under its own ratio, and batch passes it over") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, e, o) = (borrower(ctx), executor(ctx), other(ctx))
+      w.fund(b, erg("20"))
+      w.fund(e, erg("1"))
+      w.fund(o, erg("5"), Token(SigUsd, 1000L))
+      // $7 at 150% needs 5.25 ERG at 0.5 ERG per USD; 4.9 ERG is 140%, over the offer's 130% floor.
+      w.oracle(500000000L, w.h)
+      w.run(o, w.app(o).createOffer(offerSpec(w).copy(market = Market.SigUsd, capital = 1000L, fees = erg("0.5"))))
+      w.run(b, w.app(b).createOrder(loan(Market.SigUsd, principal = 600L, repayment = 700L, collateralErg = erg("4.9"),
+        collateral = Seq.empty, rule = OracleChoice(15000L, 60L))(w).copy(allowLiquidatable = true)))
+      val order = w.app(e).orders().loneElement.box.id.toString
+      refused(w.app(e).matchOrder(w.app(e).offers().loneElement.box.id.toString, order)) should
+        include("at 140%, under its own 150% ratio, so it could be liquidated at once")
+      w.app(e).batchScan().work.filter(_.command.startsWith("match-offer")) shouldBe empty
+    }
+  }
+
+  // ═══ GUARDS ═══════════════════════════════════════════════════════════════
+
+  /** 1 ERG and $10 against 6 ERG, liquidated below 150%, with the fill guard at `fill`. */
+  private def guardedLoan(w: World, fill: Long): StdLoan =
+    loan(collateralErg = erg("1"), collateral = Seq(Token(SigUsd, 1000L)), rule = OracleChoice(15000L, 30L))(w)
+      .copy(fillRatio = Some(fill))
+
+  property("fill guard: an order's guard runs in every fill, by wallet or offer, and stops one under its ratio") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, l, e, o) = (borrower(ctx), lender(ctx), executor(ctx), other(ctx))
+      w.fund(b, erg("20"), Token(SigUsd, 3000L))
+      w.fund(l, erg("20"))
+      w.fund(e, erg("1"))
+      w.fund(o, erg("30"))
+      // At 0.9 ERG per USD the collateral is 10 ERG: 166%.
+      val high = w.oracle(900000000L, w.h)
+      refused(w.app(b).createOrder(guardedLoan(w, 14000L))) should include("under the liquidation ratio 150%")
+      val posted = w.app(b).createOrder(guardedLoan(w, 15000L))
+      posted.notes.exists(_.startsWith("fill guard: a fill must leave collateral worth at least 150%")) shouldBe true
+      posted.notes.exists(_.contains("cannot be filled once ERG rises above $1.2500")) shouldBe true
+      w.run(b, posted)
+      val order = w.app(l).orders().loneElement
+      order.fillRatio shouldBe Some(15000L)
+      protocol.isFillGuard(order.guardHash.get, Market.Erg) shouldBe true
+
+      // A wallet fill: the guard rides in the order's var 1 and the oracle is a data input.
+      val fill = w.app(l).fillOrder(order.box.id.toString, reserve)
+      fill.tx.getDataInputs.size shouldBe 1
+      w.run(l, fill)
+      w.app(e).bonds().loneElement.payload shouldBe Seq(15000L, 30L, 15000L)
+
+      // An offer fills a second guarded order the same way.
+      w.run(b, w.app(b).createOrder(guardedLoan(w, 16000L)))
+      w.run(o, w.app(o).createOffer(offerSpec(w)))
+      val second = w.app(e).orders().loneElement.box.id.toString
+      w.run(e, w.app(e).matchOrder(w.app(e).offers().loneElement.box.id.toString, second))
+      w.app(e).bonds().size shouldBe 2
+
+      // ERG at $2: 6 ERG of collateral, 100%. The order posts with a warning, and nothing fills it.
+      w.chain.unspent.remove(high.id.toString)
+      w.oracle(500000000L, w.h)
+      val waiting = w.app(b).createOrder(guardedLoan(w, 16000L))
+      waiting.notes.exists(_.startsWith("WARNING: at this price the fill guard refuses every fill")) shouldBe true
+      w.run(b, waiting)
+      val stuck = w.app(l).orders().loneElement.box.id.toString
+      refused(w.app(l).fillOrder(stuck, reserve, allowLiquidatable = true)) should
+        include("the order's fill guard refuses this fill: the bond would start at 100% of its repayment, under the order's 160% fill guard")
+      // The offer's own floor refuses it first; batch passes it over either way.
+      refused(w.app(e).matchOrder(w.app(e).offers().loneElement.box.id.toString, stuck)) should include("refuses this order")
+      w.app(e).batchScan().work.filter(_.command.startsWith("match-offer")) shouldBe empty
+    }
+  }
+
+  property("sale guard: a guarded ask sells, at NAV or at a fixed price, only while its bond's cover holds") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, l, e, o) = (borrower(ctx), lender(ctx), executor(ctx), other(ctx))
+      w.fund(b, erg("20"), Token(SigUsd, 1000L))
+      w.fund(l, erg("20"))
+      w.fund(e, erg("20"))
+      w.fund(o, erg("30"))
+      val high = w.oracle(900000000L, w.h)
+      w.run(b, w.app(b).createOrder(guardedLoan(w, 15000L)))
+      w.run(l, w.app(l).fillOrder(w.app(l).orders().loneElement.box.id.toString, reserve))
+      val bond = w.app(e).bonds().loneElement
+
+      // At NAV with a 160% guard: an offer buys it at 166%.
+      val navAsk = w.app(l).sell(bond.asset.toString, 1L, Market.Erg, NavPrice(0L, None), Some(1L), w.h + 100L,
+        erg("0.002"), Some(SaleGuard(16000L, 30L)))
+      navAsk.notes.exists(_.startsWith("sale guard: it sells only while the bond's collateral is worth at least 160%")) shouldBe true
+      w.run(l, navAsk)
+      val nav = w.app(e).asks().loneElement
+      protocol.saleGuard(nav) shouldBe Some(16000L -> 30L)
+      w.run(o, w.app(o).createOffer(offerSpec(w)))
+      w.run(e, w.app(e).matchAsk(w.app(e).offers().loneElement.box.id.toString, nav.box.id.toString, None))
+      w.tokens(o).get(bond.asset) shouldBe Some(1L)
+
+      // At a fixed 5.5 ERG with the same guard: a NAV ask whose floor is the price.
+      w.run(o, w.app(o).sell(bond.asset.toString, 1L, Market.Erg, FixedPrice(erg("5.5")), Some(1L), w.h + 100L,
+        erg("0.002"), Some(SaleGuard(16000L, 30L))))
+      val fixed = w.app(e).asks().loneElement
+      fixed.margin shouldBe StandardProtocol.GuardedFixedMargin
+      w.app(e).askPrice(fixed, 1L)._1 shouldBe erg("5.5")
+      // ERG at about $1.18: 158%, over the bond's 150% ratio but under the seller's 160%.
+      w.chain.unspent.remove(high.id.toString)
+      val low = w.oracle(850000000L, w.h)
+      refused(w.app(e).buy(fixed.box.id.toString, None)) should
+        include("the ask's sale guard refuses this sale: the bond is at 158.33% of its repayment, under the seller's 160% sale guard")
+      w.chain.unspent.remove(low.id.toString)
+      w.oracle(900000000L, w.h)
+      val o0 = w.nano(o)
+      w.run(e, w.app(e).buy(fixed.box.id.toString, None))
+      w.tokens(e).get(bond.asset) shouldBe Some(1L)
+      w.nano(o) shouldBe o0 + erg("5.5")
+    }
   }
 
   // ═══ BATCHING ═════════════════════════════════════════════════════════════

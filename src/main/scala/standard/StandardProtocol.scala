@@ -29,9 +29,13 @@ case class OracleRatio(market: Market, expression: Contract) extends Liquidation
 /**
  * A standard order. `terms` is R4 exactly as the bond will copy it: 0 repayment, 1 principal nanoERG,
  * 2 repayment ERG floor, 3 maturity height or duration, 4 expiry height, 5 expiry fee, 6 mode, 7.. payload.
+ * `guardHash` is R8, the fill guard expression a fill must also pass, when the borrower set one; the
+ * standard guard reads its minimum fill ratio at payload(2).
  */
 case class StdOrder(box: InputUTXO, market: Market, terms: Seq[Long], principalTokens: Seq[Token],
-                    borrowerHash: Array[Byte], liqHash: Array[Byte]) {
+                    borrowerHash: Array[Byte], liqHash: Array[Byte], guardHash: Option[Array[Byte]] = None) {
+  /** The guard's minimum collateral ratio at the fill, in basis points of the repayment. */
+  def fillRatio: Option[Long] = guardHash.flatMap(_ => payload.lift(2))
   def repayment: Long = terms(0)
   def principalErg: Long = terms(1)
   def ergFloor: Long = terms(2)
@@ -45,16 +49,20 @@ case class StdOrder(box: InputUTXO, market: Market, terms: Seq[Long], principalT
   def collateral: Seq[Token] = box.tokens
 }
 
-/** A live standard bond. R9 is (lender fee reserve, start height, maturity height). */
+/**
+ * A live standard bond. R9 is (lender fee reserve, start height, maturity height). `pending`: not yet made, the
+ * bond a fill of the order `box` would make; the order holds the collateral alone, with its expiry fee.
+ */
 case class StdBond(box: InputUTXO, market: Market, terms: Seq[Long], principalTokens: Seq[Token],
-                   borrowerHash: Array[Byte], liqHash: Array[Byte], feeReserve: Long, start: Long, maturity: Long) {
-  def asset: ErgoId = box.tokens.head.id
+                   borrowerHash: Array[Byte], liqHash: Array[Byte], feeReserve: Long, start: Long, maturity: Long,
+                   pending: Boolean = false) {
+  def asset: ErgoId = if (pending) box.id else box.tokens.head.id
   def repayment: Long = terms(0)
   def ergFloor: Long = terms(2)
   def payload: Seq[Long] = terms.drop(7)
   def principal: Long = if (market.token.isEmpty) terms(1) else principalTokens.headOption.fold(0L)(_.amount)
-  def collateral: Seq[Token] = box.tokens.drop(1)
-  def collateralErg: Long = box.value - feeReserve
+  def collateral: Seq[Token] = if (pending) box.tokens else box.tokens.drop(1)
+  def collateralErg: Long = box.value - (if (pending) terms(5) else feeReserve)
   /** The box's creation height: when the bond last moved, which starts its recollateralize wait. */
   def movedAt: Int = box.input.getCreationHeight
   def recollateralizableFrom: Long = movedAt.toLong + StandardProtocol.RecollateralizeWait
@@ -173,7 +181,20 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
     principal <- tokensReg(box, 5)
     borrower <- bytesReg(box, 6) if borrower.length == 32
     liq <- bytesReg(box, 7) if liq.length == 32
-  } yield StdOrder(box, m, terms.toSeq, principal, borrower, liq)
+  } yield StdOrder(box, m, terms.toSeq, principal, borrower, liq, bytesReg(box, 8))
+
+  /** Whether `hash` is the standard fill guard compiled for `m`. */
+  def isFillGuard(hash: Array[Byte], m: Market): Boolean = hash.sameElements(market(m).fillGuard.hashedValueBytes)
+
+  /** Whether a NAV ask's R6 names the guarded pricing expression, which also holds a sale to a minimum cover. */
+  def isGuarded(ask: StdAsk): Boolean = ask.pricingHash.exists(_.sameElements(market(ask.market).guardedPricing.hashedValueBytes))
+
+  /** A guarded ask's (minimum cover in basis points, maximum oracle age): R5(6) and R5(7). */
+  def saleGuard(ask: StdAsk): Option[(Long, Long)] =
+    if (isGuarded(ask) && ask.terms.size >= 8) Some(ask.terms(6) -> ask.terms(7)) else None
+
+  /** The pricing expression a NAV ask's R6 names, as the bytes its var 2 carries. */
+  def pricingOf(ask: StdAsk): Contract = if (isGuarded(ask)) market(ask.market).guardedPricing else market(ask.market).pricing
 
   def asBond(box: InputUTXO): Option[StdBond] = for {
     m <- bondMarket(box.input.getErgoTree)
@@ -282,17 +303,24 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
 
   /** Collateral value and debt in the oracle rule's common unit; None when the price is unusable. */
   def cover(bond: StdBond, price: Long): Option[(BigInt, BigInt)] =
-    if (price <= 0L) None
-    else {
-      val sigUsd = bond.collateral.filter(_.id == Market.SigUsdId).map(t => BigInt(t.amount)).sum
-      val collateral = BigInt(bond.collateralErg) * 100 + BigInt(price) * sigUsd
-      val debt = if (bond.market.token.isEmpty) BigInt(bond.repayment) * 100 else BigInt(price) * bond.repayment
-      if (debt <= 0) None else Some(collateral -> debt)
-    }
+    coverOf(bond.market, bond.collateralErg, bond.collateral, bond.repayment, price)
 
   /** The collateral ratio in basis points of the repayment, as the oracle rule measures it. */
   def ratioBps(bond: StdBond, price: Long): Option[Long] =
     cover(bond, price).map { case (c, d) => (c * 10000 / d).min(BigInt(Long.MaxValue)).toLong }
+
+  /** The bond's own early-liquidation ratio, when its rule is the oracle rule and it carries one. */
+  def ownRatio(bond: StdBond): Option[Long] = ruleOf(bond.liqHash) match {
+    case Some(OracleRatio(_, _)) if bond.payload.nonEmpty => Some(bond.payload.head)
+    case _ => None
+  }
+
+  /**
+   * Whether the bond's collateral is strictly below its own oracle ratio at `price`: its rule then lets anyone
+   * liquidate it, sending all the collateral to the lender, as soon as an oracle that fresh is read.
+   */
+  def belowOwnRatio(bond: StdBond, price: Long): Boolean =
+    ownRatio(bond).exists(r => cover(bond, price).exists { case (c, d) => c * 10000 < d * r })
 }
 
 object StandardProtocol {
@@ -309,17 +337,74 @@ object StandardProtocol {
   /** The floor every standard batching fee shares on-chain: 0.002 ERG. */
   val MinBatchingFee: Long = 2000000L
 
+  /**
+   * The margin of a guarded fixed-price ask: a NAV ask priced at a hundredth of a percent of accrued value, so its
+   * floor, the fixed price, is what a buyer pays, and the guarded expression still holds the sale to its cover.
+   */
+  val GuardedFixedMargin: Long = -9999L
+
   /** zcs1's maturity grid: fixed maturities are multiples of 21,600 blocks, about 30 days of 2-minute blocks. */
   val MaturityGrid: Long = 21600L
 
   /**
-   * The grid height nearest `target` that still lies more than 2 blocks above `height`, so an order made now
-   * can be filled; a tie goes to the later height.
+   * zcs1's snap: a maturity at least one grid step away moves to the nearest grid height, a tie going to the
+   * later one, so it moves by at most half a step and the term stays at least 10,800 blocks. A nearer maturity
+   * keeps its height: rounding it could shorten a 10-day loan to minutes.
    */
-  def snapMaturity(target: Long, height: Long): Long = {
-    val below = Math.floorDiv(target, MaturityGrid) * MaturityGrid
-    Seq(below, below + MaturityGrid, below + 2 * MaturityGrid)
-      .filter(_ > height + 2L)
-      .minBy(g => (math.abs(g - target), -g))
+  def snapMaturity(target: Long, height: Long): Long =
+    if (target - height < MaturityGrid) target
+    else {
+      val below = Math.floorDiv(target, MaturityGrid) * MaturityGrid
+      Seq(below, below + MaturityGrid).minBy(g => (math.abs(g - target), -g))
+    }
+
+  /**
+   * zcs1's default order expiry: a week, but never more than half of a fixed maturity's remaining term, so a
+   * fill always leaves the borrower at least half the term to repay.
+   */
+  def defaultOrderExpiry(height: Long, maturity: Option[Long], week: Long): Long =
+    maturity.fold(height + week)(h => math.max(height + 2L, math.min(height + week, height + (h - height) / 2L)))
+
+  /**
+   * Collateral value and debt in the oracle rule's common unit: C = 100 * nanoERG + price * SigUSD raw, and
+   * L = 100 * repayment nanoERG or price * repayment raw. Other tokens count as zero. None for an unusable price.
+   */
+  def coverOf(market: Market, collateralErg: Long, collateral: Seq[Token], repayment: Long,
+              price: Long): Option[(BigInt, BigInt)] =
+    if (price <= 0L) None
+    else {
+      val sigUsd = collateral.filter(_.id == Market.SigUsdId).map(t => BigInt(t.amount)).sum
+      val value = BigInt(collateralErg) * 100 + BigInt(price) * sigUsd
+      val debt = if (market.token.isEmpty) BigInt(repayment) * 100 else BigInt(price) * repayment
+      if (debt <= 0) None else Some(value -> debt)
+    }
+
+  /**
+   * Where collateral crosses `ratioBps` of the repayment, as an oracle price in nanoERG per USD, and which way:
+   * `belowWhenHigher` is true when prices above it (ERG cheaper) put the collateral below the ratio. None when
+   * no price moves it across: all-ERG collateral against an ERG repayment, or SigUSD that covers it alone.
+   */
+  def crossingPrice(market: Market, collateralErg: Long, collateral: Seq[Token], repayment: Long,
+                    ratioBps: Long): Option[(BigInt, Boolean)] = {
+    val sigUsd = collateral.filter(_.id == Market.SigUsdId).map(t => BigInt(t.amount)).sum
+    if (market.token.isEmpty) {
+      // (100 E + P U) 10000 < 100 R ratio  <=>  P < 100 (R ratio - 10000 E) / (10000 U)
+      val gap = BigInt(100) * (BigInt(repayment) * ratioBps - BigInt(10000) * collateralErg)
+      if (sigUsd <= 0 || gap <= 0) None else Some((gap / (sigUsd * 10000)) -> false)
+    } else {
+      // (100 E + P U) 10000 < P R ratio  <=>  P > 1000000 E / (R ratio - 10000 U)
+      val gap = BigInt(repayment) * ratioBps - sigUsd * 10000
+      if (gap <= 0) None else Some((BigInt(1000000) * collateralErg / gap) -> true)
+    }
   }
+
+  /** An oracle price, nanoERG per USD, as dollars per ERG. */
+  def usdPerErg(price: BigInt): String =
+    if (price <= 0) "an unbounded price"
+    else "$" + (BigDecimal(1000000000) / BigDecimal(price)).setScale(4, BigDecimal.RoundingMode.HALF_UP).bigDecimal.toPlainString
+
+  /** The bond a fill of `order` at `start` would make, as the cover and offer checks read it. */
+  def prospective(order: StdOrder, start: Long, maturity: Long, feeReserve: Long = 0L): StdBond =
+    StdBond(order.box, order.market, order.terms, order.principalTokens, order.borrowerHash, order.liqHash,
+      feeReserve, start, maturity, pending = true)
 }

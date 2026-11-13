@@ -69,9 +69,11 @@ sbt "runMain ksingh.sigmabonds.app.SigmaFiCli help"
 - Look around: `info`, `orders`, `bonds` (oracle ratios, recollateralize timing, and whether each bond
   asset was really minted by a standard order), `claims`
 - Borrower: `create-order` (ERG or SigUSD market; maturity or oracle-ratio liquidation; a fixed
-  maturity snaps to the 21,600-block grid unless `--exact-maturity`), `cancel-order`,
-  `repay [--from-collateral]`, `recollateralize`
-- Lender: `fill-order [--fee-reserve <ERG>]` (CLI minimum and default 0.05 ERG), `claim`
+  maturity at least 21,600 blocks out snaps to the grid unless `--exact-maturity`; an oracle order
+  carries a fill guard that its contract enforces, at `--ratio` or `--fill-ratio`, unless
+  `--no-fill-guard`), `cancel-order`, `repay [--from-collateral]`, `recollateralize`
+- Lender: `fill-order [--fee-reserve <ERG>]` (CLI minimum and default 0.05 ERG), `claim`. A fill or
+  purchase that would leave a bond under its own oracle ratio is refused unless `--allow-liquidatable`
 - Anyone: `liquidate`, which keeps the bonds' fee reserves, `refund-order`, which returns an expired
   order to its borrower for its expiry fee, and `pack`, which refunds expired orders, offers and asks
   and liquidates bonds in one transaction with one miner fee
@@ -79,7 +81,8 @@ sbt "runMain ksingh.sigmabonds.app.SigmaFiCli help"
   collateral), `mint-shares` and `pull` (anyone, for the fees the owner committed), `buy-lot` (anyone,
   at an open auction's current price), `claim-shares`, `cancel-share-request`
 - Asks: `asks` (prices also as a percentage of face), `sell` (a fixed `--price`, or `--nav` at a bond's
-  accrued value plus a margin), `buy`, `cancel-ask`, `refund-ask`
+  accrued value plus a margin; `--min-cover` adds a sale guard that stops sales while the bond's
+  collateral is thin), `buy`, `cancel-ask`, `refund-ask`
 - Lend offers: `offers`, `create-offer` (a yearly yield, a maturity window, a collateral floor, and
   optionally `--deliver-shares` into fractional or Dutch shares), `cancel-offer`, `refund-offer`, and
   `match-offer --order | --ask`, which anyone runs for the offer's batcher fee. An offer's policy buys

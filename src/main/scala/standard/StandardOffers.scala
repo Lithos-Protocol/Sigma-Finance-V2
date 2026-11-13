@@ -133,6 +133,11 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     else if (at - oracle.get.created > o.maxAge) Some(s"the oracle price is older than the offer's ${o.maxAge} blocks")
     else if (!cover.exists { case (c, d) => c * 10000 >= d * o.floorBps })
       Some(s"the collateral is at ${protocol.ratioBps(bond, oracle.get.price).fold("?")(Units.percent)}, under the offer's floor")
+    // zcs1, not the contract: the policy passes a bond under its own ratio but over the floor, which anyone could
+    // then liquidate at once for all its collateral. A batcher liquidates such a bond instead of buying or making it.
+    else if (protocol.belowOwnRatio(bond, oracle.get.price))
+      Some(s"the bond is at ${protocol.ratioBps(bond, oracle.get.price).fold("?")(Units.percent)}, under its own " +
+        s"${Units.percent(bond.payload(0))} ratio, so it could be liquidated at once")
     else None
   }
 
@@ -186,10 +191,10 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     val start = height.toLong
     val maturity = if (order.onClose) addAmount(start, order.terms(3)) else order.terms(3)
     val asset = order.box.id
-    val bond = StdBond(order.box, order.market, order.terms, order.principalTokens, order.borrowerHash, order.liqHash,
-      o.feeReserve, start, maturity)
+    val bond = prospective(order, start, maturity, o.feeReserve)
     val oracle = Try(self.oracle()).toOption.flatten
     offerRefusal(o, bond, order.principal, 1L, 1L, oracle).foreach(r => fail(s"the offer refuses this order: $r"))
+    guardRefusal(order, bond, oracle).foreach(r => fail(s"the order's fill guard refuses this fill: $r"))
     oracle.foreach(readableOracle)
 
     val rule = protocol.ruleOf(order.liqHash).getOrElse(fail("the order names a liquidation expression this client does not know"))
@@ -204,7 +209,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     val ergOut = o.batcherFee + funding + o.feeReserve + (if (o.market.token.isEmpty) order.principal else order.principalErg)
     val rest = offerRest(o, order.principal, ergOut)
     prepare(s"Match offer $offerId with order $orderId",
-      plan(Seq(order.box, offerInput(o, 3)), Seq(delivery, bondOut, principal, rest), minted = Some(asset),
+      plan(Seq(orderInput(order), offerInput(o, 3)), Seq(delivery, bondOut, principal, rest), minted = Some(asset),
         dataInputs = oracle.map(_.box).toSeq),
       Seq(s"the offer lends ${Units.amount(order.principal, o.market)} for ${Units.amount(order.repayment, o.market)} " +
         s"at height $maturity", s"you keep the offer's ${Fmt.erg(o.batcherFee)} batcher fee, less the miner fee"))
@@ -232,6 +237,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     val price = if (o.market.token.isEmpty) math.max(askPrice(ask, n)._1, MinBox) else askPrice(ask, n)._1
     val oracle = Try(self.oracle()).toOption.flatten
     offerRefusal(o, bond, price, n, whole, oracle).foreach(r => fail(s"the offer refuses this ask: $r"))
+    saleGuardRefusal(ask, bond, oracle).foreach(r => fail(s"the ask's sale guard refuses this sale: $r"))
     oracle.foreach(readableOracle)
 
     val originBytes = nodeApi.boxById(asset.toString).filter(j => NodeJson.spentBy(j).isDefined)

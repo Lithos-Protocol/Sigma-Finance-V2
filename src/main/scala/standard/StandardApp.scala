@@ -23,7 +23,8 @@ case class OracleChoice(ratioBps: Long, maxAge: Long) extends RuleChoice
  */
 case class StdLoan(market: Market, principal: Long, repayment: Long, collateralErg: Long,
                    collateralTokens: Seq[Token], schedule: Schedule, rule: RuleChoice,
-                   expiry: Long, expiryFee: Long, requestedMaturity: Option[Long] = None)
+                   expiry: Long, expiryFee: Long, requestedMaturity: Option[Long] = None,
+                   allowLiquidatable: Boolean = false, fillRatio: Option[Long] = None)
 
 /**
  * The ZC Standard set over a single Ergo node: the CLI's default commands. It builds with the pinned trees
@@ -160,11 +161,33 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
         (d, 1L)
     }
     val (rule, payload) = loan.rule match {
-      case MaturityChoice => (protocol.contracts.maturity, Seq.empty[Long])
+      case MaturityChoice =>
+        if (loan.fillRatio.isDefined) fail("a fill guard needs the oracle liquidation rule")
+        (protocol.contracts.maturity, Seq.empty[Long])
       case OracleChoice(ratio, age) =>
         if (ratio <= 0L) fail("the liquidation ratio must be positive")
         if (age < 1L || age > 100000L) fail("the oracle age must be 1 to 100000 blocks")
-        (protocol.market(m).oracleRule, Seq(ratio, age))
+        loan.fillRatio.foreach { f =>
+          if (f < ratio) fail(s"the fill guard's ratio ${Units.percent(f)} is under the liquidation ratio " +
+            s"${Units.percent(ratio)}: a fill could then start a bond already liquidatable")
+        }
+        // The fill guard reads its minimum at payload index 2, after the rule's ratio and oracle age.
+        (protocol.market(m).oracleRule, Seq(ratio, age) ++ loan.fillRatio.toSeq)
+    }
+    val coverNotes = loan.rule match {
+      case MaturityChoice => Seq.empty[String]
+      case OracleChoice(ratio, _) =>
+        orderCover(m, loan.collateralErg, loan.collateralTokens, loan.repayment, ratio, loan.fillRatio,
+          loan.allowLiquidatable)
+    }
+    // A fill as late as the order allows: before its expiry, and at least 2 blocks before a fixed maturity.
+    val termNotes = loan.schedule match {
+      case FixedMaturity(h) =>
+        val lastFill = math.min(loan.expiry - 1L, h - 2L)
+        if (h - lastFill >= (h - height.toLong) / 2L) Seq.empty
+        else Seq(s"WARNING: a fill at height $lastFill leaves only ${h - lastFill} blocks to repay; from maturity on " +
+          "anyone may liquidate the bond, sending all the collateral to the lender. An earlier --expires-in leaves more")
+      case OnClose(_) => Seq.empty
     }
     // One asset: an ERG loan's floor never binds; a token loan carries only box minimums beside its token.
     val (principalErg, floor, principalTokens) = m.token match {
@@ -174,7 +197,8 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
     val terms = Seq(loan.repayment, principalErg, floor, maturityTerm, loan.expiry, loan.expiryFee, mode) ++ payload
     val order = UTXO(protocol.market(m).order, addAmount(loan.collateralErg, loan.expiryFee), loan.collateralTokens,
       Seq(longsValue(terms: _*), tokensValue(principalTokens), bytesValue(hashOf(myTree)),
-        bytesValue(rule.hashedValueBytes)))
+        bytesValue(rule.hashedValueBytes)) ++
+        loan.fillRatio.map(_ => bytesValue(protocol.market(m).fillGuard.hashedValueBytes)))
 
     val notes = Seq(
       s"borrow: ${Units.amount(loan.principal, m)}; repay ${Units.amount(loan.repayment, m)}",
@@ -191,10 +215,93 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
           "or from maturity on"
       }),
       s"expiry: height ${loan.expiry}; from then anyone may return it to you and keep the ${Fmt.erg(loan.expiryFee)} " +
-        "expiry fee, which a fill refunds to you instead",
-      "Output 0 is the order. Cancel it any time before it is filled with `cancel-order <its box id>`.")
+        "expiry fee, which a fill refunds to you instead") ++ coverNotes ++ termNotes :+
+      "Output 0 is the order. Cancel it any time before it is filled with `cancel-order <its box id>`."
     prepare("Create order", plan(Seq.empty, Seq(order)), notes)
   }
+
+  /**
+   * zcs1's cover check for a new oracle order, at the confirmed oracle price. With a fill guard (`fill`), the
+   * contract itself refuses a fill under that ratio, so the notes say at what ERG price the order stops filling
+   * and warn when it cannot fill now. Without one, an order already below its own ratio is refused unless
+   * `allow`: a fill would start a bond anyone could liquidate at once, sending all the collateral to the lender.
+   * Without a readable oracle nothing is checked, and a note says so.
+   */
+  private def orderCover(m: Market, collateralErg: Long, collateral: Seq[Token], repayment: Long, ratio: Long,
+                         fill: Option[Long], allow: Boolean): Seq[String] = {
+    val line = fill.getOrElse(ratio)
+    val crossing = crossingPrice(m, collateralErg, collateral, repayment, line).map { case (p, higher) =>
+      val side = if (higher) "falls under" else "rises above"
+      if (fill.isDefined) s"so it cannot be filled once ERG $side ${usdPerErg(p)}"
+      else s"a fill starts a bond that can be liquidated at once if ERG $side ${usdPerErg(p)}, so the order is safe to " +
+        "leave open only while the price stays clear of that (a fill guard, the default, would stop such a fill)"
+    }
+    val guardNote = fill.map(f => s"fill guard: a fill must leave collateral worth at least ${Units.percent(f)} of " +
+      "the repayment at a fresh oracle price, which the order's contract checks").toSeq
+    guardNote ++ crossing ++ (Try(oracle()).toOption.flatten match {
+      case None => Seq("the USD oracle pool could not be read, so the order's cover now was not checked")
+      case Some(o) =>
+        val (c, d) = coverOf(m, collateralErg, collateral, repayment, o.price).getOrElse(fail("the oracle price is unusable"))
+        val now = Units.percent((c * 10000 / d).min(BigInt(Long.MaxValue)).toLong)
+        val below = c * 10000 < d * ratio
+        if (fill.isEmpty && below && !allow)
+          fail(s"at the oracle price (ERG at ${usdPerErg(o.price)}) the collateral is $now of the repayment, already under " +
+            s"the order's ${Units.percent(ratio)} ratio: a fill would start a bond anyone could liquidate at once, sending " +
+            "all the collateral to the lender. Add collateral, keep the fill guard, or pass --allow-liquidatable")
+        Seq(s"cover now: $now of the repayment at ERG ${usdPerErg(o.price)}" +
+          (if (below && fill.isEmpty) s", UNDER its ${Units.percent(ratio)} ratio (--allow-liquidatable)" else "")) ++
+          fill.filter(f => c * 10000 < d * f).map(f => s"WARNING: at this price the fill guard refuses every fill: " +
+            s"the order waits until the price recovers to ${Units.percent(f)} cover, or you cancel it").toSeq
+    })
+  }
+
+  /**
+   * Why the order's fill guard would refuse a fill of `bond` now, or None when it has none or would pass: the
+   * guard must be the standard one for the order's market, its terms whole, and the confirmed oracle fresh
+   * enough for the order's rule with the bond's cover at least the guard's ratio.
+   */
+  private[standard] def guardRefusal(order: StdOrder, bond: StdBond, oracle: Option[OracleState]): Option[String] =
+    order.guardHash.flatMap { hash =>
+      val at = height.toLong + 1L
+      val p = order.payload
+      if (!protocol.isFillGuard(hash, order.market)) Some("the order names a fill guard this client does not know")
+      else if (p.size < 3 || p(0) <= 0L || p(2) < p(0) || p(1) < 1L || p(1) > 100000L)
+        Some("the order's fill guard terms are malformed, so no fill can pass it; its borrower can only cancel it")
+      else oracle match {
+        case None => Some("a guarded order fills only with the USD oracle pool as a data input, and the node's index " +
+          "has no single pool box")
+        case Some(o) if at - o.created > p(1) => Some(s"the oracle price is older than the order's ${p(1)} blocks")
+        case Some(o) if !protocol.cover(bond, o.price).exists { case (c, d) => c * 10000 >= d * p(2) } =>
+          Some(s"the bond would start at ${protocol.ratioBps(bond, o.price).fold("?")(Units.percent)} of its " +
+            s"repayment, under the order's ${Units.percent(p(2))} fill guard")
+        case _ => None
+      }
+    }
+
+  /** The order as a fill spends it: with its fill guard's expression in context var 1 when R8 names one. */
+  private[standard] def orderInput(order: StdOrder): InputUTXO =
+    if (order.guardHash.isEmpty) order.box
+    else order.box.withCtxVar(1.toByte, bytesValue(protocol.market(order.market).fillGuard.valueBytes))
+
+  /**
+   * zcs1: no fill or purchase leaves a bond below its own oracle ratio, which anyone could liquidate at once. It
+   * refuses one at the confirmed oracle price unless `allow`, saying `why` and what to do `instead`, and otherwise
+   * notes the cover. A bond without the oracle rule, or a client without a readable oracle, is not checked.
+   */
+  private[standard] def coverCheck(bond: StdBond, allow: Boolean, why: String, instead: String): Seq[String] =
+    protocol.ownRatio(bond).toSeq.flatMap { ratio =>
+      Try(oracle()).toOption.flatten match {
+        case None => Seq("the USD oracle pool could not be read, so the bond's cover was not checked")
+        case Some(o) =>
+          val now = protocol.ratioBps(bond, o.price).fold("?")(Units.percent)
+          val below = protocol.belowOwnRatio(bond, o.price)
+          if (below && !allow)
+            fail(s"$why at $now of its repayment, under its own ${Units.percent(ratio)} ratio at the oracle price: anyone " +
+              s"could liquidate it at once, sending all the collateral to the lender. $instead; --allow-liquidatable overrides")
+          Seq(s"cover: $now of the repayment at ERG ${usdPerErg(o.price)}; its ratio is ${Units.percent(ratio)}" +
+            (if (below) " (UNDER it: liquidatable now)" else ""))
+      }
+    }
 
   /** Take the collateral back, authorized by a box at the borrower address. */
   def cancelOrder(orderId: String): Prepared = {
@@ -216,7 +323,7 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
    * metadata, and 2 locked in the bond at OUTPUTS(1). The principal and the unused expiry fee go to the
    * borrower at OUTPUTS(2). This wallet funds the principal and the lender's liquidation fee reserve.
    */
-  def fillOrder(orderId: String, feeReserve: Long): Prepared = {
+  def fillOrder(orderId: String, feeReserve: Long, allowLiquidatable: Boolean = false): Prepared = {
     if (feeReserve < 0L) fail("the fee reserve cannot be negative")
     val order = protocol.asOrder(unspent(orderId)).getOrElse(fail(s"$orderId is not a ZC Standard order"))
     val m = order.market
@@ -231,6 +338,13 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
     }
     val start = height.toLong
     val maturity = if (order.onClose) addAmount(start, order.terms(3)) else order.terms(3)
+    val prospect = prospective(order, start, maturity, feeReserve)
+    // A guarded order's contract reads the confirmed oracle as a data input; refuse here what it would refuse.
+    val guardOracle = if (order.guardHash.isEmpty) None else Try(oracle()).toOption.flatten.map(readableOracle)
+    guardRefusal(order, prospect, guardOracle).foreach(r => fail(s"the order's fill guard refuses this fill: $r"))
+    val coverNotes = coverCheck(prospect, allowLiquidatable, "the bond would start",
+      "Wait for the price or for the borrower to cancel") ++
+      order.fillRatio.map(f => s"the order's fill guard (at least ${Units.percent(f)}) runs in this fill").toSeq
     val borrower = borrowerTree(order.borrowerHash, order.box)
     val asset = order.box.id
 
@@ -249,8 +363,9 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
       s"collateral: ${Fmt.contents(order.collateralErg, order.collateral)}; liquidation: ${describeRule(rule, order.payload)}",
       s"You also fund a ${Fmt.erg(feeReserve)} liquidation fee reserve: it pays whoever liquidates, and goes to " +
         "the vault on repayment.",
-      s"Your bond asset is $asset. Claim the bond's payout with `claim $asset`.")
-    prepare(s"Fill order $orderId", plan(Seq(order.box), Seq(unit, bond, principal), minted = Some(asset)), notes)
+      s"Your bond asset is $asset. Claim the bond's payout with `claim $asset`.") ++ coverNotes
+    prepare(s"Fill order $orderId", plan(Seq(orderInput(order)), Seq(unit, bond, principal), minted = Some(asset),
+      dataInputs = guardOracle.map(_.box).toSeq), notes)
   }
 
   /** A new bond unit's zcs1 metadata, as EIP-4 registers, from the order and the fill's heights. */

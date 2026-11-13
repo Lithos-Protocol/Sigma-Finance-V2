@@ -35,7 +35,8 @@ object Market {
 /** The contracts and expressions compiled for one market. */
 case class MarketContracts(bond: Contract, order: Contract, offer: Contract, saleOrder: Contract,
                            navAsk: Contract, dutchMint: Contract,
-                           oracleRule: Contract, policy: Contract, pricing: Contract)
+                           oracleRule: Contract, policy: Contract, pricing: Contract,
+                           fillGuard: Contract, guardedPricing: Contract)
 
 /**
  * The whole ZC Standard set. Expressions that run through `executeFromVar` are held as Contracts as
@@ -56,7 +57,8 @@ case class StandardContracts(vault: Contract, fractionalVault: Contract, fractio
         val c = market(m)
         Seq("Bond" -> c.bond, "Order" -> c.order, "LendOffer" -> c.offer, "SaleOrder" -> c.saleOrder,
           "NavAsk" -> c.navAsk, "DutchAuctionMint" -> c.dutchMint, "ERG_SigUSD_Liquidation" -> c.oracleRule,
-          "ERG_SigUSD_CollateralPolicy" -> c.policy, "AccruedValue_Pricing" -> c.pricing)
+          "ERG_SigUSD_CollateralPolicy" -> c.policy, "AccruedValue_Pricing" -> c.pricing,
+          "ERG_SigUSD_FillGuard" -> c.fillGuard, "ERG_SigUSD_GuardedNav_Pricing" -> c.guardedPricing)
           .map { case (name, contract) => Entry(name, Some(m), contract) }
       }
   }
@@ -72,7 +74,8 @@ object StandardContracts {
 
   /** Entries run through `executeFromVar`: a box commits to their expression bytes, not their tree. */
   val Expressions: Set[String] =
-    Set("MaturityLiquidation", "ERG_SigUSD_Liquidation", "ERG_SigUSD_CollateralPolicy", "AccruedValue_Pricing")
+    Set("MaturityLiquidation", "ERG_SigUSD_Liquidation", "ERG_SigUSD_CollateralPolicy", "AccruedValue_Pricing",
+      "ERG_SigUSD_FillGuard", "ERG_SigUSD_GuardedNav_Pricing")
 
   private var cache: Option[StandardContracts] = None
 
@@ -119,6 +122,10 @@ object StandardContracts {
           policy = build("bonds/policies/ZC_Standard_ERG_SigUSD_CollateralPolicy",
             "CONST_REPAYMENT_TOKEN" -> asset, "CONST_LIQUIDATION_HASH" -> Colls.fromArray(oracle.hashedValueBytes)),
           pricing = build("bonds/policies/ZC_Standard_AccruedValue_Pricing",
+            "CONST_REPAYMENT_TOKEN" -> asset, "CONST_BOND_HASH" -> hash(bond)),
+          // The borrower's fill guard and the seller's guarded pricing measure as the oracle rule does.
+          fillGuard = build("bonds/policies/ZC_Standard_ERG_SigUSD_FillGuard", "CONST_REPAYMENT_TOKEN" -> asset),
+          guardedPricing = build("bonds/policies/ZC_Standard_ERG_SigUSD_GuardedNav_Pricing",
             "CONST_REPAYMENT_TOKEN" -> asset, "CONST_BOND_HASH" -> hash(bond)))
       }.toMap
 
@@ -139,7 +146,7 @@ object StandardContracts {
         def of(name: String) = get(name, Some(m))
         m -> MarketContracts(of("Bond"), of("Order"), of("LendOffer"), of("SaleOrder"), of("NavAsk"),
           of("DutchAuctionMint"), of("ERG_SigUSD_Liquidation"), of("ERG_SigUSD_CollateralPolicy"),
-          of("AccruedValue_Pricing"))
+          of("AccruedValue_Pricing"), of("ERG_SigUSD_FillGuard"), of("ERG_SigUSD_GuardedNav_Pricing"))
       }.toMap)
   }
 }

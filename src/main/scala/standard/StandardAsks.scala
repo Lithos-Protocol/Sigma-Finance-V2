@@ -18,6 +18,12 @@ case class FixedPrice(total: Long) extends AskPrice
 case class NavPrice(marginBps: Long, floorTotal: Option[Long]) extends AskPrice
 
 /**
+ * A seller's sale guard: the ask sells only while the bond's collateral is worth at least `minBps` of its
+ * repayment at an oracle price at most `maxAge` blocks old (ZC_Standard_ERG_SigUSD_GuardedNav_Pricing).
+ */
+case class SaleGuard(minBps: Long, maxAge: Long)
+
+/**
  * Asks: ZC_Standard_SaleOrder at a fixed price, and ZC_Standard_NavAsk at a bond's accrued value through
  * ZC_Standard_AccruedValue_Pricing. Either sells any token; a NAV ask sells a bond unit or shares of one.
  */
@@ -71,7 +77,7 @@ trait StandardAsks extends AppBase { self: StandardApp =>
    * the token to be a standard bond unit or its shares, and is paid in that bond's own asset.
    */
   def sell(tokenId: String, amount: Long, market: Market, price: AskPrice, minFillAsked: Option[Long], expiry: Long,
-           refundFee: Long): Prepared = {
+           refundFee: Long, guard: Option[SaleGuard] = None): Prepared = {
     val token = Try(ErgoId.create(tokenId)).getOrElse(fail(s"$tokenId is not a token id"))
     val held = walletBoxes.flatMap(_.tokens).filter(_.id == token).map(_.amount).sum
     if (amount < 1L || amount > held) fail(s"this wallet holds $held of $tokenId; sell 1 to $held")
@@ -84,29 +90,65 @@ trait StandardAsks extends AppBase { self: StandardApp =>
     if (expiry <= height.toLong + 1L) fail("the ask's expiry must be above the current height")
     if (refundFee < 0L) fail("the refund fee cannot be negative")
     val seller = bytesValue(hashOf(myTree))
+    guard.foreach { g =>
+      if (g.minBps <= 0L) fail("the sale guard's minimum cover must be positive")
+      if (g.maxAge < 1L || g.maxAge > 100000L) fail("the sale guard's oracle age must be 1 to 100000 blocks")
+    }
+    // A NAV ask over a standard bond: plain accrued-value pricing, or with a sale guard the guarded expression,
+    // whose R5(6) and R5(7) hold the guard's minimum cover and oracle age.
+    def navAsk(num: Long, den: Long, margin: Long): (Contract, Seq[ErgoValue[_]]) = {
+      val (asset, whole) = bondOf(token).getOrElse(fail(s"$tokenId is not a standard bond unit or its shares"))
+      val bondMarket = assetMarket(asset).getOrElse(fail(s"bond $asset was not minted by a standard order"))
+      if (bondMarket != market) fail(s"a NAV ask or a guarded ask is paid in its bond's asset: use --market $bondMarket")
+      val pricing = if (guard.isDefined) protocol.market(market).guardedPricing else protocol.market(market).pricing
+      (protocol.market(market).navAsk,
+        Seq(seller, longsValue(Seq(num, den, minFill, expiry, margin, whole) ++ guard.toSeq.flatMap(g => Seq(g.minBps, g.maxAge)): _*),
+          bytesValue(pricing.hashedValueBytes), bytesValue(asset.getBytes)))
+    }
     val (script, regs, note) = price match {
-      case FixedPrice(total) =>
+      case FixedPrice(total) if guard.isEmpty =>
         if (total <= 0L) fail("the price must be positive")
         (protocol.market(market).saleOrder, Seq(seller, longsValue(total, amount, minFill, expiry)),
           s"price: ${Units.amount(total, market)} for all $amount units")
+      case FixedPrice(total) =>
+        if (total <= 0L) fail("the price must be positive")
+        // A guarded fixed price: a NAV ask at -99.99%, so its floor, the fixed price, is what a buyer pays.
+        val (script, regs) = navAsk(total, amount, GuardedFixedMargin)
+        (script, regs, s"price: ${Units.amount(total, market)} for all $amount units (a NAV ask whose floor is the price)")
       case NavPrice(margin, floor) =>
         if (margin <= -10000L || margin > 1000000L) fail("the margin must be above -100% and at most 10000%")
-        val (asset, whole) = bondOf(token).getOrElse(fail(s"$tokenId is not a standard bond unit or its shares"))
-        val bondMarket = assetMarket(asset).getOrElse(fail(s"bond $asset was not minted by a standard order"))
-        if (bondMarket != market) fail(s"a NAV ask is paid in its bond's asset: use --market $bondMarket")
         val (num, den) = floor.fold((1L, 1000000000000L))(t => (t, amount))
-        (protocol.market(market).navAsk,
-          Seq(seller, longsValue(num, den, minFill, expiry, margin, whole), bytesValue(protocol.market(market).pricing.hashedValueBytes),
-            bytesValue(asset.getBytes)),
-          s"price: the bond's accrued value ${if (margin >= 0) "plus" else "minus"} ${Units.percent(margin.abs)}, per " +
-            s"$whole unit(s) of a whole bond" + floor.fold("")(f => s", never under ${Units.amount(f, market)} for all"))
+        val (script, regs) = navAsk(num, den, margin)
+        val whole = bondOf(token).fold(1L)(_._2)
+        (script, regs, s"price: the bond's accrued value ${if (margin >= 0) "plus" else "minus"} ${Units.percent(margin.abs)}, per " +
+          s"$whole unit(s) of a whole bond" + floor.fold("")(f => s", never under ${Units.amount(f, market)} for all"))
     }
+    val guardNote = guard.map(g => s"sale guard: it sells only while the bond's collateral is worth at least " +
+      s"${Units.percent(g.minBps)} of its repayment at an oracle price at most ${g.maxAge} blocks old; below that, " +
+      "anyone may liquidate the bond and you claim its collateral with the unit").toSeq
     val ask = UTXO(script, MinBox + refundFee, Seq(Token(token, amount)), regs)
     prepare(s"Sell $amount of $tokenId", plan(Seq.empty, Seq(ask)), Seq(note,
       s"paid in $market; minimum fill $minFill; expires at height $expiry, then anyone may return it for the " +
         s"${Fmt.erg(refundFee)} refund fee",
-      "Output 0 is the ask. Cancel it with `cancel-ask <its box id>`.") ++ lotNotes)
+      "Output 0 is the ask. Cancel it with `cancel-ask <its box id>`.") ++ guardNote ++ lotNotes)
   }
+
+  /**
+   * Why a guarded ask's expression would refuse a sale now, or None when it has no guard or would pass: the
+   * confirmed oracle must be fresh enough for the ask, and the bond's cover at least the seller's minimum.
+   */
+  private[standard] def saleGuardRefusal(ask: StdAsk, bond: StdBond, oracle: Option[OracleState]): Option[String] =
+    protocol.saleGuard(ask).flatMap { case (minBps, maxAge) =>
+      oracle match {
+        case None => Some("a guarded ask sells only with the USD oracle pool as a data input, and the node's index has " +
+          "no single pool box")
+        case Some(o) if height.toLong + 1L - o.created > maxAge => Some(s"the oracle price is older than the ask's $maxAge blocks")
+        case Some(o) if !protocol.cover(bond, o.price).exists { case (c, d) => c * 10000 >= d * minBps } =>
+          Some(s"the bond is at ${protocol.ratioBps(bond, o.price).fold("?")(Units.percent)} of its repayment, under " +
+            s"the seller's ${Units.percent(minBps)} sale guard")
+        case _ => None
+      }
+    }
 
   /**
    * zcs1's least lot of a bond's shares: ceil(N / R) raw shares claim at least one raw unit of the repayment
@@ -150,7 +192,7 @@ trait StandardAsks extends AppBase { self: StandardApp =>
   private[standard] def askInput(ask: StdAsk, payoutIndex: Int, restIndex: Option[Int]): InputUTXO = {
     val base = restIndex.foldLeft(ask.box.withCtxVar(0.toByte, intValue(payoutIndex)))((b, i) => b.withCtxVar(1.toByte, intValue(i)))
     if (!ask.nav) base
-    else base.withCtxVar(2.toByte, bytesValue(protocol.market(ask.market).pricing.valueBytes)).withCtxVar(3.toByte, intValue(0))
+    else base.withCtxVar(2.toByte, bytesValue(protocol.pricingOf(ask).valueBytes)).withCtxVar(3.toByte, intValue(0))
   }
 
   private[standard] def checkFill(ask: StdAsk, units: Long): Unit = {
@@ -160,18 +202,32 @@ trait StandardAsks extends AppBase { self: StandardApp =>
       fail(s"the ask's minimum fill is ${ask.minFill} unless a fill takes all ${ask.token.amount}")
   }
 
-  /** Buy `units` (default all) from an ask with this wallet: the units arrive as change. */
-  def buy(askId: String, units: Option[Long]): Prepared = {
+  /**
+   * Buy `units` (default all) from an ask with this wallet: the units arrive as change. zcs1: a claim on a live
+   * bond under its own oracle ratio is not bought unless `allowLiquidatable`; liquidating it serves the seller.
+   */
+  def buy(askId: String, units: Option[Long], allowLiquidatable: Boolean = false): Prepared = {
     val ask = protocol.asAsk(unspent(askId)).getOrElse(fail(s"$askId is not a ZC Standard ask"))
     val n = units.getOrElse(ask.token.amount)
     checkFill(ask, n)
+    val coverNotes = liveBondOf(ask.token.id).toSeq.flatMap(b => coverCheck(b, allowLiquidatable, s"bond ${b.box.id} is",
+      s"Liquidate it instead (`liquidate ${b.box.id}`): its holder, the seller, then claims all the collateral"))
     val (paid, bond) = askPrice(ask, n)
+    // A guarded ask's expression reads the confirmed oracle after the bond; refuse here what it would refuse.
+    val guardOracle = if (protocol.saleGuard(ask).isEmpty) None else Try(oracle()).toOption.flatten.map(readableOracle)
+    bond.flatMap(saleGuardRefusal(ask, _, guardOracle)).foreach(r => fail(s"the ask's sale guard refuses this sale: $r"))
     val rest = askRest(ask, n)
     val outputs = askPayout(ask, n, paid) +: rest.toSeq
     prepare(s"Buy $n of ${ask.token.id}", plan(Seq(askInput(ask, 0, rest.map(_ => 1))), outputs,
-      dataInputs = bond.map(_.box).toSeq),
-      Seq(s"pay ${Units.amount(paid, ask.market)} to the seller for $n of ${ask.token.id}"))
+      dataInputs = bond.map(_.box).toSeq ++ guardOracle.map(_.box)),
+      s"pay ${Units.amount(paid, ask.market)} to the seller for $n of ${ask.token.id}" +: coverNotes)
   }
+
+  /** The live bond behind a bond unit or its shares, or None for any other token or a settled bond. */
+  private[standard] def liveBondOf(token: ErgoId): Option[StdBond] =
+    Try(bondOf(token)).toOption.flatten.flatMap { case (asset, _) =>
+      decoded(nodeApi.unspentByTokenId(asset.toString)).flatMap(protocol.asBond).find(_.asset == asset)
+    }
 
   def cancelAsk(askId: String): Prepared = {
     val ask = protocol.asAsk(unspent(askId)).getOrElse(fail(s"$askId is not a ZC Standard ask"))

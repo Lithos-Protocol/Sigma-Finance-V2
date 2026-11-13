@@ -30,7 +30,7 @@ object ZcStandardSpecBase {
    * both asks, the two expressions they run, and the Dutch auction mint.
    */
   case class Market(offer: Contract, saleOrder: Contract, navAsk: Contract, pricing: Contract,
-                    policy: Contract, dutchMint: Contract)
+                    policy: Contract, dutchMint: Contract, fillGuard: Contract, guardedPricing: Contract)
 
   case class Exchange(erg: Market, token: Market, dutchVault: Contract)
 
@@ -53,7 +53,7 @@ object ZcStandardSpecBase {
     val s = compiled(ctx)
     def market(m: StdMarket): Market = {
       val c = s.market(m)
-      Market(c.offer, c.saleOrder, c.navAsk, c.pricing, c.policy, c.dutchMint)
+      Market(c.offer, c.saleOrder, c.navAsk, c.pricing, c.policy, c.dutchMint, c.fillGuard, c.guardedPricing)
     }
     Exchange(market(StdMarket.Erg), market(StdMarket.SigUsd), s.dutchVault)
   }
@@ -99,7 +99,8 @@ trait ZcStandardSpecBase extends BondSpecBase {
 
   /**
    * `fixedMaturity` overrides a fixed-height order's maturity. `extra` is the borrower payload from
-   * index 7: the oracle rule reads its ratio and maximum age there.
+   * index 7: the oracle rule reads its ratio and maximum age there, and a fill guard its minimum at 9.
+   * `guard` puts a fill guard expression's hash in the order's R8.
    */
   protected def flow(ctx: BlockchainContext, kind: Kind = TokenBond, style: OrderStyle = FixedHeight,
                      collateralValue: Long = collateralErg, collateral: Seq[Token] = defaultCollateral,
@@ -107,7 +108,7 @@ trait ZcStandardSpecBase extends BondSpecBase {
                      duration: Long = 1000L, fixedMaturity: Long = -1L,
                      principalValue: Long = -1L, principalAssets: Seq[Token] = null,
                      repayment: Long = -1L, extra: Seq[Long] = Seq(15000L, 30L, 777L),
-                     liq: Contract = null, ergFloor: Long = -1L): Flow = {
+                     liq: Contract = null, ergFloor: Long = -1L, guard: Contract = null): Flow = {
     val s = scripts(ctx)
     val height = ctx.getHeight + 10
     val maturity =
@@ -126,7 +127,8 @@ trait ZcStandardSpecBase extends BondSpecBase {
     val borrowerHash = bytesValue(hashOf(borrowerTree(ctx)))
     val liqHash = bytesValue(expression.hashedValueBytes)
     val order = UTXO(orderOf(ctx, kind), collateralValue + expiryFee, collateral,
-      Seq(longsValue(data: _*), Protocol.tokensValue(principalTokens), borrowerHash, liqHash))
+      Seq(longsValue(data: _*), Protocol.tokensValue(principalTokens), borrowerHash, liqHash) ++
+        Option(guard).map(g => bytesValue(g.hashedValueBytes)).toSeq)
     val input = inputAt(order, ctx, 0)
     // Created at the start height, as the order requires: the bond's recollateralize wait counts from it.
     val bond = UTXO(bondOf(ctx, kind), collateralValue + fee, Token(input.id, 2L) +: collateral,

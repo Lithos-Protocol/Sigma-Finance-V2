@@ -33,7 +33,8 @@ object StandardCommands {
       app.submit(app.recollateralize(one(a, "bond box id"), a.opt("add-erg").map(parseErg).getOrElse(0L),
         a.opts("add-token").map(parseToken)))
 
-    case "fill-order" => app.submit(app.fillOrder(one(a, "order box id"), reserve(a, "fee-reserve")))
+    case "fill-order" =>
+      app.submit(app.fillOrder(one(a, "order box id"), reserve(a, "fee-reserve"), a.flag("allow-liquidatable")))
     case "claim" => app.submit(app.claim(one(a, "bond asset id")))
 
     case "liquidate" => app.submit(app.liquidate(a.positional))
@@ -62,18 +63,29 @@ object StandardCommands {
           throw CliError("--ratio and --oracle-age need --liquidation oracle")
         MaturityChoice
       case "oracle" =>
-        val ratio = a.opt("ratio").map(percentToBps).getOrElse(throw CliError("--liquidation oracle needs --ratio <percent>"))
+        val ratio = a.opt("ratio").map(percentToBps(_, "ratio")).getOrElse(throw CliError("--liquidation oracle needs --ratio <percent>"))
         OracleChoice(ratio, a.opt("oracle-age").map(parseLong(_, "--oracle-age")).getOrElse(DefaultOracleAge))
       case other => throw CliError(s"unknown liquidation $other; use maturity or oracle")
     }
-    val expiry = a.opt("expires-in").map(n => app.height.toLong + parseLong(n, "--expires-in")).getOrElse {
-      val week = app.height.toLong + DefaultExpiry
-      // By default an order expires before a fixed maturity: after it, nobody could fill it.
-      schedule match {
-        case FixedMaturity(h) => math.max(app.height.toLong + 2L, math.min(week, h - 2L))
-        case OnClose(_) => week
-      }
+    // An oracle order carries the standard fill guard unless --no-fill-guard: by default at its own ratio, so no
+    // fill can start a bond already liquidatable; --fill-ratio asks for more room.
+    val fillRatio = rule match {
+      case OracleChoice(ratio, _) =>
+        if (a.flag("no-fill-guard")) {
+          if (a.opt("fill-ratio").isDefined) throw CliError("--fill-ratio and --no-fill-guard contradict each other")
+          None
+        } else Some(a.opt("fill-ratio").map(percentToBps(_, "fill-ratio")).getOrElse(ratio))
+      case MaturityChoice =>
+        if (a.opt("fill-ratio").isDefined || a.flag("no-fill-guard"))
+          throw CliError("--fill-ratio and --no-fill-guard need --liquidation oracle")
+        None
     }
+    // zcs1: by default a fixed-maturity order expires within half its term, so a fill leaves at least half.
+    val expiry = a.opt("expires-in").map(n => app.height.toLong + parseLong(n, "--expires-in")).getOrElse(
+      StandardProtocol.defaultOrderExpiry(app.height.toLong, schedule match {
+        case FixedMaturity(h) => Some(h)
+        case OnClose(_) => None
+      }, DefaultExpiry))
     StdLoan(market,
       principal = Units.parse(a.need("principal"), market, "--principal"),
       repayment = Units.parse(a.need("repayment"), market, "--repayment"),
@@ -84,14 +96,16 @@ object StandardCommands {
       requestedMaturity = asked match {
         case FixedMaturity(h) => Some(h)
         case OnClose(_) => None
-      })
+      },
+      allowLiquidatable = a.flag("allow-liquidatable"),
+      fillRatio = fillRatio)
   }
 
-  /** "150" or "150.5" percent as basis points. */
-  private def percentToBps(s: String): Long = {
-    val bps = Try(BigDecimal(s) * 100).getOrElse(throw CliError(s"--ratio: $s is not a percentage"))
-    if (!bps.isWhole || bps <= 0) throw CliError(s"--ratio: $s must be positive, with at most 2 decimals")
-    Try(bps.toLongExact).getOrElse(throw CliError(s"--ratio: $s is too large"))
+  /** "150" or "150.5" percent as basis points, for the option `key`. */
+  private def percentToBps(s: String, key: String): Long = {
+    val bps = Try(BigDecimal(s) * 100).getOrElse(throw CliError(s"--$key: $s is not a percentage"))
+    if (!bps.isWhole || bps <= 0) throw CliError(s"--$key: $s must be positive, with at most 2 decimals")
+    Try(bps.toLongExact).getOrElse(throw CliError(s"--$key: $s is too large"))
   }
 
   // ═══ LISTINGS ═════════════════════════════════════════════════════════════
@@ -129,6 +143,10 @@ object StandardCommands {
         else s"height ${o.terms(3)} (${o.terms(3) - app.height} blocks from now)"))
       println(s"  collateral:  ${Fmt.contents(o.collateralErg, o.collateral)}")
       println(s"  liquidation: ${app.protocol.ruleOf(o.liqHash).fold(app.protocol.ruleName(o.liqHash))(app.describeRule(_, o.payload))}")
+      o.guardHash.foreach { h =>
+        println("  fill guard:  " + (if (!app.protocol.isFillGuard(h, m)) "UNKNOWN: this client cannot fill it"
+          else o.fillRatio.fold("MALFORMED: no fill can pass it")(f => s"fills only at ${Units.percent(f)} cover or more")))
+      }
       println(s"  expiry:      height ${o.expiry}; fee ${Fmt.erg(o.expiryFee)}" +
         (if (app.height.toLong >= o.expiry) " (EXPIRED: anyone may refund-order it for the fee)" else ""))
       if (app.isOwnHash(o.borrowerHash)) println("  (your order)")

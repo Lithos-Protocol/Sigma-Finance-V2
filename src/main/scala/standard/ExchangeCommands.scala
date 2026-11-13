@@ -33,7 +33,8 @@ object ExchangeCommands {
 
     case "asks" => listAsks(app, a.flag("mine"))
     case "sell" => app.submit(sell(app, a))
-    case "buy" => app.submit(app.buy(one(a, "ask box id"), a.opt("amount").map(parseLong(_, "--amount"))))
+    case "buy" => app.submit(app.buy(one(a, "ask box id"), a.opt("amount").map(parseLong(_, "--amount")),
+      a.flag("allow-liquidatable")))
     case "cancel-ask" => app.submit(app.cancelAsk(one(a, "ask box id")))
     case "refund-ask" => app.submit(app.refundAsk(one(a, "ask box id")))
 
@@ -95,9 +96,14 @@ object ExchangeCommands {
     val price = if (a.flag("nav")) NavPrice(a.opt("margin").map(signedBps).getOrElse(0L),
       a.opt("price").map(Units.parse(_, m, "--price")))
     else FixedPrice(Units.parse(a.opt("price").getOrElse(throw CliError("give --price <total> or --nav")), m, "--price"))
+    if (a.opt("oracle-age").isDefined && a.opt("min-cover").isEmpty) throw CliError("--oracle-age on an ask needs --min-cover")
+    val guard = percent(a, "min-cover").map { bps =>
+      if (bps <= 0L) throw CliError("--min-cover must be positive")
+      SaleGuard(bps, a.opt("oracle-age").map(parseLong(_, "--oracle-age")).getOrElse(DefaultOfferOracleAge))
+    }
     app.sell(one(a, "token id"), parseLong(a.need("amount"), "--amount"), m, price,
       a.opt("min-fill").map(parseLong(_, "--min-fill")), expiry(app, a),
-      parseErg(a.opt("refund-fee").getOrElse(DefaultRefundFee)))
+      parseErg(a.opt("refund-fee").getOrElse(DefaultRefundFee)), guard)
   }
 
   /** A signed margin in percent, e.g. -2 or 1.5, as basis points. */
@@ -174,12 +180,19 @@ object ExchangeCommands {
     val asks = app.asks().filter(a => !mine || app.isOwnHash(a.sellerHash))
     if (asks.isEmpty) println("No asks.")
     asks.foreach { a =>
-      println(s"Ask ${a.box.id}  ${a.token.amount} of ${a.token.id}  (${if (a.nav) "NAV" else "fixed price"}, paid in ${a.market})")
+      val guard = app.protocol.saleGuard(a)
+      val fixed = !a.nav || (guard.isDefined && a.margin == StandardProtocol.GuardedFixedMargin)
+      println(s"Ask ${a.box.id}  ${a.token.amount} of ${a.token.id}  (${if (fixed) "fixed price" else "NAV"}" +
+        s"${if (guard.isDefined) ", guarded" else ""}, paid in ${a.market})")
       val price = Try(app.askPrice(a, a.token.amount)._1).toOption
       val face = price.flatMap(p => app.faceBps(a.token.id, p, a.token.amount))
       println("  price:  " + price.fold("not fillable now (its bond is not live)")(p => s"${Units.amount(p, a.market)} for all") +
         face.fold("")(f => s" (${Units.percent(f)} of face)") +
-        (if (a.nav) s"; NAV ${if (a.margin >= 0) "+" else "-"}${Units.percent(a.margin.abs)}, ${a.wholeUnits} unit(s) per bond" else ""))
+        (if (a.nav && !fixed) s"; NAV ${if (a.margin >= 0) "+" else "-"}${Units.percent(a.margin.abs)}, ${a.wholeUnits} unit(s) per bond" else ""))
+      guard.foreach { case (minBps, age) =>
+        println(s"  sale guard: sells only while its bond is at ${Units.percent(minBps)} cover or more " +
+          s"(oracle at most $age blocks old)")
+      }
       println(s"  minimum fill ${a.minFill}; expires at height ${a.expiry}" +
         (if (app.height.toLong >= a.expiry) " (EXPIRED: anyone may refund-ask it)" else ""))
       app.bondOf(a.token.id).foreach { case (asset, n) =>

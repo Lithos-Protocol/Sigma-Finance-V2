@@ -1,0 +1,82 @@
+{
+    // Standard fill guard for ZC_Standard_Order, the borrower's counterpart of the lend offer's policy.
+    // Executed through the order's context var 1 with the ORDER as SELF, on a fill only, when the
+    // order's R8 names this expression's hash. A fill otherwise checks nothing about the collateral's
+    // value: an order left open while the price moves could be filled into a bond its rule liquidates
+    // at once, or a block later, for all the collateral. With the guard, the new bond must start
+    // with collateral worth at least a minimum ratio of the repayment at a fresh oracle price, so the
+    // order simply cannot be filled while the price is against it.
+    //
+    // CONSTANTS
+    // CONST_REPAYMENT_TOKEN: Coll[Byte] - the order's repayment asset: EMPTY for ERG, or SigUSD. Any
+    //   other asset never passes. One compiled guard, and one hash, per asset, like the oracle rule.
+    //
+    // INPUTS FROM THE ORDER (its R4, which the bond copies into R6)
+    // R4(7): the oracle rule's liquidation ratio in basis points of the repayment.
+    // R4(8): the rule's maximum oracle age in blocks (1..100000). The oracle read here may be at most
+    //   this old, so it is one the rule itself could liquidate on.
+    // R4(9): the minimum fill ratio in basis points (17000 = 170%). It must be at least R4(7): a
+    //   lower one would let a fill start a bond already below its own ratio, which is what the guard
+    //   exists to stop. An order that breaks this never fills; its borrower cancels it.
+    //
+    // THE BOND
+    // OUTPUTS(1), which the order validates as the bond in the same transaction. Its value less the
+    // lender fee reserve R9(0) is the collateral nanoERG, and tokens(1..) are the collateral tokens,
+    // exactly as ZC_Standard_ERG_SigUSD_Liquidation will measure it.
+    //
+    // VALUATION (identical to the liquidation rule)
+    // One fresh USD Oracle v2 data input, found by its singleton NFT; R4 Long = nanoERG per USD.
+    // SigUSD is taken as $1 with 100 raw units per USD. Other collateral tokens count as zero.
+    // With oracle price P:
+    //   C = 100 * collateralNanoERG + P * collateralSigUSDRaw
+    //   L = 100 * repaymentNanoERG, or P * repaymentSigUSDRaw
+    // pass iff C * 10000 >= L * R4(9). Products are widened to BigInt before multiplying.
+    //
+    // LIMITS
+    // - It guards the fill, not the bond's life: after the fill the price may still fall, and the
+    //   borrower recollateralizes as usual. A minimum well above the rule's ratio buys that time.
+    // - It needs a fresh oracle at the fill, so a guarded order cannot fill while the pool is stale.
+
+    val terms = SELF.R4[Coll[Long]].get
+    val bond = OUTPUTS(1)
+    val lender = bond.R9[Coll[Long]].get
+
+    if (terms.size < 10 || lender.size != 3) {
+        sigmaProp(false)
+    } else {
+        val ratioBps = terms(7)
+        val maxAge = terms(8)
+        val fillBps = terms(9)
+        val oracleNFT = fromBase16("6a2b821b5727e85beb5e78b4efb9f0250d59cd48481d2ded2c23e91ba1d07c66")
+        val sigUSD = fromBase16("03faf2cb329f2e90d6d23b58d91bbb6c046aa143261cc21f52fbe2824bfcbf04")
+        val pools = CONTEXT.dataInputs.filter { (b: Box) =>
+            b.tokens.exists { (t: (Coll[Byte], Long)) => t._1 == oracleNFT && t._2 == 1L }
+        }
+        if (ratioBps <= 0L || fillBps < ratioBps || maxAge < 1L || maxAge > 100000L || pools.size != 1) {
+            sigmaProp(false)
+        } else {
+            val pool = pools(0)
+            val price = pool.R4[Long].get
+            val epoch = pool.R5[Int].get
+            val created = pool.creationInfo._1.toLong
+            val fresh = created >= 0L && created <= HEIGHT.toLong && HEIGHT.toLong - created <= maxAge
+            val repaysERG = CONST_REPAYMENT_TOKEN.size == 0
+            val supported = repaysERG || CONST_REPAYMENT_TOKEN == sigUSD
+            val repayment = terms(0)
+            val fee = lender(0)
+            val collateral = bond.tokens.slice(1, bond.tokens.size)
+            val collateralUSD = collateral.fold(0L, { (a: Long, t: (Coll[Byte], Long)) =>
+                if (t._1 == sigUSD) a + t._2 else a
+            })
+            val collateralValue = (bond.value - fee).toBigInt * 100L.toBigInt +
+                price.toBigInt * collateralUSD.toBigInt
+            val debtValue = if (repaysERG) repayment.toBigInt * 100L.toBigInt
+                else price.toBigInt * repayment.toBigInt
+            sigmaProp(
+                fresh && price > 0L && epoch >= 0 && supported && repayment > 0L &&
+                fee >= 0L && fee <= bond.value &&
+                collateralValue * 10000L.toBigInt >= debtValue * fillBps.toBigInt
+            )
+        }
+    }
+}

@@ -58,15 +58,21 @@ object SigmaFiCli {
       |               (--maturity <height> | --term <blocks> | --duration <blocks>) [--exact-maturity]
       |               [--market ERG|SigUSD] [--collateral-token <token id>:<n> ...]
       |               [--liquidation maturity|oracle] [--ratio <percent>] [--oracle-age <blocks>]
+      |               [--fill-ratio <percent> | --no-fill-guard] [--allow-liquidatable]
       |               [--expires-in <blocks>] [--expiry-fee <ERG>]
       |      Amounts are in the market's unit (ERG, or SigUSD with 2 decimals); a loan is lent and repaid in
-      |      that one asset. A --maturity or --term snaps to the nearest multiple of 21600 blocks (about 30
-      |      days), so bonds maturing the same month share one height; --exact-maturity keeps it as given.
-      |      --duration makes an on-close order: the bond matures that many blocks after the
-      |      fill. --liquidation oracle liquidates below --ratio (e.g. 150) of the repayment at a USD oracle
-      |      price at most --oracle-age blocks old (default 60), as well as at maturity.
-      |      The order expires after --expires-in blocks (default 5040); then anyone may return it to you for
-      |      the --expiry-fee (default 0.005 ERG, at least 0.002), which a fill refunds to you instead.
+      |      that one asset. A --maturity or --term at least 21600 blocks (about 30 days) out snaps to the
+      |      nearest multiple of 21600, so bonds maturing the same month share one height; nearer ones and
+      |      --exact-maturity keep the height. --duration makes an on-close order: the bond matures that many
+      |      blocks after the fill. --liquidation oracle liquidates below --ratio (e.g. 150) of the repayment
+      |      at a USD oracle price at most --oracle-age blocks old (default 60), as well as at maturity.
+      |      An oracle order carries a fill guard: its contract refuses any fill that leaves the collateral
+      |      under --fill-ratio of the repayment (default: --ratio) at a fresh oracle price, so it cannot be
+      |      filled into a bond liquidatable at once. --no-fill-guard leaves it out; such an order already
+      |      under its ratio is refused unless --allow-liquidatable.
+      |      The order expires after --expires-in blocks (default 5040, or half a fixed maturity's term if
+      |      less); then anyone may return it to you for the --expiry-fee (default 0.005 ERG, at least 0.002),
+      |      which a fill refunds to you instead.
       |  cancel-order <order box id>
       |  repay <bond box id> [--from-collateral]
       |      --from-collateral repays out of the bond's own ERG or repayment token, as far as it holds them
@@ -74,8 +80,9 @@ object SigmaFiCli {
       |      at most once per 60 blocks; a token bond may add its repayment token even if it holds none
       |
       |  Lender:
-      |  fill-order <order box id> [--fee-reserve <ERG>]
-      |      --fee-reserve: the liquidation reserve you fund in the bond (minimum and default $MinimumReserve)
+      |  fill-order <order box id> [--fee-reserve <ERG>] [--allow-liquidatable]
+      |      --fee-reserve: the liquidation reserve you fund in the bond (minimum and default $MinimumReserve).
+      |      A fill that would start a bond under its own oracle ratio is refused unless --allow-liquidatable.
       |  claim <bond asset id>               collect a repaid or liquidated bond from the vault
       |
       |  Anyone:
@@ -102,9 +109,14 @@ object SigmaFiCli {
       |  asks [--mine]
       |  sell <token id> --amount <n> [--market ERG|SigUSD] (--price <total> | --nav [--margin <percent>]
       |               [--price <floor total>]) [--min-fill <n>] [--expires-in <blocks>] [--refund-fee <ERG>]
+      |               [--min-cover <percent> [--oracle-age <blocks>]]
       |      --nav prices a bond unit or its shares at the bond's accrued value plus --margin (may be negative).
       |      Shares' --min-fill defaults to the least lot that claims a raw unit of the repayment.
-      |  buy <ask box id> [--amount <n>]
+      |      --min-cover adds a sale guard to a bond unit or its shares, at either price: the ask sells only
+      |      while the bond's collateral is worth at least that share of its repayment at an oracle price at
+      |      most --oracle-age blocks old (default 30), so nobody buys it to liquidate it.
+      |  buy <ask box id> [--amount <n>] [--allow-liquidatable]
+      |      a claim on a bond under its own oracle ratio is refused unless --allow-liquidatable: liquidate it
       |  cancel-ask <ask box id>
       |  refund-ask <ask box id>            anyone, after expiry; keeps the refund fee
       |
@@ -342,7 +354,7 @@ case class Args(command: Option[String], positional: Seq[String], options: Map[S
 
 object Args {
   val Flags: Set[String] = Set("send", "mine", "liquidatable", "help", "old", "from-collateral", "dutch", "nav", "run",
-    "deliver-shares", "exact-maturity", "mempool")
+    "deliver-shares", "exact-maturity", "mempool", "allow-liquidatable", "no-fill-guard")
   val SessionOptions: Set[String] = Set("node", "api-key", "wallet-pass", "address", "fee")
   val Options: Set[String] = SessionOptions ++ Set(
     "principal", "principal-token", "repayment", "collateral-erg", "collateral-token", "batching-fee",

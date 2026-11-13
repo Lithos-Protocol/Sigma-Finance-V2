@@ -1,0 +1,120 @@
+{
+    // Standard guarded pricing expression for ZC_Standard_NavAsk: ZC_Standard_AccruedValue_Pricing
+    // plus the seller's sale guard. Executed through the ask's context var 2 with the ASK as SELF.
+    // It prices exactly as AccruedValue_Pricing does, and also refuses any sale while the bond's
+    // collateral is worth less than the seller's minimum ratio of its repayment at a fresh oracle
+    // price. That protects the seller of a bond near its liquidation line: a buyer could otherwise pay
+    // accrued value, at most the repayment, and liquidate at once or after a small price move for all
+    // of the collateral, which the seller would have got by liquidating it. While the guard holds the
+    // ask still, anyone may liquidate the bond, and the seller claims the vault with the unit.
+    //
+    // CONSTANTS
+    // CONST_REPAYMENT_TOKEN: Coll[Byte] - the bond's repayment asset: EMPTY for ERG, or SigUSD; the ask
+    //   is paid in it. Any other asset never passes the guard.
+    // CONST_BOND_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Bond tree for that asset
+    //
+    // INPUTS FROM THE ASK
+    // Ask R5(4): the margin in basis points over NAV, signed, -9999..1000000. -9999 prices at a
+    //   hundredth of a percent of NAV, which leaves the ask's fixed floor, R5(0) / R5(1), as the
+    //   price: a guarded fixed-price ask without another contract.
+    // Ask R5(5): N, the raw units that make up one bond: 1 for a unit, the share count for shares.
+    // Ask R5(6): the minimum sale ratio in basis points of the repayment (17000 = 170%), positive.
+    // Ask R5(7): the maximum oracle age in blocks, 1..100000.
+    // Ask R7: the bond asset id X.
+    // Context var 3: Int data-input index of the bond's state box. Vars 0 and 1 are the ask's.
+    //
+    // CHECKS
+    // State and price: exactly as ZC_Standard_AccruedValue_Pricing. A settled or matured bond does
+    //   not fill.
+    // Guard: one fresh USD Oracle v2 data input, found by its singleton NFT anywhere among the data
+    //   inputs, and with oracle price P, measured as ZC_Standard_ERG_SigUSD_Liquidation measures it:
+    //     C = 100 * (state value - fee reserve R9(0)) + P * SigUSD raw in state tokens(1..)
+    //     L = 100 * repayment nanoERG, or P * repayment SigUSD raw
+    //   pass iff C * 10000 >= L * R5(6). Other collateral tokens count as zero.
+    //
+    // LIMITS
+    // As AccruedValue_Pricing; and a sale needs a fresh oracle, so the ask cannot fill while the pool
+    // is stale.
+
+    val terms = SELF.R5[Coll[Long]].get
+    val payoutIndex = getVar[Int](0).get
+    val nextIndex = getVar[Int](1)
+    val stateIndex = getVar[Int](3).get
+
+    if (terms.size < 8 || SELF.tokens.size != 1 ||
+        payoutIndex < 0 || payoutIndex >= OUTPUTS.size ||
+        stateIndex < 0 || stateIndex >= CONTEXT.dataInputs.size) {
+        sigmaProp(false)
+    } else {
+        val margin = terms(4)
+        val wholeUnits = terms(5)
+        val minBps = terms(6)
+        val maxAge = terms(7)
+        val asset = SELF.R7[Coll[Byte]].get
+        val state = CONTEXT.dataInputs(stateIndex)
+        val isBond =
+            blake2b256(state.propositionBytes) == CONST_BOND_HASH &&
+            state.tokens.size > 0 && state.tokens(0)._1 == asset && state.tokens(0)._2 == 2L
+        val oracleNFT = fromBase16("6a2b821b5727e85beb5e78b4efb9f0250d59cd48481d2ded2c23e91ba1d07c66")
+        val sigUSD = fromBase16("03faf2cb329f2e90d6d23b58d91bbb6c046aa143261cc21f52fbe2824bfcbf04")
+        val pools = CONTEXT.dataInputs.filter { (b: Box) =>
+            b.tokens.exists { (t: (Coll[Byte], Long)) => t._1 == oracleNFT && t._2 == 1L }
+        }
+
+        if (!isBond || margin <= -10000L || margin > 1000000L ||
+            wholeUnits < 1L || wholeUnits > 1000000000L ||
+            minBps <= 0L || maxAge < 1L || maxAge > 100000L || pools.size != 1) {
+            sigmaProp(false)
+        } else {
+            val borrower = state.R6[Coll[Long]].get
+            val lender = state.R9[Coll[Long]].get
+            val principalTokens = state.R7[Coll[(Coll[Byte], Long)]].get
+            val repaysERG = CONST_REPAYMENT_TOKEN.size == 0
+            val supported = repaysERG || CONST_REPAYMENT_TOKEN == sigUSD
+            val repayment = borrower(0)
+            // ZC_Standard_Order lends in the repayment asset alone, so P is in the same unit as R.
+            val principal = if (repaysERG) borrower(1) else principalTokens(0)._2
+            val fee = lender(0)
+            val start = lender(1)
+            val maturity = lender(2)
+            val term = maturity - start
+            val elapsed = HEIGHT.toLong - start
+
+            val payout = OUTPUTS(payoutIndex)
+            val paid = if (repaysERG) {
+                payout.value
+            } else if (payout.tokens.size > 0 && payout.tokens(0)._1 == CONST_REPAYMENT_TOKEN) {
+                payout.tokens(0)._2
+            } else 0L
+            val remaining = if (nextIndex.isDefined) OUTPUTS(nextIndex.get).tokens(0)._2 else 0L
+            val sold = SELF.tokens(0)._2 - remaining
+
+            val pool = pools(0)
+            val price = pool.R4[Long].get
+            val epoch = pool.R5[Int].get
+            val created = pool.creationInfo._1.toLong
+            val fresh = created >= 0L && created <= HEIGHT.toLong && HEIGHT.toLong - created <= maxAge
+
+            if (repayment <= 0L || term <= 0L || elapsed < 0L || elapsed >= term || sold < 1L ||
+                !supported || !fresh || price <= 0L || epoch < 0 || fee < 0L || fee > state.value) {
+                sigmaProp(false)
+            } else {
+                // NAV * term: P * (term - elapsed) + R * elapsed, never negative.
+                val accrued = principal.toBigInt * (term - elapsed).toBigInt +
+                    repayment.toBigInt * elapsed.toBigInt
+                val collateralUSD = state.tokens.slice(1, state.tokens.size).fold(0L, { (a: Long, t: (Coll[Byte], Long)) =>
+                    if (t._1 == sigUSD) a + t._2 else a
+                })
+                val collateralValue = (state.value - fee).toBigInt * 100L.toBigInt +
+                    price.toBigInt * collateralUSD.toBigInt
+                val debtValue = if (repaysERG) repayment.toBigInt * 100L.toBigInt
+                    else price.toBigInt * repayment.toBigInt
+                sigmaProp(
+                    paid.toBigInt * wholeUnits.toBigInt * term.toBigInt * 10000L.toBigInt >=
+                        sold.toBigInt * accrued * (10000L + margin).toBigInt &&
+                    collateralValue * 10000L.toBigInt >= debtValue * minBps.toBigInt
+                )
+            }
+        }
+    }
+}

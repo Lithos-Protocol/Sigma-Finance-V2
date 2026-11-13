@@ -57,9 +57,11 @@ class ZcStandardProbeSpec extends AnyPropSpec with ContractSpecBase {
           pins(c.dutchMint, c.bond.hashedPropBytes) shouldBe true
           pins(c.policy, c.oracleRule.hashedValueBytes) shouldBe true
           pins(c.pricing, c.bond.hashedPropBytes) shouldBe true
+          pins(c.guardedPricing, c.bond.hashedPropBytes) shouldBe true
           // The repayment token is compiled into every per-market script of a token market.
           m.token.foreach { id =>
-            Seq(c.bond, c.order, c.offer, c.saleOrder, c.navAsk, c.dutchMint, c.oracleRule, c.policy, c.pricing)
+            Seq(c.bond, c.order, c.offer, c.saleOrder, c.navAsk, c.dutchMint, c.oracleRule, c.policy, c.pricing,
+              c.fillGuard, c.guardedPricing)
               .foreach(t => pins(t, id.getBytes) shouldBe true)
           }
         }

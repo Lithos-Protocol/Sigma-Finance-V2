@@ -8,7 +8,7 @@ shows bonds and shares. This document is that off-chain part of the ZC Standard,
 Status: **draft**. The CLI follows all of it, specced offline in `StandardOffchainSpec`; nothing has
 run against a live node yet. See "CLI status" at the end.
 
-Three principles:
+Four principles:
 
 - **Off-chain rules serve user experience and batching.** They decide how boxes are written, found,
   grouped and displayed. They never decide a price or a risk. Yield, collateral floor, liquidation
@@ -18,13 +18,16 @@ Three principles:
   skips boxes that break one. The owner can still act on such a box with their own client.
 - **Recommended rules** keep the market uniform. Clients always write them; readers flag boxes that
   break one, but batchers still serve those boxes.
+- **Defaults** are what a client writes when the user chooses nothing else: the maturity grid and the
+  values under "Defaults". The user can always choose otherwise, and a departure from a default is
+  not flagged.
 
 ## What the contracts leave off-chain
 
 | Area | Fixed on-chain | Left off-chain |
 |---|---|---|
 | Deployment | Each tree pins the hashes of the trees it reads | Whether each market's constants agree (an order's repayment token and its bond's, an offer's five constants). Pinned in [ZC_STANDARD_REFERENCE.md](./ZC_STANDARD_REFERENCE.md). |
-| Expressions | Their hashes only (bond R8, offer R6, NAV ask R6) | The expression bytes a spender supplies; whether a bond's liquidation rule is the one compiled for its market |
+| Expressions | Their hashes only (bond R8, order R8, offer R6, NAV ask R6) | The expression bytes a spender supplies; whether a bond's liquidation rule is the one compiled for its market |
 | Verification | Origin and state checks inside the lend offer | Every other reader (wallet, UI, a direct purchase) runs the recipe in SigmaBonds.MD itself |
 | Scripts behind hashes | Borrower, owner and seller as blake2b256 of their scripts | Finding the script to pay: **script disclosure** below |
 | Token metadata | A bond unit's EIP-4 R4 and R5 exist and R6 is "0"; a share's R4 to R6 copy its request's R9 | Every name and description: **token metadata** below |
@@ -244,25 +247,82 @@ Readers already learn N from the chain (the request's R8, the vault's R5), so a 
 nobody anything but uniformity. The off-chain rule keeps that uniformity: clients always write
 100,000,000, and readers flag anything else.
 
-## Maturity grid (recommended)
+## Maturity grid (default)
 
-Fixed-maturity orders snap to a grid of **21,600 blocks**, about 30 days of 2-minute blocks: the
-maturity height is a multiple of 21,600.
+The grid is a client default, not a conformance rule. Every maturity the contracts allow is a
+standard maturity, and batchers, lend offers and readers treat an off-grid bond exactly like one on
+the grid.
 
-- A client asked for a maturity, as a height or a duration, rounds it to the nearest grid height.
-  The order's expiry still has to come before it. An explicit flag keeps an exact height.
+**What a client does.** A fixed maturity snaps to a grid of **21,600 blocks**, about 30 days of
+2-minute blocks, so the maturity height is a multiple of 21,600.
+
+- A client asked for a maturity at least one grid step (21,600 blocks) away, as a height or a
+  duration, rounds it to the nearest grid height; a tie goes to the later height. The term then
+  stays at least 10,800 blocks. A nearer maturity keeps its exact height: 10 days asked 10 blocks
+  before a grid line would otherwise become a 20-minute loan.
 - Example: at height 1,700,000, "about 60 days" is height 1,743,200. The nearest grid heights are
   1,728,000 (80 × 21,600, about 39 days) and 1,749,600 (81 × 21,600, about 69 days). The order
   matures at 1,749,600.
+- The grid rounds the maturity the user asked for; it never supplies one. Rounding can move it by
+  up to 10,800 blocks (15 days), which changes the rate at a fixed repayment, so the client shows the
+  snapped height before signing, and the user can always keep an exact height.
+- An order meant for a particular lend offer takes a grid height inside that offer's maturity window,
+  or keeps its exact height. Snapping out of the window would lose the fill. A window at least 21,600
+  blocks wide always contains a grid height.
 - On-close orders mature at their start plus a duration, which is unknown until the fill, so they stay
   off the grid.
 
-Why: without a grid, two bonds maturing 17 blocks apart are separate maturities for every quote,
-listing and share market. With it, every bond of a market maturing in a given month shares one height.
-Asks and offers then quote on one curve, and shares of different bonds that mature together compare
-directly. A lend offer's maturity window at least 21,600 blocks wide always contains a grid height.
-Series pools are the later on-chain version of the same idea: a pool can require
-`maturity % 21600 == 0`.
+**What nobody does.** No batcher, lend offer or reader refuses an off-grid maturity, ranks it lower or
+flags it. The standard lend offer checks only the blocks left to maturity against its window, and the
+matching order under "Batching" ranks by yield alone.
+
+**Why a grid at all.** Not for pricing. The lend offer's yield test reads the blocks left to maturity,
+and `AccruedValue_Pricing` reads each bond's own start and maturity, so both price any maturity with
+no setup. Comparing quotes across maturities needs no grid either: a UI shows each ask's yield to
+maturity, the figure the matching order already ranks by. (A NAV ask's price is the bond's own
+accrued value, not a market rate, so even two NAV asks compare by yield, not by price.)
+
+What the grid gives is identical maturities. Bonds can only be pooled into one fungible token when
+they mature at the same height. Series, a planned layer, group bonds of one market, one maturity
+height and one collateral policy that way, and a series pool can require `maturity % 21600 == 0`.
+The default puts most new bonds on series heights, so they can join a series later. An off-grid bond
+trades on its own, as every bond does today, and stays outside series.
+
+## Cover at the fill
+
+Without a guard, no contract stops a fill from starting a bond that can be liquidated at once. The
+order checks nothing about the collateral's value, and the lend offer's policy passes a bond under
+its own oracle ratio as long as it clears the lender's floor. A liquidation sends all the collateral
+to the lender, and the bond's 60-block recollateralize wait counts from its start, so the borrower
+cannot top up in time. An order left open while the price moves is a free option for lenders: the
+longer it rests and the nearer its cover sits to its ratio, the more it is worth. An ask on a bond
+near its line is the same option for buyers. On a fixed-maturity order the same happens with time:
+a fill just before maturity leaves blocks, not days, to repay.
+
+**On-chain: the guards (default for oracle orders).** The fill guard and the sale guard, described
+in [SigmaBonds.MD](../SigmaBonds.MD) under "Fill and sale guards", let the owner of a resting order
+or ask set a collateral ratio under which the contract refuses to trade it. They bind everyone, a
+lender who wants to snipe included. A client gives every oracle order the fill guard, at the
+order's own liquidation ratio unless the borrower asks for more, so no fill can start a bond
+already liquidatable. A ratio above the rule's buys room after the fill; choosing it is the
+borrower's call. The sale guard is the seller's choice and has no default.
+
+**Off-chain: for unguarded boxes, and for the user's sake.** A client or batcher following this
+profile:
+
+- **Never fills an order, by hand or from a lend offer, whose bond would start under its own oracle
+  ratio** at the confirmed oracle price. Nor does it buy, from any ask, a claim on a bond under its
+  own ratio: it liquidates that bond instead, which pays the bond's holder, often the seller, all
+  the collateral.
+- **Never posts an unguarded oracle order already under its own ratio**, and tells the borrower the
+  ERG price at which a fill would start a bond liquidatable at once, or for a guarded order, the
+  price at which the guard stops fills. It warns when a guarded order cannot be filled now.
+- **Checks a guard before building**, so a fill or sale the guard would refuse is never sent.
+- **Gives a fixed-maturity order an expiry within half its term** by default (and at most a week),
+  so a fill leaves the borrower at least half the term. It warns when a chosen expiry leaves less.
+
+The user can override the off-chain refusals for their own transaction; the CLI's flag is
+`--allow-liquidatable`. Nothing overrides a guard.
 
 ## Batching
 
@@ -317,7 +377,7 @@ when the order's oracle age is at least the offer's. The values are the CLI's cu
 | Value | Default | Floor in the contracts |
 |---|---|---|
 | Miner fee | 0.001 ERG | — |
-| Order expiry | 5,040 blocks (about 7 days) | — |
+| Order expiry | 5,040 blocks (about 7 days), or half a fixed maturity's term if that is less | — |
 | Order expiry fee | 0.005 ERG | 0.002 ERG |
 | Oracle age written into an order's rule | 60 blocks | 1 to 100,000 |
 | Oracle age on an offer | 30 blocks | at most the bond's |
@@ -330,6 +390,8 @@ when the order's oracle age is at least the offer's. The values are the CLI's cu
 | ERG carried by a SigUSD offer for fees | 0.5 ERG | — |
 | Ask minimum fill, offer minimum price | 1 raw unit | — |
 | NAV ask margin | 0% | above −100% |
+| Fill guard on an oracle order | on, at the order's own liquidation ratio | at least that ratio |
+| Sale guard | off; its oracle age 30 blocks when set | 1 to 100,000 blocks |
 | Share count, decimals | 100,000,000 (100 shares), 6 | 1 to 1,000,000,000 |
 
 No defaults, ever: principal, repayment, collateral, maturity, liquidation ratio, yield, collateral
@@ -373,6 +435,7 @@ floor, an ask's price or `--nav`, and a Dutch auction's opening, floor and lengt
 | Bond metadata | The zcs1 template on every fill, by a wallet or a matched offer. `bonds` prints `metadata: zcs1` or what departs from it. |
 | Share metadata | The zcs1 template: with the bond for `fractionalize`, without it for an offer's delivery. `--share-name`, `--share-description` and `--decimals` override it and are flagged NONSTANDARD. `shares` and `offers` check every request, vault and offer. |
 | Share count | 100,000,000 (100 shares) by default (`--shares` overrides, flagged). `create-offer --deliver-shares` is a flag. `asks` quotes a percentage of face; a share ask's `--min-fill` defaults to the least lot; a partial claim warns when an asset rounds to nothing. |
-| Maturity grid | `create-order --maturity` and `--term` snap to the grid; `--exact-maturity` keeps the height. |
+| Maturity grid | `create-order --maturity` and `--term` at least 21,600 blocks out snap to the grid, and the summary says when the height moved; nearer ones and `--exact-maturity` keep the height. `create-order` does not look at open offers, so aiming at an offer's window takes `--exact-maturity` or a grid height chosen by hand. `match-offer`, `batch` and the listings ignore the grid. |
+| Cover at the fill | `create-order` gives an oracle order the fill guard at its `--ratio`, or at `--fill-ratio`; `--no-fill-guard` leaves it out. It notes the cover now and the ERG price at which the guard stops fills, and warns when it would refuse one now; an unguarded order already under its own ratio is refused. `fill-order`, `match-offer` and `batch` supply the guard and the oracle and check the guard first. `sell --min-cover <percent> [--oracle-age <blocks>]` adds the sale guard at a NAV or a fixed price; `buy`, `match-offer` and `batch` check it. `fill-order` and `buy` refuse a bond under its own ratio, and `buy` names the `liquidate` command instead; `--allow-liquidatable` overrides those and the unguarded create-order refusal, never a guard. A fixed-maturity order's default expiry is half its term at most, and a later `--expires-in` warns. Without a readable oracle, unguarded boxes are not checked and a note says so. |
 | Batching | `pack` for refunds and liquidations; `batch --run` packs, ranks offers and their sources, and runs up to 5 rounds with mempool lookups. `--mempool` turns those lookups on for any command. |
 | Defaults | As in the table above |

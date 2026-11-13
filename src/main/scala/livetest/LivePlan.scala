@@ -196,7 +196,7 @@ object LivePlan {
     // ─── C, first part: the offer must refuse an undercollateralized order ───
     tx("C1", "C oracle", "Order C: borrow 0.1, repay 0.12, only 0.1 ERG collateral, oracle rule at 150%",
       s"create-order --principal 0.1 --repayment 0.12 --collateral-erg 0.1 $oracleOrder --term 400 --exact-maturity " +
-        "--expires-in 200",
+        "--expires-in 200 --no-fill-guard --allow-liquidatable",
       after = Seq("S1"), binds = Seq(out("orderC", 0))),
     refusal("C1x", "C oracle", "The offer refuses order C: its collateral is under the offer's floor",
       "match-offer {offer1} --order {orderC}", "under the offer's floor", after = Seq("O1", "C1")),
@@ -289,7 +289,8 @@ object LivePlan {
       check = Check.TokenGone("orderB")),
 
     // ─── C, the rest: early liquidation by the oracle rule ────────────────────
-    tx("C2", "C oracle", "Fill order C from the wallet: the bond starts below its ratio", "fill-order {orderC}",
+    tx("C2", "C oracle", "Fill order C from the wallet: the bond starts below its ratio",
+      "fill-order {orderC} --allow-liquidatable",
       after = Seq("C1x"), binds = Seq(out("bondC", 1))),
     read("C3", "C oracle", "Bond C lists as liquidatable", "bonds --liquidatable", Seq("{bondC}"), after = Seq("C2")),
     tx("C4", "C oracle", "Fractionalize bond C's unit", "fractionalize {orderC}", settled = Seq("C2"),
@@ -314,8 +315,11 @@ object LivePlan {
       s"create-order --market SigUSD --principal 1 --repayment 1.1 --collateral-erg 0.05 $oracleOrder " +
         "--term 400 --exact-maturity --expires-in 200",
       after = Seq("S1"), binds = Seq(out("orderS", 0))),
-    read("K4", "K expiries", "The SigUSD order lists", "orders --mine", Seq("{orderS}", "SigUSD"), after = Seq("K3")),
-    tx("K5", "K expiries", "Cancel the SigUSD order", "cancel-order {orderS}", after = Seq("K3", "K4")),
+    read("K4", "K expiries", "The SigUSD order lists, with its fill guard", "orders --mine",
+      Seq("{orderS}", "SigUSD", "fill guard"), after = Seq("K3")),
+    refusal("K4x", "K expiries", "The SigUSD order's fill guard refuses a fill: 0.05 ERG is far under 150% of $1.10",
+      "fill-order {orderS}", "fill guard refuses", after = Seq("K3")),
+    tx("K5", "K expiries", "Cancel the SigUSD order", "cancel-order {orderS}", after = Seq("K3", "K4", "K4x")),
     tx("K6", "K expiries", "Lend offer of 0.05 ERG expiring in 10 blocks",
       "create-offer --capital 0.05 --yield 5 --collateral-floor 150 --expires-in 10", after = Seq("S1"),
       binds = Seq(out("offer4", 0))),
@@ -387,7 +391,8 @@ object LivePlan {
     "D1" -> ("A plain order for 0.1 ERG, repaying 0.11 at height M, under the maturity liquidation rule. This wallet " +
       "fills it by hand, and it is liquidated at maturity together with bond E."),
     "C1" -> ("An order backed by only 0.1 ERG against a 0.12 ERG repayment, about 83%, well under its 150% oracle " +
-      "ratio. It exists to be refused by an offer, then filled by hand and liquidated early."),
+      "ratio. It exists to be refused by an offer, then filled by hand and liquidated early: it leaves out the fill " +
+      "guard, and --allow-liquidatable lets the CLI post it."),
     "C1x" -> ("Tries to match the O1 offer with order C, which the CLI must refuse. Shows an offer's collateral floor " +
       "is checked before anything is built, so no batcher can fund a bond the lender wouldn't accept."),
     "E2" -> ("This wallet, as batcher, matches the O1 offer with order E: a new bond whose unit goes to the offer's " +
@@ -472,8 +477,8 @@ object LivePlan {
     "B5" -> "Claims repaid bond B with its unit, taking the 0.11 ERG repayment. All three bond units burn.",
 
     // C: early liquidation by the oracle rule
-    "C2" -> ("This wallet fills order C anyway, starting a bond that is already below its 150% ratio. It is what C6 " +
-      "liquidates early."),
+    "C2" -> ("This wallet fills order C anyway, starting a bond that is already below its 150% ratio; " +
+      "--allow-liquidatable overrides the CLI's refusal. It is what C6 liquidates early."),
     "C3" -> ("Lists bond C as liquidatable. Shows readers applying the oracle rule to find bonds anyone may " +
       "liquidate now."),
     "C4" -> "Puts bond C's unit into a share mint request. It is never minted: C5 takes it back.",
@@ -495,8 +500,11 @@ object LivePlan {
       "fee; here this wallet is both."),
     "K2" -> "Another order expiring in 10 blocks. Its refund rides along with bond C's liquidation in C6.",
     "K3" -> ("An order on the SigUSD market: borrow 1 SigUSD against 0.05 ERG. Nobody fills it; it shows the SigUSD " +
-      "market's contracts taking an order."),
-    "K4" -> "Lists the SigUSD order, with amounts in SigUSD.",
+      "market's contracts taking an order. As an oracle order it carries the default fill guard at its 150% ratio, " +
+      "so the CLI posts it with a warning instead of refusing it."),
+    "K4" -> "Lists the SigUSD order, with amounts in SigUSD and its fill guard.",
+    "K4x" -> ("Tries to fill the SigUSD order, which the CLI must refuse: the bond would start far under the fill " +
+      "guard's 150%, so the order's own contract would reject the fill."),
     "K5" -> "Cancels the SigUSD order, returning its collateral. Shows the borrower can cancel at any time.",
     "K6" -> "A small lend offer that expires in 10 blocks, set up to be refunded.",
     "K7" -> ("Refunds the expired offer to its owner. Anyone may, keeping the batcher fee; it is how a contract-owned " +

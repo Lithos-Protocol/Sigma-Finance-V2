@@ -211,9 +211,9 @@ trait StandardBatch extends AppBase { self: StandardApp =>
       .sortBy(o => (-o.batcherFee, o.box.id.toString)).foreach { o =>
         val fromOrders = orderSources.filter(x => x.market == o.market && !taken(x.box.id.toString)).flatMap { order =>
           val maturity = if (order.onClose) height.toLong + order.terms(3) else order.terms(3)
-          val bond = StdBond(order.box, order.market, order.terms, order.principalTokens, order.borrowerHash,
-            order.liqHash, o.feeReserve, height.toLong, maturity)
-          if (offerRefusal(o, bond, order.principal, 1L, 1L, usableOracle).nonEmpty) None
+          val bond = prospective(order, height.toLong, maturity, o.feeReserve)
+          if (offerRefusal(o, bond, order.principal, 1L, 1L, usableOracle).nonEmpty ||
+            guardRefusal(order, bond, usableOracle).nonEmpty) None
           else Some((impliedYield(o, order.repayment, order.principal, 1L, 1L, maturity), order.box.id.toString,
             Work(s"fill order ${order.box.id} from offer ${o.box.id}", s"match-offer ${o.box.id} --order ${order.box.id}",
               o.batcherFee, Set(o.box.id.toString, order.box.id.toString))))
@@ -225,7 +225,8 @@ trait StandardBatch extends AppBase { self: StandardApp =>
             val bond = liveBonds.find(_.asset == asset).get
             val price = if (o.market.token.isEmpty) math.max(askPrice(a, units)._1, MinBox) else askPrice(a, units)._1
             if (units < a.minFill && units != a.token.amount) None
-            else if (offerRefusal(o, bond, price, units, whole, usableOracle).nonEmpty) None
+            else if (offerRefusal(o, bond, price, units, whole, usableOracle).nonEmpty ||
+              saleGuardRefusal(a, bond, usableOracle).nonEmpty) None
             else Some((impliedYield(o, bond.repayment, price, units, whole, bond.maturity), a.box.id.toString,
               Work(s"buy $units of ${a.token.id} from ask ${a.box.id} with offer ${o.box.id}",
                 s"match-offer ${o.box.id} --ask ${a.box.id}" + (if (units != a.token.amount) s" --amount $units" else ""),

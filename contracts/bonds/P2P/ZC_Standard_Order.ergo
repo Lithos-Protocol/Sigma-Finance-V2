@@ -39,6 +39,12 @@
     //   one entry, the repayment token and the principal amount
     // R6: Coll[Byte] -> bond R5: blake2b256 of the borrower script
     // R7: Coll[Byte] -> bond R8: blake2b256 of the serialized liquidation expression
+    // R8 (optional, not copied): Coll[Byte] - blake2b256 of a serialized fill guard expression. When
+    //   present, a fill must also pass that expression, supplied in context var 1 and run with this
+    //   order as SELF; it reads the new bond at OUTPUTS(1) and may read data inputs.
+    //   ZC_Standard_ERG_SigUSD_FillGuard is the first: the bond must start with collateral worth at
+    //   least a minimum ratio of the repayment at a fresh oracle price. Absent, a fill checks nothing
+    //   about the collateral's value, so it can start a bond its rule liquidates at once.
     // Bond R4 = this order's id. Bond R9: Coll[Long] = (lender liquidation fee reserve, start height,
     // maturity height).
     //
@@ -48,7 +54,7 @@
     // Expiry refund requires HEIGHT >= R4(4): all tokens and >= value - fee go back to the borrower.
     // A borrower-script co-spend cancels at any height.
     //
-    // FILL SHAPE (no context vars)
+    // FILL SHAPE (no context vars, except var 1: Coll[Byte] the fill guard when R8 names one)
     // INPUTS(0) = SELF, so the bond asset id is this order's id and one order fills per transaction.
     // Exactly 3 units are minted: 2 locked in the bond, 1 circulating.
     // OUTPUTS(0): the circulating unit at tokens(0), at any lender-chosen script (a wallet, a lend
@@ -165,7 +171,15 @@
                     principal.value >= expiryFee && principal.value - expiryFee >= borrower(1) &&
                     principal.tokens == principalTokens
 
-                sigmaProp(borrowerValid && mintValid && bondValid && startValid && maturityValid && principalPaid)
+                val core = borrowerValid && mintValid && bondValid && startValid && maturityValid && principalPaid
+
+                // The borrower's fill guard, when R8 names one. Var 1 only: var 0 is the refund's Int.
+                val guard = SELF.R8[Coll[Byte]]
+                if (guard.isDefined) {
+                    sigmaProp(core && blake2b256(getVar[Coll[Byte]](1).get) == guard.get) && executeFromVar[SigmaProp](1)
+                } else {
+                    sigmaProp(core)
+                }
             }
         }
     } else {
