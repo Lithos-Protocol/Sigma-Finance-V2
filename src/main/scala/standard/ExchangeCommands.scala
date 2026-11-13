@@ -67,7 +67,7 @@ object ExchangeCommands {
   private def needPercent(a: Args, key: String): Long = percent(a, key).getOrElse(throw CliError(s"missing --$key <percent>"))
 
   /**
-   * Share terms: --shares (default zcs1's 1,000,000), the fees, any --dutch auction, and the EIP-4 fields, which
+   * Share terms: --shares (default zcs1's 100,000,000), the fees, any --dutch auction, and the EIP-4 fields, which
    * default to zcs1's template; giving one overrides it, and the command then says the shares are nonstandard.
    */
   private def shareTerms(a: Args): ShareTerms = {
@@ -181,7 +181,7 @@ object ExchangeCommands {
         face.fold("")(f => s" (${Units.percent(f)} of face)") +
         (if (a.nav) s"; NAV ${if (a.margin >= 0) "+" else "-"}${Units.percent(a.margin.abs)}, ${a.wholeUnits} unit(s) per bond" else ""))
       println(s"  minimum fill ${a.minFill}; expires at height ${a.expiry}" +
-        (if (app.height.toLong + 1L >= a.expiry) " (EXPIRED: anyone may refund-ask it)" else ""))
+        (if (app.height.toLong >= a.expiry) " (EXPIRED: anyone may refund-ask it)" else ""))
       app.bondOf(a.token.id).foreach { case (asset, n) =>
         println(s"  a claim on bond $asset" + (if (n > 1L) s" ($n shares per bond)" else ""))
       }
@@ -206,7 +206,7 @@ object ExchangeCommands {
           s", named '${o.metadata.headOption.map(StandardMetadata.text).getOrElse("")}'")
         metadataLine(app.offerMetadataIssues(o))
       }
-      println(s"  expires at height ${o.expiry}" + (if (app.height.toLong + 1L >= o.expiry) " (EXPIRED: anyone may refund-offer it)" else ""))
+      println(s"  expires at height ${o.expiry}" + (if (app.height.toLong >= o.expiry) " (EXPIRED: anyone may refund-offer it)" else ""))
       if (app.isOwnHash(o.ownerHash)) println("  (your offer)")
     }
   }

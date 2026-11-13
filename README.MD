@@ -92,8 +92,9 @@ sbt "runMain ksingh.sigmabonds.app.SigmaFiCli help"
 Every transaction follows the zcs1 off-chain rules in
 [docs/ZC_STANDARD_OFFCHAIN.md](./docs/ZC_STANDARD_OFFCHAIN.md). It discloses each script its boxes name
 by hash in context variable 64, unless an input or output already carries it, so any batcher can pay
-it. A fill names the lender's bond unit `ZCS-<market>-B-<maturity>-<first6>`, with a one-sentence
-description. Shares default to 1,000,000 with 6 decimals and a zcs1 name. The listings flag anything
+it. A fill names the lender's bond unit `ZCS-Bond-Unit-<first6>`, with a short description of the
+bond's terms. Shares default to 100 with 6 decimals (1.0 shares is 1% of the bond) and are named
+`ZCS-Bond-Shares-<first6>` or `ZCS-Bond-Auction-Shares-<first6>`. The listings flag anything
 nonstandard. `help` lists every option.
 
 **First generation, with `--old`.** `info`, `orders`, `bonds`, `claims`, `fill-order [--batching-fee
@@ -132,7 +133,9 @@ collateral the oracle does not price, which the Dutch auction's lot and the toke
 need. Where the CLI can, a step builds on transactions still in the mempool (`--mempool`). It waits for
 confirmation where the CLI reads the chain's history: an offer or a share request checks a bond asset's
 origin, which needs the order spent on chain. A step that fails while what it built on is unconfirmed
-runs again once that confirms, and the final report lists those.
+runs again once that confirms, and the final report lists those. A step whose transaction leaves the
+mempool unconfirmed has the ids it found undone and runs again, and `retry failed` re-runs every failed
+step.
 
 Steps also run the listings and check what they show, and run commands the CLI must refuse: a claim
 before settlement, recollateralizing within 60 blocks, an early maturity liquidation, a refund before

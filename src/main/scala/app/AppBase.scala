@@ -51,7 +51,11 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
 
   import Protocol._
 
-  /** The last block's height. A transaction built now lands at a later one. */
+  /**
+   * The last block's height. The node wallet signs at it, running every script there, and the transaction
+   * lands at a later height. So a path open only before height X needs height + 1 < X, and a path open from
+   * X on (an expiry refund, a maturity liquidation, the end of a wait) needs height >= X.
+   */
   def height: Int = ctx.getHeight
 
   /** The node, for code mixed into a subclass. */
@@ -133,9 +137,21 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
 
   def walletHolds(tokenId: ErgoId): Boolean = walletBoxes.exists(_.tokens.exists(_.id == tokenId))
 
+  /**
+   * Wallet boxes still in the mempool (listed only with --mempool). Coin selection spends them last: a
+   * transaction paying with unconfirmed change shares the fate of whatever made it, so one dropped
+   * transaction would take every later one down with it.
+   */
+  private lazy val unconfirmedWallet: Set[String] = {
+    walletReady
+    Try(node.walletUnconfirmedBoxIds()).getOrElse(Set.empty)
+  }
+
+  private def unconfirmed(b: InputUTXO): Boolean = unconfirmedWallet.contains(b.id.toString)
+
   /** A wallet box under the script `hash` names: the co-spend that proves a borrower or owner is present. */
   protected def walletBoxAt(hash: Array[Byte], who: String): InputUTXO =
-    walletBoxes.find(b => hashOf(b.input.getErgoTree).sameElements(hash))
+    walletBoxes.filter(b => hashOf(b.input.getErgoTree).sameElements(hash)).sortBy(unconfirmed).headOption
       .getOrElse(fail(s"this wallet holds no box at the $who's address; only the $who can do this"))
 
   // ═══ SIGN AND SUBMIT ══════════════════════════════════════════════════════
@@ -280,7 +296,10 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
     plan(spends, Seq(UTXO(Contract(myTree), math.max(MinBox, total - settings.fee), kept)), burn)
   }
 
-  /** Token boxes first, largest holdings first; then the largest ERG boxes until `erg` is covered. */
+  /**
+   * Token boxes first, largest holdings first; then the largest ERG boxes until `erg` is covered. Confirmed
+   * boxes always come before unconfirmed ones.
+   */
   private def selectWallet(erg: Long, tokens: Map[ErgoId, Long], exclude: Set[ErgoId],
                            avoidTokens: Set[ErgoId]): Seq[InputUTXO] = {
     val pool = walletBoxes.filterNot(b => exclude.contains(b.id) || b.tokens.exists(t => avoidTokens.contains(t.id)))
@@ -289,10 +308,11 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
     def amountIn(b: InputUTXO, id: ErgoId): Long = b.tokens.filter(_.id == id).map(_.amount).sum
 
     tokens.foreach { case (id, need) =>
-      pool.filter(amountIn(_, id) > 0).sortBy(-amountIn(_, id)).foreach(b => if (held(id) < need) chosen += b)
+      pool.filter(amountIn(_, id) > 0).sortBy(b => (unconfirmed(b), -amountIn(b, id)))
+        .foreach(b => if (held(id) < need) chosen += b)
       if (held(id) < need) fail(s"the wallet holds ${held(id)} of token $id; this needs $need")
     }
-    pool.filterNot(chosen.contains).sortBy(-_.value).foreach { b =>
+    pool.filterNot(chosen.contains).sortBy(b => (unconfirmed(b), -b.value)).foreach { b =>
       if (chosen.toSeq.map(_.value).sum < erg) chosen += b
     }
     val value = chosen.toSeq.map(_.value).sum

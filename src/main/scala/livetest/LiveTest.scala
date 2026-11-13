@@ -36,7 +36,8 @@ object LiveTest {
       |  plan             the steps, their tracks and what each builds on
       |  show <step>      a step's command line, transactions, output boxes and notes
       |  vars             the box and token ids steps have found
-      |  retry <step>     run a failed or skipped step again
+      |  retry <step> ... run failed or skipped steps again; `retry failed` re-runs every failed step. A step
+      |                   whose transaction left the mempool unconfirmed runs again by itself (twice at most)
       |  skip <step>      skip a step (B3, the recollateralize 60 blocks after a fill, saves about an hour)
       |  chain on|off     whether steps chain through the mempool or wait for confirmations
       |  cleanup [run]    this wallet's open orders, offers, asks, share requests, bonds and claims, with the
@@ -124,9 +125,12 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
 
   // ═══ THE CHAIN ════════════════════════════════════════════════════════════
 
-  /** Heights: the node's chain, its index, and its wallet's scan. */
+  /**
+   * Heights: the node's chain, its index, and its wallet's scan. The node wallet signs at `height`, so a gate
+   * on a path open from height X opens at height >= X (see AppBase.height).
+   */
   private case class View(height: Int, indexed: Int, wallet: Int) {
-    def next: Long = height.toLong + 1L
+    def reached(x: Long): Boolean = height.toLong >= x
   }
 
   private def view(): View = {
@@ -164,7 +168,10 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
     case None => if (Try(n.unconfirmedTransactionById(tx)).toOption.flatten.isDefined) Pooled else Missing
   }
 
-  /** Settle in-flight steps: done once every transaction confirms, failed if one leaves the mempool unconfirmed. */
+  /**
+   * Settle in-flight steps: done once every transaction confirms. One that leaves the mempool unconfirmed (and
+   * with it whatever was chained on it) has its bindings undone and runs again, up to MaxAttempts.
+   */
   private def settle(v: View): Unit = {
     val n = session.nodeApi()
     plan.filter(s => st(s.id).status == InFlight).foreach { s =>
@@ -179,11 +186,24 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
         val now = System.currentTimeMillis()
         val ss = st(s.id)
         val first = if (ss.misses == 0) now else ss.firstMiss
-        if (ss.misses + 1 >= 3 && now - first >= 90000L)
-          finish(s, Failed, "a transaction left the mempool without confirming (dropped, or replaced by a conflicting " +
-            "one); `retry " + s.id + "` runs the step again")
+        if (ss.misses + 1 >= 3 && now - first >= 90000L) dropped(s)
         else set(s.id)(_.copy(misses = ss.misses + 1, firstMiss = first))
       } else if (st(s.id).misses > 0) set(s.id)(_.copy(misses = 0))
+    }
+  }
+
+  /** A step whose transaction left the mempool unconfirmed: its bindings are undone, and it runs again. */
+  private def dropped(s: Step): Unit = {
+    val why = "a transaction left the mempool without confirming (dropped, or replaced by a conflicting one)"
+    state = state.unbind(s.id)
+    val ss = st(s.id)
+    if (ss.attempts < MaxAttempts) {
+      set(s.id)(_.copy(status = Pending, txs = Vector.empty, outputs = Vector.empty, waitFor = Vector.empty,
+        misses = 0, notes = ss.notes :+ s"attempt ${ss.attempts}: $why"))
+      say(s"[${s.id}] $why; it runs again")
+    } else {
+      save()
+      finish(s, Failed, s"$why; `retry ${s.id}` runs the step again")
     }
   }
 
@@ -255,6 +275,8 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
     else if (unconfirmed.nonEmpty) Waiting(s"waiting for ${waitWords(unconfirmed)}")
     else if (unsent.nonEmpty) Waiting(s"waiting for ${waitWords(unsent)}")
     else if (held.nonEmpty) Waiting(s"retrying once ${held.mkString(", ")} confirm")
+    else if (st(s.id).notBefore.exists(_ > v.height))
+      Waiting(s"retrying at height ${st(s.id).notBefore.get}", st(s.id).notBefore.map(_.toLong), external = true)
     else if (s.skipIf.exists(state.vars.contains)) SkipNow(s"${s.skipIf.get} is already bound: an earlier step did this")
     else if (missing.nonEmpty) {
       if (chained) Waiting(s"waiting for ${missing.mkString(", ")}")
@@ -281,33 +303,33 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
     case BoxKind.Ask => "ask"
   }
 
-  /** The gate's verdict, or None when it is open. Heights compare against the next block's. */
+  /** The gate's verdict, or None when it is open. A height counts once the chain is at it: the node wallet signs there. */
   private def gate(s: Step, v: View, look: Look): Option[Readiness] = {
     def vr(n: String) = state.vars(n)
     def unread(id: String) = Some(Waiting(s"cannot read box ${short(id)} from the node yet"))
     s.gate match {
       case Gate.Open => None
       case Gate.Expired(k, b) => look.expiry(k, vr(b)) match {
-        case Some(e) if v.next >= e => None
+        case Some(e) if v.reached(e) => None
         case Some(e) => Some(Waiting(s"${kindName(k)} ${short(vr(b))} expires at height $e", Some(e)))
         case None => unread(vr(b))
       }
       case Gate.Unexpired(k, b) => look.expiry(k, vr(b)) match {
-        case Some(e) if v.next >= e => Some(SkipNow(s"the ${kindName(k)} expired at height $e before this could run"))
+        case Some(e) if v.reached(e) => Some(SkipNow(s"the ${kindName(k)} expired at height $e before this could run"))
         case Some(_) => None
         case None => unread(vr(b))
       }
       case Gate.Recollateralizable(b) => look.bond(vr(b)).map(_.recollateralizableFrom) match {
-        case Some(h) if v.next >= h => None
+        case Some(h) if v.reached(h) => None
         case Some(h) => Some(Waiting(s"bond ${short(vr(b))} can take collateral from height $h", Some(h)))
         case None => unread(vr(b))
       }
       case Gate.Reached(h) =>
         val at = vr(h).toLong
-        if (v.next >= at) None else Some(Waiting(s"height $at ($h)", Some(at)))
+        if (v.reached(at)) None else Some(Waiting(s"height $at ($h)", Some(at)))
       case Gate.Before(h) =>
         val at = vr(h).toLong
-        if (v.next >= at) Some(SkipNow(s"height $at ($h) has passed")) else None
+        if (v.reached(at)) Some(SkipNow(s"height $at ($h) has passed")) else None
       case Gate.QuietBatch(boxes) => quiet(boxes.map(vr).toSet, v)
     }
   }
@@ -424,12 +446,18 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
   /**
    * A failure while transactions are in flight may be the mempool's doing (a lookup that does not see it yet,
    * a wallet box still unconfirmed), so the step runs again once they confirm: its own dependencies when it
-   * built on any of them, else everything in flight. Otherwise it fails.
+   * built on any of them, else everything in flight. A refusal that names the next block (an oracle refresh in
+   * the mempool) waits for it without counting as an attempt. Otherwise the step fails.
    */
   private def failure(s: Step, message: String): Unit = {
     val inflightDeps = deps(s).filter(d => st(d).status == InFlight)
     val inflight = if (inflightDeps.nonEmpty) inflightDeps else plan.map(_.id).filter(d => st(d).status == InFlight)
-    if (!s.noDefer && inflight.nonEmpty && st(s.id).attempts < MaxAttempts) {
+    if (message.contains("Try again after the next block")) {
+      val at = st(s.id).ranAt.getOrElse(0) + 1
+      set(s.id)(ss => ss.copy(status = Pending, attempts = math.max(0, ss.attempts - 1), notBefore = Some(at),
+        notes = ss.notes :+ s"waited a block: $message"))
+      say(s"[${s.id}] $message\n[${s.id}] it runs again at height $at")
+    } else if (!s.noDefer && inflight.nonEmpty && st(s.id).attempts < MaxAttempts) {
       val how = if (inflightDeps.nonEmpty) "chained through the mempool" else "with transactions in flight"
       set(s.id)(ss => ss.copy(status = Pending, waitFor = inflight.toVector,
         notes = ss.notes :+ s"attempt ${ss.attempts} ($how) failed: $message"))
@@ -443,7 +471,7 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
       sub.flatMap(_.outputs.lift(b.output)).filter(_.nonEmpty).map(b.name -> _)
     }
     if (found.nonEmpty) {
-      state = state.bind(found: _*)
+      state = state.bindAs(s.id, found)
       save()
       say(s"[${s.id}] found " + found.map { case (k, id) => s"$k = $id" }.mkString(", "))
     }
@@ -605,7 +633,7 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
     case "auto" :: _ => auto()
     case "show" :: id :: _ => show(id)
     case "vars" :: _ => state.vars.toSeq.sortBy(_._1).foreach { case (k, v) => say(f"  $k%-10s $v") }
-    case "retry" :: id :: _ => retry(id)
+    case "retry" :: ids if ids.nonEmpty => retry(ids)
     case "skip" :: id :: _ => skip(id)
     case "chain" :: "on" :: _ => state = state.copy(chain = true); save(); say("Mempool chaining is on.")
     case "chain" :: "off" :: _ => state = state.copy(chain = false); save(); say("Mempool chaining is off.")
@@ -746,7 +774,7 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
     val failed = plan.filter(s => st(s.id).status == Failed).map(_.id)
     val head = s"Height ${v.height}: $counts." +
       (if (inflight.nonEmpty) s" In flight: ${inflight.mkString(", ")}." else "") +
-      heights.headOption.fold("") { case (s, h) => s" Next height: ${s.id} at $h (${h - v.next} blocks, ${minutes(h - v.next)})." } +
+      heights.headOption.fold("") { case (s, h) => s" Next height: ${s.id} at $h (${h - v.height} blocks, ${minutes(h - v.height)})." } +
       (if (failed.nonEmpty) s" FAILED: ${failed.mkString(", ")}." else "")
     if (!detailed) head
     else (head +: pending.take(8).map {
@@ -811,13 +839,24 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
     ss.notes.foreach(n => say(s"  note:     $n"))
   }
 
-  private def retry(id: String): Unit = find(id).foreach { s =>
-    st(s.id).status match {
-      case Failed | Skipped =>
-        set(s.id)(ss => ss.copy(status = Pending, txs = Vector.empty, outputs = Vector.empty, waitFor = Vector.empty,
-          attempts = 0, misses = 0, notes = ss.notes :+ "retried"))
-        say(s"${s.id} will run again.")
-      case other => say(s"${s.id} is $other: only a failed or skipped step can be retried.")
+  /**
+   * `retry failed` re-runs every failed step; otherwise each step named. A step whose transactions never
+   * reached the chain has its bindings undone first, so it builds on what was there before it.
+   */
+  private def retry(ids: Seq[String]): Unit = {
+    val chosen = if (ids == Seq("failed")) plan.filter(s => st(s.id).status == Failed) else ids.flatMap(find)
+    if (chosen.isEmpty) say("Nothing to retry.")
+    val n = session.nodeApi()
+    chosen.foreach { s =>
+      st(s.id).status match {
+        case Failed | Skipped =>
+          val onChain = st(s.id).txs.exists(tx => Try(n.transactionById(tx)).toOption.flatten.isDefined)
+          if (!onChain) state = state.unbind(s.id)
+          set(s.id)(ss => ss.copy(status = Pending, txs = Vector.empty, outputs = Vector.empty, waitFor = Vector.empty,
+            attempts = 0, misses = 0, notBefore = None, notes = ss.notes :+ "retried"))
+          say(s"${s.id} will run again.")
+        case other => say(s"${s.id} is $other: only a failed or skipped step can be retried.")
+      }
     }
   }
 

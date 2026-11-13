@@ -59,7 +59,25 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
   def settlements(): Seq[StdSettlement] =
     decoded(node.unspentByErgoTree(protocol.contracts.vault.ergoTreeHex)).flatMap(protocol.asSettlement)
 
-  def oracle(): Option[OracleState] = protocol.asOracle(decoded(node.unspentByTokenId(OracleNft.toString)))
+  /**
+   * The USD oracle pool box as confirmed on chain, never one from the mempool, even with --mempool. Oracles
+   * race to refresh the pool and the losing refresh's box never exists, so a data input read from the
+   * mempool can vanish, taking the transaction and everything chained on it. The mempool is only asked
+   * whether a refresh already spends the confirmed box (`refreshing`).
+   */
+  def oracle(): Option[OracleState] = {
+    val nft = OracleNft.toString
+    protocol.asOracle(decoded(node.withMempool(false).unspentByTokenId(nft))).map { o =>
+      val pooled = Try(decoded(node.withMempool(true).unspentByTokenId(nft))).toOption
+      o.copy(refreshing = pooled.exists(boxes => !boxes.exists(_.id == o.box.id)))
+    }
+  }
+
+  /** The oracle as a data input: refused while a refresh in the mempool spends it, since the read would fail. */
+  private[standard] def readableOracle(o: OracleState): OracleState =
+    if (!o.refreshing) o
+    else fail("the oracle pool is being refreshed: a transaction in the mempool spends its box, so a transaction " +
+      "reading it now would fail once that confirms. Try again after the next block")
 
   /**
    * Whether a bond asset is genuine: the box whose id it is was spent under this market's standard order,
@@ -84,6 +102,10 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
       }
     }
   }
+
+  /** What a bond asset's zcs1 metadata is built from, read from its bond record. */
+  def bondFacts(asset: ErgoId): Option[StandardMetadata.BondFacts] =
+    bondRecord(asset).map(b => StandardMetadata.BondFacts.of(b, protocol.ruleOf(b.liqHash)))
 
   /**
    * How a bond unit's metadata departs from zcs1: the fill's OUTPUTS(0) is the issuing box and OUTPUTS(1) the
@@ -324,7 +346,7 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
     if (addErg == 0L && addTokens.isEmpty) fail("add something: --add-erg <ERG> or --add-token <token id>:<amount>")
     if (addTokens.map(_.id).distinct.size != addTokens.size) fail("list each added token once")
     if (height.toLong + 1L >= bond.maturity) fail(s"the bond matures at height ${bond.maturity}: it can no longer take collateral")
-    if (height.toLong + 1L < bond.recollateralizableFrom)
+    if (height.toLong < bond.recollateralizableFrom)
       fail(s"the bond last moved at height ${bond.movedAt}; it can take collateral again from height ${bond.recollateralizableFrom}")
 
     val held = bond.collateral.map(_.id).toSet

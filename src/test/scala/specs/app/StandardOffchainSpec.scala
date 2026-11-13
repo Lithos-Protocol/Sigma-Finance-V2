@@ -28,11 +28,11 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
   private def oracleLoan(w: World, tokens: Long, repayment: Long = erg("6")): StdLoan =
     loan(repayment = repayment, collateral = Seq(Token(collateralToken, tokens)), rule = OracleChoice(15000L, 60L))(w)
 
-  /** An expired lend offer owned by `owner`, with the given batcher fee. */
-  private def expiredOffer(w: World, owner: ErgoProver, value: Long = erg("2")): UTXO =
+  /** A lend offer owned by `owner` that expires at `expiry` (default: the current height, so it is expired). */
+  private def expiredOffer(w: World, owner: ErgoProver, value: Long = erg("2"), expiry: Option[Long] = None): UTXO =
     UTXO(protocol.market(Market.Erg).offer, value, Seq.empty,
       Seq(bytesValue(hashOf(tree(owner).ergoTree)),
-        longsValue(0L, 1L, 262800L, fee, reserve, 13000L, w.h.toLong, 1L, 30L, 0L, 0L),
+        longsValue(0L, 1L, 262800L, fee, reserve, 13000L, expiry.getOrElse(w.h.toLong), 1L, 30L, 0L, 0L),
         bytesValue(protocol.market(Market.Erg).policy.hashedValueBytes), longsValue(), textsValue(), bytesValue(Array.empty[Byte])))
 
   private def text(box: work.lithos.mutations.InputUTXO, r: Int): Option[String] = bytesReg(box, r).map(StandardMetadata.text)
@@ -107,9 +107,9 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
       val bond = w.liveBond(loan()(w), l)
       val maturity = w.h + 1000L
       val unit = w.app(l).walletBoxes.find(_.tokens.exists(_.id == bond.asset)).get
-      text(unit, 4) shouldBe Some(s"ZCS-ERG-B-$maturity-${bond.asset.toString.take(6)}")
-      text(unit, 5) shouldBe Some(s"zcs1 bond: repays 6 ERG at height $maturity; lent 5 at height ${w.h}; " +
-        "liquidates at maturity. Verify on chain.")
+      text(unit, 4) shouldBe Some(s"ZCS-Bond-Unit-${bond.asset.toString.take(6)}")
+      text(unit, 5) shouldBe Some(s"ZC Standard bond. It lent 5 ERG at height ${w.h} and repays 6 ERG at height " +
+        s"$maturity. It liquidates at maturity if unpaid. Verify on chain.")
       text(unit, 6) shouldBe Some("0")
       w.app(l).bondMetadataIssues(bond.asset) shouldBe empty
     }
@@ -117,20 +117,26 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
 
   property("metadata: the template formats SigUSD amounts, oracle ratios and Dutch auctions exactly") {
     val asset = ErgoId.create("3fa2c1" + "00" * 29)
-    val bond = StandardMetadata.bond(StandardMetadata.BondFacts(Market.SigUsd, asset, 10000L, 10550L, 1712000L,
-      1749600L, StandardMetadata.ruleText(Some(OracleRatio(Market.SigUsd, protocol.market(Market.SigUsd).oracleRule)),
-        Seq(15000L, 60L), Array.fill(32)(0.toByte))))
-    bond shouldBe Seq("ZCS-SigUSD-B-1749600-3fa2c1",
-      "zcs1 bond: repays 105.5 SigUSD at height 1749600; lent 100 at height 1712000; liquidates below 150% or at maturity. " +
-        "Verify on chain.", "0")
+    val facts = StandardMetadata.BondFacts(Market.SigUsd, asset, 10000L, 10550L, 1712000L, 1749600L,
+      StandardMetadata.ruleText(Some(OracleRatio(Market.SigUsd, protocol.market(Market.SigUsd).oracleRule)),
+        Seq(15000L, 60L), Array.fill(32)(0.toByte)))
+    val terms = "lent 100 SigUSD at height 1712000 and repays 105.5 SigUSD at height 1749600. " +
+      "It liquidates below 150% collateral, or at maturity if unpaid."
+    StandardMetadata.bond(facts) shouldBe
+      Seq("ZCS-Bond-Unit-3fa2c1", s"ZC Standard bond. It $terms Verify on chain.", "0")
+    StandardMetadata.shares(Market.SigUsd, None, Some(facts)) shouldBe Seq("ZCS-Bond-Shares-3fa2c1",
+      s"ZC Standard shares. 1.0 shares equals 1% of bond 3fa2c1. The bond $terms Verify on chain.", "6")
     val auction = Some(AuctionTerms(12000L, 9050L, 720L))
-    StandardMetadata.shares(Market.SigUsd, auction, Some(StandardMetadata.ShareBond(asset, 10550L, 1749600L))) shouldBe
-      Seq("ZCS-SigUSD-D90.5-1749600-3fa2c1",
-        "zcs1 shares: 1.000000 = one bond 3fa2c1 repaying 105.5 SigUSD at height 1749600. If liquidated, auctioned " +
-          "from 120% to 90.5% of the repayment over 720 blocks. Verify on chain.", "6")
-    StandardMetadata.shares(Market.Erg, None, None) shouldBe
-      Seq("ZCS-ERG-S", "zcs1 shares: 1.000000 = one ERG bond. Verify on chain.", "6")
-    StandardMetadata.ruleText(None, Seq.empty, Array.fill(32)(0xab.toByte)) shouldBe "liquidation rule abababab"
+    val sale = "If liquidated, its collateral is auctioned from 120% down to 90.5% of the repayment over 720 blocks."
+    StandardMetadata.shares(Market.SigUsd, auction, Some(facts)) shouldBe Seq("ZCS-Bond-Auction-Shares-3fa2c1",
+      s"ZC Standard shares. 1.0 shares equals 1% of bond 3fa2c1. The bond $terms $sale Verify on chain.", "6")
+    // Without the bond: the market's article is grammatical ("an ERG", "a SigUSD").
+    StandardMetadata.shares(Market.Erg, None, None) shouldBe Seq("ZCS-Bond-Shares",
+      "ZC Standard shares. 1.0 shares equals 1% of an ERG bond bought by a lend offer. Verify on chain.", "6")
+    StandardMetadata.shares(Market.SigUsd, auction, None) shouldBe Seq("ZCS-Bond-Auction-Shares",
+      s"ZC Standard shares. 1.0 shares equals 1% of a SigUSD bond bought by a lend offer. $sale Verify on chain.", "6")
+    StandardMetadata.ruleText(None, Seq.empty, Array.fill(32)(0xab.toByte)) shouldBe
+      "It liquidates under liquidation rule abababab."
   }
 
   property("metadata: a misleading name or an R7 set on a fill's unit is flagged") {
@@ -168,13 +174,16 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
       w.fund(o, erg("5"), Token(SigUsd, 1000L))
       w.oracle(500000000L, w.h)
 
-      // Dutch shares of a known bond: named after it, with the floor in the kind.
+      // Dutch shares of a known bond: named after it, with the bond's terms and the auction in the description.
       val bond = w.liveBond(loan(collateral = Seq(Token(collateralToken, 100L)))(w), l)
       val auction = Some(AuctionTerms(15000L, 9000L, 500L))
       w.run(l, w.app(l).fractionalize(bond.asset.toString, ShareTerms(pullFee = fee, mintFee = fee, auction = auction)))
       val req = w.app(e).shareRequests().loneElement
-      req.shares shouldBe 1000000L
-      StandardMetadata.text(req.metadata.head) shouldBe s"ZCS-ERG-D90-${w.h + 1000L}-${bond.asset.toString.take(6)}"
+      req.shares shouldBe 100000000L
+      StandardMetadata.text(req.metadata.head) shouldBe s"ZCS-Bond-Auction-Shares-${bond.asset.toString.take(6)}"
+      StandardMetadata.text(req.metadata(1)) should (startWith("ZC Standard shares. 1.0 shares equals 1% of bond ") and
+        include(s"The bond lent 5 ERG at height ${w.h} and repays 6 ERG at height ${w.h + 1000L}.") and
+        include("auctioned from 150% down to 90%") and endWith("Verify on chain."))
       w.app(e).requestMetadataIssues(req) shouldBe empty
       w.run(e, w.app(e).mintShares(req.box.id.toString))
       val shares = w.app(l).walletBoxes.find(_.tokens.exists(_.id == req.shareId)).get
@@ -185,7 +194,7 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
       w.run(o, w.app(o).createOffer(offerSpec(w).copy(market = Market.SigUsd, capital = 1000L, fees = erg("0.5"),
         delivery = Some(OfferDelivery(ShareTerms(pullFee = fee, mintFee = fee, auction = auction))))))
       val offer = w.app(e).offers().loneElement
-      offer.metadata.map(StandardMetadata.text).head shouldBe "ZCS-SigUSD-D90"
+      offer.metadata.map(StandardMetadata.text).head shouldBe "ZCS-Bond-Auction-Shares"
       w.app(e).offerMetadataIssues(offer) shouldBe empty
       w.run(b, w.app(b).createOrder(loan(Market.SigUsd, principal = 600L, repayment = 700L,
         collateral = Seq(Token(collateralToken, 5L)), rule = OracleChoice(15000L, 60L))(w)))
@@ -196,12 +205,12 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
 
       // Overrides build, but say they are nonstandard, and the check says so too.
       val own = w.liveBond(loan(collateral = Seq(Token(collateralToken, 5L)))(w), l)
-      val custom = w.app(l).fractionalize(own.asset.toString, ShareTerms(100L, fee, fee, name = Some("My shares")))
+      val custom = w.app(l).fractionalize(own.asset.toString, ShareTerms(1000000L, fee, fee, name = Some("My shares")))
       custom.notes.exists(_.startsWith("NONSTANDARD share count")) shouldBe true
       custom.notes.exists(_.startsWith("NONSTANDARD metadata")) shouldBe true
       w.run(l, custom)
       val issues = w.app(e).requestMetadataIssues(w.app(e).shareRequests().find(_.bondAsset == own.asset).get)
-      issues.exists(_.contains("share count is 100")) shouldBe true
+      issues.exists(_.contains("share count is 1000000, not zcs1's 100000000")) shouldBe true
       issues.exists(_.contains("'My shares'")) shouldBe true
     }
   }
@@ -220,31 +229,32 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
       val ergBond = w.liveBond(loan(collateral = Seq(Token(collateralToken, 100L)))(w), l)
       w.app(l).faceBps(ergBond.asset, erg("5.5"), 1L) shouldBe Some(9166L)
 
-      // 1,000,000 shares of a 7.00 SigUSD bond: 1429 shares claim at least one cent.
+      // 100,000,000 shares of a 7.00 SigUSD bond: 142858 raw shares (0.142858) claim at least one cent.
       val bond = w.liveBond(loan(Market.SigUsd, principal = 600L, repayment = 700L, collateralErg = erg("2"),
         collateral = Seq(Token(collateralToken, 100L)))(w), l)
       w.run(l, w.app(l).fractionalize(bond.asset.toString, ShareTerms(pullFee = fee, mintFee = fee)))
       w.run(e, w.app(e).mintShares(w.app(e).shareRequests().loneElement.box.id.toString))
       val shareId = w.app(e).shareVaults().loneElement.shareId
-      w.app(l).shareLot(shareId) shouldBe Some(1429L)
-      w.app(l).faceBps(shareId, 350L, 500000L) shouldBe Some(10000L)
+      w.app(l).shareLot(shareId) shouldBe Some(142858L)
+      // Half the shares (50.000000) for half the repayment is 100% of face.
+      w.app(l).faceBps(shareId, 350L, 50000000L) shouldBe Some(10000L)
 
-      val listed = w.app(l).sell(shareId.toString, 500000L, Market.SigUsd, FixedPrice(340L), None, w.h + 100L, erg("0.002"))
+      val listed = w.app(l).sell(shareId.toString, 50000000L, Market.SigUsd, FixedPrice(340L), None, w.h + 100L, erg("0.002"))
       listed.notes.exists(_.startsWith("WARNING")) shouldBe false
       w.run(l, listed)
-      w.app(e).asks().loneElement.minFill shouldBe 1429L
+      w.app(e).asks().loneElement.minFill shouldBe 142858L
       w.app(l).sell(shareId.toString, 1000L, Market.SigUsd, FixedPrice(1L), None, w.h + 100L, erg("0.002"))
-        .notes.exists(_.contains("fills under 1429 shares")) shouldBe true
+        .notes.exists(_.contains("fills under 142858 shares")) shouldBe true
 
       // Repaid and pulled: the vault holds 700 SigUSD, so a 1000-share claim takes none of it.
       w.run(b, w.app(b).repay(bond.box.id.toString))
       w.run(e, w.app(e).pull(w.app(e).shareVaults().loneElement.box.id.toString))
       val dust = w.app(l).claimShares(shareId.toString, Some(1000L))
-      dust.notes.exists(n => n.startsWith("WARNING") && n.contains(SigUsd.toString) && n.contains("at least 1429 shares")) shouldBe true
+      dust.notes.exists(n => n.startsWith("WARNING") && n.contains(SigUsd.toString) && n.contains("at least 142858 shares")) shouldBe true
       // It still builds and signs; the SigUSD stays in the vault for later claimants.
       w.run(l, dust)
       w.app(e).shareVaults().loneElement.assets shouldBe Seq(Token(SigUsd, 700L))
-      w.app(l).claimShares(shareId.toString, Some(1429L)).notes.exists(_.startsWith("WARNING")) shouldBe false
+      w.app(l).claimShares(shareId.toString, Some(142858L)).notes.exists(_.startsWith("WARNING")) shouldBe false
     }
   }
 
@@ -353,7 +363,94 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
     }
   }
 
+  // ═══ THE SIGNING HEIGHT ═══════════════════════════════════════════════════
+
+  property("height: a path open from a height opens at it, where the node wallet signs, and not a block before") {
+    withCtx { ctx =>
+      // Offline signing runs every script at the context's height h, as the node wallet does. The CLI used to
+      // allow these at h + 1 >= X, and signing then failed: the live test's refunds at their expiry - 1.
+      val w = new World(ctx)
+      val (b, o, e) = (borrower(ctx), other(ctx), executor(ctx))
+      w.fund(b, erg("1"))
+      w.fund(o, erg("1"))
+      w.fund(e, erg("1"))
+      def order(expiry: Long) = w.seedFrom(b, UTXO(protocol.market(Market.Erg).order, erg("3") + fee, Seq.empty,
+        Seq(longsValue(erg("2"), erg("1"), erg("2"), w.h + 1000L, expiry, fee, 0L), tokensValue(Seq.empty),
+          bytesValue(hashOf(tree(b).ergoTree)), bytesValue(protocol.contracts.maturity.hashedValueBytes))))
+      def bond(asset: String, maturity: Long) = w.bond(Market.Erg, ErgoId.create(asset * 32), erg("3"), Seq.empty, erg("2"),
+        protocol.contracts.maturity, start = w.h - 100L, maturity = maturity, moved = w.h - 100)
+      val (early, due) = (order(w.h + 1L), order(w.h.toLong))
+      val (earlyOffer, dueOffer) = (w.seedFrom(o, expiredOffer(w, o, expiry = Some(w.h + 1L))), w.seedFrom(o, expiredOffer(w, o)))
+      val (young, matured) = (bond("d2", w.h + 1L), bond("d3", w.h.toLong))
+
+      val app = w.app(e)
+      refused(app.refundOrder(early.id.toString)) should include("it can be refunded from then on")
+      refused(app.refundOffer(earlyOffer.id.toString)) should include("it can be refunded from then on")
+      refused(app.liquidate(Seq(young.id.toString))) should include("it can be liquidated from then on")
+      app.batchScan().work.flatMap(_.packBox).toSet shouldBe Set(due, dueOffer, matured).map(_.id.toString)
+      w.run(e, w.app(e).pack(Seq(due, dueOffer, matured).map(_.id.toString)))
+      w.app(e).settlements().loneElement.liquidated shouldBe true
+    }
+  }
+
   // ═══ SESSION AND MEMPOOL ══════════════════════════════════════════════════
+
+  property("mempool: the oracle is read as confirmed, and nothing reads it while a refresh in the mempool spends it") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, e, o) = (borrower(ctx), executor(ctx), other(ctx))
+      w.fund(b, erg("40"), Token(collateralToken, 100L))
+      w.fund(e, erg("1"))
+      w.fund(o, erg("30"))
+      val confirmed = w.oracle(500000000L, w.h)
+      w.run(b, w.app(b).createOrder(oracleLoan(w, 50L)))
+      w.run(o, w.app(o).createOffer(offerSpec(w)))
+      // A refresh in the mempool spends the confirmed pool box and makes another, which may never confirm.
+      val refreshed = UTXO(Contract.SIGMA_TRUE, MinBox, Seq(Token(StandardProtocol.OracleNft, 1L)),
+        Seq(org.ergoplatform.appkit.ErgoValue.of(510000000L), org.ergoplatform.appkit.ErgoValue.of(2)), Some(w.h))
+        .toInput(ctx, ErgoId.create("ee" * 32), 0.toShort)
+      val pooled = w.chain.json(refreshed.input.asInstanceOf[InputBoxImpl].getErgoBox)
+      class Refreshing(inPool: Boolean) extends FakeNode(w.chain, e) {
+        override def withMempool(on: Boolean): NodeApi = if (on == inPool) this else new Refreshing(on)
+        override def unspentByTokenId(tokenId: String): Seq[Json] =
+          if (inPool && tokenId == StandardProtocol.OracleNft.toString) Seq(pooled) else super.unspentByTokenId(tokenId)
+      }
+      // Read through the mempool or not, the app sees the confirmed box, and knows a refresh is pending.
+      Seq(true, false).foreach { mempool =>
+        val app = new StandardApp(ctx, new Refreshing(mempool), AppSettings(), _ => (), protocol)
+        val read = app.oracle().get
+        read.box.id shouldBe confirmed.id
+        read.refreshing shouldBe true
+        val order = app.orders().loneElement.box.id.toString
+        refused(app.matchOrder(app.offers().loneElement.box.id.toString, order)) should include("Try again after the next block")
+        app.batchScan().work shouldBe empty
+        app.batchScan().skipped.exists(_.contains("oracle pool is being refreshed")) shouldBe true
+      }
+      // With no refresh pending the match is built and signed.
+      w.app(e).oracle().get.refreshing shouldBe false
+      w.run(e, w.app(e).matchOrder(w.app(e).offers().loneElement.box.id.toString, w.app(e).orders().loneElement.box.id.toString))
+    }
+  }
+
+  property("mempool: coin selection spends confirmed wallet boxes before larger unconfirmed ones") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val b = borrower(ctx)
+      val big = w.fund(b, erg("10"))
+      val small = w.fund(b, erg("1"))
+      val app = new StandardApp(ctx, new FakeNode(w.chain, b) {
+        override def walletUnconfirmedBoxIds(): Set[String] = Set(big.id.toString)
+      }, AppSettings(), _ => (), protocol)
+      def inputs(collateral: String) = {
+        val tx = app.createOrder(loan(collateralErg = erg(collateral), collateral = Seq.empty)(w)).tx
+        scala.collection.JavaConverters.asScalaBuffer(tx.getInputs).map(_.getId.toString).toSet
+      }
+      // Largest first would take the 10 ERG box; it is unconfirmed, so the 1 ERG box pays.
+      inputs("0.5") shouldBe Set(small.id.toString)
+      // When the confirmed boxes cannot cover it, the unconfirmed one is added.
+      inputs("5") shouldBe Set(small.id.toString, big.id.toString)
+    }
+  }
 
   property("session: a box this session spent is never built on, and wallet boxes it spent are left out") {
     withCtx { ctx =>

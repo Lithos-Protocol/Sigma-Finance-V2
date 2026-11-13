@@ -62,6 +62,9 @@ class FakeNode(chain: FakeChain, wallet: ErgoProver) extends NodeApi("http://fak
 
   override def info(): Json = Json.obj("network" -> Json.fromString("mainnet"))
 
+  /** Its mempool is always empty, so reading it or not changes nothing. */
+  override def withMempool(on: Boolean): NodeApi = this
+
   override def indexedHeight(): Json = Json.obj("indexedHeight" -> Json.fromInt(0), "fullHeight" -> Json.fromInt(0))
 
   override def unspentByErgoTree(treeHex: String): Seq[Json] =

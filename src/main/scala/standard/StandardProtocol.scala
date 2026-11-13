@@ -67,8 +67,11 @@ case class StdSettlement(box: InputUTXO, asset: ErgoId, bondId: Array[Byte], liq
   def proceeds: Seq[Token] = box.tokens.drop(1)
 }
 
-/** One read of the USD oracle pool: nanoERG per USD, as the oracle rule reads it. */
-case class OracleState(box: InputUTXO, price: Long, epoch: Int, created: Int)
+/**
+ * One read of the USD oracle pool: nanoERG per USD, as the oracle rule reads it. `refreshing`: a refresh in
+ * the mempool already spends this box, so a transaction reading it fails once that refresh confirms.
+ */
+case class OracleState(box: InputUTXO, price: Long, epoch: Int, created: Int, refreshing: Boolean = false)
 
 /**
  * A request to turn one bond unit into shares: ZC_Standard_FractionalMint, or a market's

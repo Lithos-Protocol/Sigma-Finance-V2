@@ -31,6 +31,9 @@ case class NodeError(status: Int, path: String, reason: String)
 class NodeApi(nodeUrl: String, apiKey: Option[String], val mempool: Boolean = false) {
 
   private val root = nodeUrl.stripSuffix("/")
+
+  /** The same node, reading the mempool or not. */
+  def withMempool(on: Boolean): NodeApi = if (on == mempool) this else new NodeApi(nodeUrl, apiKey, on)
   private val JsonType = MediaType.parse("application/json; charset=utf-8")
   private lazy val http = new OkHttpClient.Builder()
     .connectTimeout(30, TimeUnit.SECONDS)
@@ -93,10 +96,25 @@ class NodeApi(nodeUrl: String, apiKey: Option[String], val mempool: Boolean = fa
     required("/wallet/addresses", get("/wallet/addresses")).asArray.getOrElse(Vector.empty).flatMap(_.asString)
 
   /** The `box` of every unspent box the wallet holds: confirmed ones, and with `mempool` unconfirmed ones too. */
-  def walletUnspentBoxes(): Seq[Json] = pages(WalletPageSize) { (offset, limit) =>
+  def walletUnspentBoxes(): Seq[Json] = walletUnspent().flatMap(_.hcursor.downField("box").focus)
+
+  /**
+   * With `mempool`, the ids of the wallet's unspent boxes that are not on chain yet: coin selection spends
+   * them last, so a transaction does not hang on an unrelated unconfirmed one. Without it, none are listed.
+   */
+  def walletUnconfirmedBoxIds(): Set[String] =
+    if (!mempool) Set.empty
+    else walletUnspent().filter { item =>
+      val c = item.hcursor
+      c.downField("onchain").as[Boolean].toOption.map(!_)
+        .orElse(c.downField("confirmationsNum").as[Option[Int]].toOption.map(_.forall(_ <= 0)))
+        .getOrElse(false)
+    }.flatMap(_.hcursor.downField("box").downField("boxId").as[String].toOption).toSet
+
+  private def walletUnspent(): Seq[Json] = pages(WalletPageSize) { (offset, limit) =>
     get("/wallet/boxes/unspent", Seq("offset" -> offset, "limit" -> limit) ++
       (if (mempool) Seq("minConfirmations" -> -1) else Seq.empty))
-  }.flatMap(_.hcursor.downField("box").focus)
+  }
 
   /**
    * Sign with the wallet's keys. The input boxes go along in serialized form, so the node needs neither a

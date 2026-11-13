@@ -17,7 +17,7 @@ case class AuctionTerms(openingBps: Long, floorBps: Long, length: Long) {
 
 /**
  * What a share request commits to: N shares, the batching fees, the share token's EIP-4, and an auction. The
- * count defaults to zcs1's 1,000,000; a name, description or decimals left out is zcs1's (StandardMetadata).
+ * count defaults to zcs1's 100,000,000; a name, description or decimals left out is zcs1's (StandardMetadata).
  */
 case class ShareTerms(shares: Long = StandardMetadata.ShareCount, pullFee: Long, mintFee: Long,
                       name: Option[String] = None, description: Option[String] = None, decimals: Option[String] = None,
@@ -31,7 +31,8 @@ case class ShareTerms(shares: Long = StandardMetadata.ShareCount, pullFee: Long,
   /** Where these terms depart from zcs1, for a command's notes. */
   def departures(standard: Seq[String]): Seq[String] =
     (if (shares != StandardMetadata.ShareCount)
-      Seq(s"NONSTANDARD share count: zcs1 uses ${StandardMetadata.ShareCount}, so that 1.000000 is one bond") else Seq.empty) ++
+      Seq(s"NONSTANDARD share count: zcs1 uses ${StandardMetadata.ShareCount}, so that 1.0 shares is 1% of the bond")
+    else Seq.empty) ++
       (if (metadata(standard) != standard) Seq(s"NONSTANDARD metadata: zcs1 writes '${standard(0)}', '${standard(1)}', " +
         s"${standard(2)} decimals") else Seq.empty)
 }
@@ -98,8 +99,7 @@ trait StandardShares extends AppBase { self: StandardApp =>
     }
     val script = if (t.auction.isDefined) protocol.market(market).dutchMint else protocol.contracts.fractionalMint
     // zcs1 names the bond in the shares' metadata when the writer knows it, as here.
-    val standard = StandardMetadata.shares(market, t.auction,
-      bondRecord(asset).map(b => StandardMetadata.ShareBond(asset, b.repayment, b.maturity)))
+    val standard = StandardMetadata.shares(market, t.auction, bondFacts(asset))
     val metadata = t.metadata(standard)
     // Registers are dense: R4 to R6 carry a copy of the metadata so R7 to R9 can be set.
     val request = UTXO(script, 2L * MinBox + t.pullFee + t.mintFee, Seq(Token(asset, 1L)),
@@ -116,7 +116,7 @@ trait StandardShares extends AppBase { self: StandardApp =>
 
   /**
    * How a share token's metadata departs from zcs1, read from the request that minted it: its R9 must be
-   * the template with or without its bond, its count 1,000,000, and its issuing box (the mint's OUTPUTS(0))
+   * the template with or without its bond, its count 100,000,000, and its issuing box (the mint's OUTPUTS(0))
    * must leave R7 to R9 empty. Empty when it matches.
    */
   def shareMetadataIssues(shareId: ErgoId): Seq[String] = {
@@ -138,12 +138,12 @@ trait StandardShares extends AppBase { self: StandardApp =>
       Seq(s"its share count is ${req.shares}, not zcs1's ${StandardMetadata.ShareCount}") else Seq.empty
     count ++ market.fold(Seq("its bond asset was not minted by a standard order")) { m =>
       val generic = StandardMetadata.shares(m, auction, None)
-      val named = bondRecord(req.bondAsset).map(b =>
-        StandardMetadata.shares(m, auction, Some(StandardMetadata.ShareBond(req.bondAsset, b.repayment, b.maturity))))
+      val named = bondFacts(req.bondAsset).map(f => StandardMetadata.shares(m, auction, Some(f)))
       val found = req.metadata.map(StandardMetadata.text)
       if (found == generic || named.contains(found)) Seq.empty
       else Seq(s"its name is '${found.headOption.getOrElse("")}', not zcs1's '${named.getOrElse(generic).head}'" +
-        (if (found.lift(2).exists(_ != StandardMetadata.ShareDecimals)) s" (and ${found(2)} decimals, not 6)" else ""))
+        (if (found.lift(2).exists(_ != StandardMetadata.ShareDecimals))
+          s" (and ${found(2)} decimals, not ${StandardMetadata.ShareDecimals})" else ""))
     }
   }
 
@@ -277,7 +277,7 @@ trait StandardShares extends AppBase { self: StandardApp =>
       if (burned < 1L || burned > held) fail(s"claim 1 to $held shares")
       if (burned >= v.outstanding) fail(s"$burned is every outstanding share: that is a final claim, which needs them all")
       if (v.holding) fail("the bond has not settled into the vault yet: pull it first, or make a final claim with every share")
-      val ended = height.toLong + 1L >= v.auction.lift(4).getOrElse(0L) + v.auction.lift(3).getOrElse(0L)
+      val ended = height.toLong >= v.auction.lift(4).getOrElse(0L) + v.auction.lift(3).getOrElse(0L)
       if (v.auctionOpen && !ended) fail(s"the auction runs until height ${v.auction(4) + v.auction(3)}; claims wait for it")
       def part(n: Long): Long = (BigInt(n) * burned / v.outstanding).toLong
       val paidErg = part(v.box.value)

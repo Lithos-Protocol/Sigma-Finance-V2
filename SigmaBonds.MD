@@ -204,8 +204,8 @@ unit. As with the bond, the box holding N+1 shares is the shares' state box.
 - **Final claim**: burn every outstanding share and the reserve, and take everything. Before the pull,
   holding all shares returns the bond unit itself.
 
-Share count N is free and decimals are display only. The off-chain rules set N = 1,000,000 with 6
-decimals (see "Off-chain rules").
+Share count N is free and decimals are display only. The off-chain rules set N = 100,000,000 with 6
+decimals, 100 shares in all (see "Off-chain rules").
 
 ## Dutch auction shares
 
@@ -343,13 +343,14 @@ input. In brief:
   seller by hash puts that script's ErgoTree in context variable 64 of `INPUTS(0)`, unless an input or
   output already carries it. Any batcher then finds every script in one lookup. Batchers skip boxes
   that do not do this. Variables 64 to 127 are reserved for off-chain data.
-- **Token metadata** (recommended). One name and description template for bond units and shares,
-  such as `ZCS-SigUSD-B-1733600-3fa2c1`, built only from chain data, so any client writes the same
-  bytes and readers can flag a mismatch. Shares minted through a lend offer omit the bond, which
-  the offer cannot know when it is posted.
-- **Share count** (recommended). N = 1,000,000 with 6 decimals, so `1.000000` is one bond, and share
-  prices are quoted as a percentage of face. It stays off-chain: it protects no value, and enforcing
-  it would change both mints and the lend offer.
+- **Token metadata** (recommended). Short names such as `ZCS-Bond-Unit-3fa2c1`,
+  `ZCS-Bond-Shares-3fa2c1` and `ZCS-Bond-Auction-Shares-3fa2c1`, and descriptions that state the
+  bond's terms in a few sentences from a fixed grammar. Both are built only from chain data, so any
+  client writes the same bytes and readers can flag a mismatch. Shares minted through a lend offer
+  omit the bond, which the offer cannot know when it is posted.
+- **Share count** (recommended). 100 shares with 6 decimals (N = 100,000,000), so `1.000000` is 1%
+  of the bond, and share prices are quoted as a percentage of face. It stays off-chain: it protects
+  no value, and enforcing it would change both mints and the lend offer.
 - **Maturity grid** (recommended). Fixed maturities snap to multiples of 21,600 blocks (about 30
   days), so bonds of a market maturing in the same month share one height.
 - **Batching.** Pack refunds and liquidations into one transaction (the CLI's `pack`), chain fills

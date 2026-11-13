@@ -190,6 +190,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
       o.feeReserve, start, maturity)
     val oracle = Try(self.oracle()).toOption.flatten
     offerRefusal(o, bond, order.principal, 1L, 1L, oracle).foreach(r => fail(s"the offer refuses this order: $r"))
+    oracle.foreach(readableOracle)
 
     val rule = protocol.ruleOf(order.liqHash).getOrElse(fail("the order names a liquidation expression this client does not know"))
     val (delivery, funding) = unitDelivery(o, asset, bondMetadata(order, rule, start, maturity))
@@ -231,6 +232,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     val price = if (o.market.token.isEmpty) math.max(askPrice(ask, n)._1, MinBox) else askPrice(ask, n)._1
     val oracle = Try(self.oracle()).toOption.flatten
     offerRefusal(o, bond, price, n, whole, oracle).foreach(r => fail(s"the offer refuses this ask: $r"))
+    oracle.foreach(readableOracle)
 
     val originBytes = nodeApi.boxById(asset.toString).filter(j => NodeJson.spentBy(j).isDefined)
       .flatMap(j => Try(NodeJson.box(j)).toOption).map(_.bytes).getOrElse(fail(s"the order that minted $asset is not in the node's index"))

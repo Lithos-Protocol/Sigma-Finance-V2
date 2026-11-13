@@ -110,45 +110,63 @@ comes from the chain (see "Displaying a token").
 
 ### Names
 
+Names are short and say only what a token is. The terms go in the description.
+
 ```
-name     = "ZCS-" market "-" kind [ "-" maturity "-" id6 ]
-market   = the market's name: "ERG" or "SigUSD"
-kind     = "B"            a bond unit
-         | "S"            shares from ZC_Standard_FractionalMint
-         | "D" floor      shares from ZC_Standard_DutchAuctionMint; floor in percent of the repayment
-maturity = the bond's maturity height
+name     = "ZCS-Bond-" kind [ "-" id6 ]
+kind     = "Unit"             a bond unit
+         | "Shares"           shares from ZC_Standard_FractionalMint
+         | "Auction-Shares"   shares from ZC_Standard_DutchAuctionMint
 id6      = the first 6 lowercase hexadecimal characters of the bond asset id
 ```
 
-Bond units always carry the suffix. Shares carry it when the writer knows the bond (`fractionalize`)
-and leave it out when the writer does not (an offer). Wallets that sort by name then group tokens by
-market, then by kind, then by maturity.
+Bond units always carry the suffix, and for them it is the start of the token's own id. Shares carry
+the bond's suffix when the writer knows the bond (`fractionalize`) and leave it out when the writer
+does not (an offer). A share's own token id cannot be the suffix: it is the mint request's box id,
+which is a hash over the request's registers, the name among them.
 
 | Token | Name |
 |---|---|
-| Bond unit | `ZCS-SigUSD-B-1733600-3fa2c1` |
-| Shares of that bond, from `fractionalize` | `ZCS-SigUSD-S-1733600-3fa2c1` |
-| Dutch shares of that bond, 90% floor | `ZCS-SigUSD-D90-1733600-3fa2c1` |
-| Shares delivered through a SigUSD offer | `ZCS-SigUSD-S`, or `ZCS-SigUSD-D90` |
+| Bond unit | `ZCS-Bond-Unit-3fa2c1` |
+| Shares of that bond, from `fractionalize` | `ZCS-Bond-Shares-3fa2c1` |
+| Dutch auction shares of that bond | `ZCS-Bond-Auction-Shares-3fa2c1` |
+| Shares delivered through an offer | `ZCS-Bond-Shares`, or `ZCS-Bond-Auction-Shares` |
 
 ### Descriptions
 
-Each description is one sentence a wallet can show, tagged with the profile version. Machines read
-the chain, not the description.
+Each description is a few plain English sentences a wallet can show, built from the grammar below and
+ending in `Verify on chain.` Machines read the chain, not the description.
+
+```
+unit-desc   = "ZC Standard bond. It " terms " Verify on chain."
+share-desc  = "ZC Standard shares. 1.0 shares equals 1% of " what [ " " auction ] " Verify on chain."
+what        = "bond " id6 ". The bond " terms                          bond known
+            | article " " market " bond bought by a lend offer."      bond unknown
+terms       = "lent " amount " at height " start " and repays " amount " at height " maturity ". " rule
+rule        = "It liquidates at maturity if unpaid."                                   MaturityLiquidation
+            | "It liquidates below " pct "% collateral, or at maturity if unpaid."     oracle rule with a ratio
+            | "It liquidates under liquidation rule " hex8 "."                         any other
+auction     = "If liquidated, its collateral is auctioned from " pct "% down to " pct
+              "% of the repayment over " length " blocks."
+amount      = number " " market
+market      = the market's name: "ERG" or "SigUSD"
+article     = "an" before a market name starting with a vowel letter ("an ERG"), otherwise "a"
+pct         = basis points over 100: the ratio is borrower value 7, the auction's opening and floor
+hex8        = the first 8 lowercase hexadecimal characters of the rule's hash
+```
 
 | Token | Description |
 |---|---|
-| Bond unit | `zcs1 bond: repays {R} {market} at height {maturity}; lent {P} at height {start}; {rule}. Verify on chain.` |
-| Shares, bond known | `zcs1 shares: 1.000000 = one bond {id6} repaying {R} {market} at height {maturity}.{auction} Verify on chain.` |
-| Shares, bond unknown | `zcs1 shares: 1.000000 = one {market} bond.{auction} Verify on chain.` |
+| Bond unit, oracle rule (177 bytes) | `ZC Standard bond. It lent 100 SigUSD at height 1712000 and repays 105.5 SigUSD at height 1749600. It liquidates below 150% collateral, or at maturity if unpaid. Verify on chain.` |
+| Bond unit, maturity rule | `ZC Standard bond. It lent 0.1 ERG at height 1915530 and repays 0.11 ERG at height 1922400. It liquidates at maturity if unpaid. Verify on chain.` |
+| Shares, bond known | `ZC Standard shares. 1.0 shares equals 1% of bond 3fa2c1. The bond lent 100 SigUSD at height 1712000 and repays 105.5 SigUSD at height 1749600. It liquidates below 150% collateral, or at maturity if unpaid. Verify on chain.` |
+| Dutch auction shares, bond known (321 bytes, the longest) | The same, then `If liquidated, its collateral is auctioned from 100% down to 90% of the repayment over 720 blocks.` before `Verify on chain.` |
+| Shares, bond unknown | `ZC Standard shares. 1.0 shares equals 1% of a SigUSD bond bought by a lend offer. Verify on chain.` |
+| Dutch auction shares, bond unknown | `ZC Standard shares. 1.0 shares equals 1% of an ERG bond bought by a lend offer. If liquidated, its collateral is auctioned from 100% down to 90% of the repayment over 720 blocks. Verify on chain.` |
 
-- `{rule}` is `liquidates at maturity` for `MaturityLiquidation`, `liquidates below {ratio}% or at
-  maturity` for an oracle rule with a ratio (borrower value 7), and `liquidation rule {first 8 hex of
-  its hash}` for any other.
-- `{auction}` is empty for standard shares, and for Dutch shares
-  ` If liquidated, auctioned from {opening}% to {floor}% of the repayment over {length} blocks.`
-- Example, about 120 bytes: `zcs1 bond: repays 105 SigUSD at height 1733600; lent 100 at height
-  1712000; liquidates below 150% or at maturity. Verify on chain.`
+A share's bond terms are the same sentences as its bond unit's, so a holder reads the whole bond
+from the share token. An offer's metadata is fixed before it buys anything, so shares it delivers
+name only the market and any auction.
 
 **Formatting**, so that every client writes the same bytes: ASCII only, encoded as EIP-4 `Coll[Byte]`.
 Amounts are in the market's unit (ERG has 9 decimals, SigUSD 2), with trailing zeros and a trailing
@@ -158,9 +176,11 @@ way (`90`, `90.5`). Heights and block counts are plain integers.
 Decimals (R6) are `0` for a bond unit, which the order enforces, and `6` for shares (see "Share
 count").
 
-The description is short on purpose. The bond's registers already hold every term, and a fill is
-built by batchers, whose block space is limited by size before cost (see "Cost and size" in
-SigmaBonds.MD).
+Descriptions are kept short. The bond's registers already hold every term, and a fill is built by
+batchers, whose block space is limited by size before cost (see "Cost and size" in SigmaBonds.MD). A
+bond unit's description is about 145 to 180 bytes. Shares that name their bond have the longest
+descriptions, but the owner writes those with `fractionalize`, not a batcher in a fill. Shares an offer
+delivers, which a batcher's fill does write, carry the short form.
 
 ### Checking metadata
 
@@ -189,22 +209,26 @@ Clients show a SigmaFi token from the chain and use EIP-4 only when they cannot 
 
 ## Share count (recommended)
 
-**N = 1,000,000 and 6 decimals**, for every share token, on every path: `fractionalize`, an offer's
-delivery and a Dutch mint. A wallet then shows `1.000000` as one whole bond.
+**100 shares with 6 decimals, so N = 100,000,000 raw shares**, for every share token, on every path:
+`fractionalize`, an offer's delivery and a Dutch mint. A wallet then shows `100.000000` as the whole
+bond, and `1.000000` (1.0 shares) as 1% of the vault's value.
 
 - Share prices are quoted as a **percentage of face**: a price p for u raw shares of a bond repaying R
   is `p × N / (u × R)`. That figure compares across bonds of any size.
 - Rounding: a claim of u raw shares takes `floor(balance × u / N)` of each asset. Clients sell and
   claim in lots of at least `ceil(N / R)` raw shares, so the repayment asset never rounds to zero, and
-  they warn when an in-kind claim would round a collateral token to zero.
-- It fits every bond the contracts allow. With R in raw units, one raw share is worth `R / 1,000,000`:
-  1,000 nanoERG on a 1 ERG bond, or one cent on a 10,000 SigUSD bond.
+  they warn when an in-kind claim would round a collateral token to zero. On a bond repaying 105.5
+  SigUSD that lot is 9,479 raw shares (0.009479 shares, one cent).
+- It fits every bond the contracts allow: N is under their 1,000,000,000 cap, and every contract
+  product involving N (claims, Dutch pricing, the offer's yield test, NAV pricing) is computed in
+  `BigInt`, so a large N cannot overflow. With R in raw units, one raw share is worth
+  `R / 100,000,000`: 10 nanoERG on a 1 ERG bond, or one cent on a 1,000,000 SigUSD bond.
 
 **Considered: par shares**, where `1` share is one unit of the repayment asset at maturity. They quote
 more naturally, but N then depends on R, which a lend offer does not know when it is posted, and an
 ERG bond above 1 ERG would need N scaled to stay under 1,000,000,000.
 
-**Why not in the contracts.** Enforcing N = 1,000,000 and decimals `6` in both mints would make
+**Why not in the contracts.** Enforcing N = 100,000,000 and decimals `6` in both mints would make
 nonstandard shares impossible, at these costs:
 
 - It protects no value. The vaults pay pro rata for any N, and the offer's yield test (`R × u` against
@@ -216,7 +240,7 @@ nonstandard shares impossible, at these costs:
 
 Readers already learn N from the chain (the request's R8, the vault's R5), so a nonstandard N costs
 nobody anything but uniformity. The off-chain rule keeps that uniformity: clients always write
-1,000,000, and readers flag anything else.
+100,000,000, and readers flag anything else.
 
 ## Maturity grid (recommended)
 
@@ -255,7 +279,18 @@ A batcher following this profile:
   each spending the last one's continuation. The batcher runs in rounds, scanning again after each,
   and reads the mempool: unspent listings with `includeUnconfirmed=true&excludeMempoolSpent=true`,
   a box by id from `/utxo/withPool/byId/{boxId}`, and wallet boxes with `minConfirmations=-1`. So
-  all three can land in one block. It never builds on a box it has already spent.
+  all three can land in one block. It never builds on a box it has already spent. It pays fees from
+  confirmed wallet boxes first: a transaction paying with unconfirmed change fails with whatever made
+  that change. (Seen live: one dropped transaction took 14 unrelated ones with it.)
+- **Reads the oracle from the chain, never the mempool.** Oracles race to refresh the USD pool, and the
+  losing refresh's box never exists, so a data input read from the mempool can vanish, and with it the
+  transaction and everything chained on it (seen live). While a refresh in the mempool spends the
+  confirmed pool box, anything reading it waits for the next block: it would fail once the refresh
+  confirms.
+- **Checks heights where the signer runs scripts.** The node wallet signs at the current height h and a
+  transaction lands at h + 1 or later. A path open only before height X needs h + 1 < X; a path open
+  from X on (an expiry refund, a maturity liquidation, the end of a wait) needs h ≥ X. Planning the
+  latter for h + 1 makes the signer refuse at X − 1 (seen live, on every kind of refund).
 - **Uses a fixed matching order.** Offers are taken by batcher fee, highest first. Each takes the order
   or ask that gives it the highest yield, `(R / P − 1) × 262800 / D`. Ties go to the lower box id. No
   contract enforces this, but every batcher following the profile behaves the same way.
@@ -293,7 +328,7 @@ when the order's oracle age is at least the offer's. The values are the CLI's cu
 | ERG carried by a SigUSD offer for fees | 0.5 ERG | — |
 | Ask minimum fill, offer minimum price | 1 raw unit | — |
 | NAV ask margin | 0% | above −100% |
-| Share count, decimals | 1,000,000, 6 | 1 to 1,000,000,000 |
+| Share count, decimals | 100,000,000 (100 shares), 6 | 1 to 1,000,000,000 |
 
 No defaults, ever: principal, repayment, collateral, maturity, liquidation ratio, yield, collateral
 floor, an ask's price or `--nav`, and a Dutch auction's opening, floor and length.
@@ -306,7 +341,7 @@ floor, an ask's price or `--nav`, and a Dutch auction's opening, floor and lengt
 - Heights with an approximate date at 2 minutes per block.
 - Share prices as a percentage of face (see "Share count").
 - Flags for anything a reader could not verify: an unverified origin, an unknown expression,
-  nonstandard metadata, a share count other than 1,000,000.
+  nonstandard metadata, a share count other than 100,000,000.
 
 ## Open items
 
@@ -318,11 +353,12 @@ floor, an ask's price or `--nav`, and a Dutch auction's opening, floor and lengt
    sign, so a dApp can write variable 64. The node wallet's `/wallet/transaction/sign` takes them.
 3. Confirm the mempool lookups on a live node. The parameter names come from the node's source
    (`BlockchainApiRoute`, `UtxoApiRoute`, `WalletApiRoute`). A live node (6.1.7) accepts the unspent
-   lookups' `includeUnconfirmed` and `excludeMempoolSpent`; this was checked read-only on 2026-11-12,
-   with nothing in its mempool. Whether they find unconfirmed boxes, and whether the wallet's
-   `minConfirmations=-1` also leaves out boxes spent in the mempool, is still open. `sbt livetest`
-   chains its steps through these lookups and reports any step that only passed once its inputs
-   confirmed. The CLI also remembers what its own session spent.
+   lookups' `includeUnconfirmed` and `excludeMempoolSpent`. On 2026-11-12 the first `sbt livetest` run
+   chained 38 transactions through them, with no chained step failing to build: the lookups find
+   unconfirmed boxes and leave out mempool spends (the oracle pool box spent by a pending refresh was
+   left out), the wallet lists unconfirmed change, and `/transactions/check` accepts chains. Whether the
+   wallet's `minConfirmations=-1` also leaves out boxes spent in the mempool is still unknown, since the
+   CLI remembers what its own session spent.
 4. Specs for packing pulls, and for several refunds or liquidations of one owner in a single
    transaction, in the contract harness.
 5. Check how wallets show the supply of a bond unit (3, issued across two outputs) and of shares (2N+1).
@@ -334,7 +370,7 @@ floor, an ask's price or `--nav`, and a Dutch auction's opening, floor and lengt
 | Script disclosure | Every transaction it builds discloses, in variable 64 of `INPUTS(0)`, each script its outputs name that no input or output carries; a summary line says so. It resolves a script in one lookup, keeps what it found for the session, and refuses or passes over a box that does not disclose. Orders no longer carry the R8 hint. |
 | Bond metadata | The zcs1 template on every fill, by a wallet or a matched offer. `bonds` prints `metadata: zcs1` or what departs from it. |
 | Share metadata | The zcs1 template: with the bond for `fractionalize`, without it for an offer's delivery. `--share-name`, `--share-description` and `--decimals` override it and are flagged NONSTANDARD. `shares` and `offers` check every request, vault and offer. |
-| Share count | 1,000,000 by default (`--shares` overrides, flagged). `create-offer --deliver-shares` is a flag. `asks` quotes a percentage of face; a share ask's `--min-fill` defaults to the least lot; a partial claim warns when an asset rounds to nothing. |
+| Share count | 100,000,000 (100 shares) by default (`--shares` overrides, flagged). `create-offer --deliver-shares` is a flag. `asks` quotes a percentage of face; a share ask's `--min-fill` defaults to the least lot; a partial claim warns when an asset rounds to nothing. |
 | Maturity grid | `create-order --maturity` and `--term` snap to the grid; `--exact-maturity` keeps the height. |
 | Batching | `pack` for refunds and liquidations; `batch --run` packs, ranks offers and their sources, and runs up to 5 rounds with mempool lookups. `--mempool` turns those lookups on for any command. |
 | Defaults | As in the table above |

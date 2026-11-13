@@ -70,7 +70,7 @@ object OldCommands {
 
   private def listBonds(app: SigmaFiApp, node: NodeApi, mine: Boolean, liquidatable: Boolean): Unit = {
     indexStatus(node).foreach(System.err.println)
-    def matured(b: BondInfo) = app.height.toLong + 1L >= b.maturity
+    def matured(b: BondInfo) = app.height.toLong >= b.maturity
     val bonds = app.bonds()
       .filter(b => !liquidatable || matured(b) && app.protocol.liquidationOf(b.liqScriptHash).nonEmpty)
       .filter(b => !mine || app.isWalletHash(b.borrowerHash) || app.walletHolds(b.asset))

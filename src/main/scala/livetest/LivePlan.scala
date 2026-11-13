@@ -129,6 +129,9 @@ object LivePlan {
   val TokenName = "SigmaFi live test"
   val TokenDescription = "Test collateral minted by the SigmaFi live test. It has no value."
 
+  /** 1% of a zcs1 share token in raw units (1.0 shares), so share steps read as percentages. */
+  val SharePct: Long = standard.StandardMetadata.ShareCount / 100
+
   /** The least the wallet should hold before starting: about twice the most the plan locks at once. */
   val MinimumBalance = "4"
 
@@ -213,8 +216,8 @@ object LivePlan {
       after = Seq("E6"), settled = Seq("E2"), binds = Seq(out("reqE", 0))),
     tx("E8", "D/E Dutch", "Mint the Dutch shares (this wallet as batcher)", "mint-shares {reqE}", after = Seq("E7"),
       binds = Seq(out("vaultE", 1))),
-    tx("E9", "D/E Dutch", "Sell 40% of the Dutch shares at a fixed 0.04 ERG", "sell {reqE} --amount 400000 --price 0.04",
-      after = Seq("E8"), binds = Seq(out("askE", 0))),
+    tx("E9", "D/E Dutch", "Sell 40% of the Dutch shares at a fixed 0.04 ERG",
+      s"sell {reqE} --amount ${40 * SharePct} --price 0.04", after = Seq("E8"), binds = Seq(out("askE", 0))),
     tx("E10", "D/E Dutch", "The offer buys the Dutch shares from the ask", "match-offer {offer1} --ask {askE}",
       after = Seq("E9", "E6"), settled = Seq("E7"), binds = Seq(out("offer1", 2))),
     tx("E11", "D/E Dutch", "Cancel what is left of the offer", "cancel-offer {offer1}", after = Seq("E10")),
@@ -228,7 +231,7 @@ object LivePlan {
       after = Seq("E12")),
     tx("E14", "D/E Dutch", "Buy the auction's lot (the test tokens) at its current price", "buy-lot {vaultE}",
       after = Seq("E12", "E13"), binds = Seq(out("vaultE", 0)), check = Check.VaultState("vaultE", 2)),
-    tx("E15", "D/E Dutch", "Claim 30% of the Dutch shares", "claim-shares {reqE} --amount 300000",
+    tx("E15", "D/E Dutch", "Claim 30% of the Dutch shares", s"claim-shares {reqE} --amount ${30 * SharePct}",
       after = Seq("E14", "E10"), binds = Seq(out("vaultE", 1))),
     tx("E16", "D/E Dutch", "Final claim on the Dutch shares", "claim-shares {reqE}", after = Seq("E15"),
       check = Check.TokenGone("reqE")),
@@ -243,22 +246,22 @@ object LivePlan {
       binds = Seq(out("bondA", 1))),
     refusal("A2x", "A shares", "Bond A cannot be claimed before it settles", "claim {orderA}",
       "has not been repaid or liquidated yet", after = Seq("A2")),
-    tx("A3", "A shares", "Fractionalize bond A's unit into 1,000,000 shares", "fractionalize {orderA}",
+    tx("A3", "A shares", "Fractionalize bond A's unit into 100 shares (zcs1)", "fractionalize {orderA}",
       settled = Seq("A2"), binds = Seq(out("reqA", 0))),
     read("A4", "A shares", "The share request lists", "shares --mine", Seq("{reqA}"), after = Seq("A3")),
     tx("A5", "A shares", "Mint bond A's shares (this wallet as batcher)", "mint-shares {reqA}", after = Seq("A3", "A4"),
       binds = Seq(out("vaultA", 1))),
-    tx("A6", "A shares", "Sell 40% of the shares at a fixed 0.04 ERG", "sell {reqA} --amount 400000 --price 0.04",
-      after = Seq("A5"), binds = Seq(out("askA", 0))),
+    tx("A6", "A shares", "Sell 40% of the shares at a fixed 0.04 ERG",
+      s"sell {reqA} --amount ${40 * SharePct} --price 0.04", after = Seq("A5"), binds = Seq(out("askA", 0))),
     read("A7", "A shares", "The ask lists, priced against face value", "asks --mine", Seq("{askA}", "of face"),
       after = Seq("A6")),
-    tx("A8", "A shares", "Buy 100,000 of the shares back with the wallet", "buy {askA} --amount 100000",
+    tx("A8", "A shares", "Buy 10% of the shares back with the wallet", s"buy {askA} --amount ${10 * SharePct}",
       after = Seq("A6", "A7"), binds = Seq(out("askA", 1))),
     tx("A9", "A shares", "Cancel the rest of the ask", "cancel-ask {askA}", after = Seq("A8")),
     tx("A10", "A shares", "Repay bond A", "repay {bondA}", after = Seq("A5", "A2x")),
     tx("A11", "A shares", "Pull the repaid bond into the share vault", "pull {vaultA}", after = Seq("A10", "A5"),
       binds = Seq(out("vaultA", 0)), check = Check.VaultState("vaultA", 0)),
-    tx("A12", "A shares", "Claim 25% of the shares", "claim-shares {reqA} --amount 250000", after = Seq("A11"),
+    tx("A12", "A shares", "Claim 25% of the shares", s"claim-shares {reqA} --amount ${25 * SharePct}", after = Seq("A11"),
       binds = Seq(out("vaultA", 1))),
     tx("A13", "A shares", "Final claim on the shares", "claim-shares {reqA}", after = Seq("A12", "A9"),
       check = Check.TokenGone("reqA")),

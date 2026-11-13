@@ -90,8 +90,8 @@ object SigmaFiCli {
       |               [--decimals <d>] [--pull-fee <ERG>] [--mint-fee <ERG>]
       |               [--dutch --auction-opening <percent> --auction-floor <percent> --auction-length <blocks>]
       |      deposits a bond unit you hold; any batcher mints the shares to you. Fees default to 0.005 ERG.
-      |      zcs1 defaults: 1000000 shares with 6 decimals (1.000000 = one bond), and a name and description
-      |      built from the bond, such as ZCS-SigUSD-S-1749600-3fa2c1. Overriding any of them is nonstandard.
+      |      zcs1 defaults: 100000000 shares with 6 decimals (1.000000 = 1% of the bond), and a name and
+      |      description built from the bond, such as ZCS-Bond-Shares-3fa2c1. Overriding any of them is nonstandard.
       |  mint-shares <request box id>       anyone: mint a request's shares; keeps the mint fee
       |  cancel-share-request <request box id>
       |  pull <share vault box id>          anyone: pull a settled bond into its share vault; keeps the pull fee
@@ -117,8 +117,8 @@ object SigmaFiCli {
       |               [--deliver-shares [share and --dutch options as for fractionalize]]
       |      Buys only bonds with the oracle liquidation rule: its policy measures their collateral. --fees is the
       |      ERG a SigUSD offer carries for fees and box minimums (default 0.5). --deliver-shares has a batcher
-      |      mint each bond unit into shares for you; their zcs1 name leaves the bond out (ZCS-SigUSD-S), since
-      |      the offer cannot know it yet.
+      |      mint each bond unit into shares for you; their zcs1 name leaves the bond out (ZCS-Bond-Shares),
+      |      since the offer cannot know it yet.
       |  cancel-offer <offer box id>
       |  refund-offer <offer box id>        anyone, after expiry; keeps the batcher fee
       |  match-offer <offer box id> (--order <order box id> | --ask <ask box id> [--amount <n>])

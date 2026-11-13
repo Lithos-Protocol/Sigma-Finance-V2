@@ -46,7 +46,7 @@ trait StandardBatch extends AppBase { self: StandardApp =>
   // ═══ PIECES ═══════════════════════════════════════════════════════════════
 
   private[standard] def orderRefund(order: StdOrder): Piece = {
-    if (height.toLong + 1L < order.expiry) fail(s"the order expires at height ${order.expiry}; it can be refunded from then on")
+    if (height.toLong < order.expiry) fail(s"the order expires at height ${order.expiry}; it can be refunded from then on")
     if (order.expiryFee < MinBatchingFee || order.expiryFee > order.box.value - MinBox)
       fail("the order's expiry fee is outside its contract's bounds, so only its borrower can cancel it")
     val refund = UTXO(Contract(borrowerTree(order.borrowerHash, order.box)), order.box.value - order.expiryFee,
@@ -57,7 +57,7 @@ trait StandardBatch extends AppBase { self: StandardApp =>
   }
 
   private[standard] def offerRefund(o: StdOffer): Piece = {
-    if (height.toLong + 1L < o.expiry) fail(s"the offer expires at height ${o.expiry}; it can be refunded from then on")
+    if (height.toLong < o.expiry) fail(s"the offer expires at height ${o.expiry}; it can be refunded from then on")
     if (o.batcherFee < 0L || o.batcherFee > o.box.value - MinBox) fail("the offer's fee leaves no box minimum: only its owner can cancel it")
     val refund = UTXO(Contract(ownerTree(o.ownerHash, o.box, "offer owner")), o.box.value - o.batcherFee, o.box.tokens,
       Seq(bytesValue(o.box.id.getBytes)))
@@ -67,7 +67,7 @@ trait StandardBatch extends AppBase { self: StandardApp =>
   }
 
   private[standard] def askRefund(ask: StdAsk): Piece = {
-    if (height.toLong + 1L < ask.expiry) fail(s"the ask expires at height ${ask.expiry}; it can be refunded from then on")
+    if (height.toLong < ask.expiry) fail(s"the ask expires at height ${ask.expiry}; it can be refunded from then on")
     val refund = UTXO(Contract(ownerTree(ask.sellerHash, ask.box, "seller")), math.min(MinBox, ask.box.value),
       Seq(ask.token), Seq(bytesValue(ask.box.id.getBytes)))
     Piece(ask.box.id.toString, i => ask.box.withCtxVar(0.toByte, intValue(i)), Seq(refund), ask.box.value - refund.value,
@@ -81,12 +81,12 @@ trait StandardBatch extends AppBase { self: StandardApp =>
    */
   private[standard] def liquidation(b: StdBond): Piece = {
     val rule = protocol.ruleOf(b.liqHash).getOrElse(fail(s"bond ${b.box.id} names a liquidation expression this client does not know"))
-    val matured = height.toLong + 1L >= b.maturity
+    val matured = height.toLong >= b.maturity
     val reads = rule match {
       case AtMaturity(_) if !matured => fail(s"bond ${b.box.id} matures at height ${b.maturity}; it can be liquidated from then on")
       case OracleRatio(_, _) if !matured =>
         if (b.payload.size < 2) fail(s"bond ${b.box.id} has no oracle terms; it can be liquidated from maturity, height ${b.maturity}")
-        val price = oracleNow.getOrElse(fail("the node's index has no single USD oracle pool box"))
+        val price = readableOracle(oracleNow.getOrElse(fail("the node's index has no single USD oracle pool box")))
         val (ratio, age) = (b.payload(0), b.payload(1))
         if (height.toLong + 1L - price.created > age)
           fail(s"the oracle price is from height ${price.created}, older than bond ${b.box.id} accepts ($age blocks)")
@@ -147,7 +147,13 @@ trait StandardBatch extends AppBase { self: StandardApp =>
   def batchScan(): BatchScan = {
     val work = mutable.ArrayBuffer.empty[Work]
     val skipped = mutable.LinkedHashMap.empty[String, String]
-    val next = height.toLong + 1L
+    // Paths open from a height count at the signing height; ones open before it, at the next block.
+    val now = height.toLong
+    val next = now + 1L
+    // While a refresh in the mempool spends the oracle box, nothing that reads it can be built.
+    val usableOracle = oracleNow.filterNot(_.refreshing)
+    if (oracleNow.exists(_.refreshing))
+      skipped("oracle") = "offer matches and early oracle liquidations: the oracle pool is being refreshed; next block"
     def alone(fee: Long) = fee > minerFee
     def served(hash: Array[Byte], box: InputUTXO, what: String, who: String): Boolean = {
       val ok = discloses(hash, box)
@@ -170,7 +176,7 @@ trait StandardBatch extends AppBase { self: StandardApp =>
     val liveBonds = self.bonds()
     liveBonds.foreach { b =>
       val rule = protocol.ruleOf(b.liqHash)
-      val due = rule.isDefined && (next >= b.maturity || ((rule, oracleNow) match {
+      val due = rule.isDefined && (now >= b.maturity || ((rule, usableOracle) match {
         case (Some(OracleRatio(_, _)), Some(o)) if b.payload.size >= 2 =>
           next - o.created <= b.payload(1) && protocol.cover(b, o.price).exists { case (c, d) => c * 10000 < d * b.payload(0) }
         case _ => false
@@ -180,17 +186,17 @@ trait StandardBatch extends AppBase { self: StandardApp =>
     }
 
     val openOrders = orders()
-    openOrders.filter(o => next >= o.expiry && o.expiryFee >= MinBatchingFee && o.expiryFee <= o.box.value - MinBox &&
+    openOrders.filter(o => now >= o.expiry && o.expiryFee >= MinBatchingFee && o.expiryFee <= o.box.value - MinBox &&
       served(o.borrowerHash, o.box, "order", "borrower")).foreach { o =>
       work += packWork(s"return expired order ${o.box.id} to its borrower", s"refund-order ${o.box.id}", o.expiryFee, o.box.id.toString)
     }
     val allOffers = offers()
-    allOffers.filter(o => next >= o.expiry && o.batcherFee > 0L && o.batcherFee <= o.box.value - MinBox &&
+    allOffers.filter(o => now >= o.expiry && o.batcherFee > 0L && o.batcherFee <= o.box.value - MinBox &&
       served(o.ownerHash, o.box, "lend offer", "owner")).foreach { o =>
       work += packWork(s"return expired offer ${o.box.id} to its owner", s"refund-offer ${o.box.id}", o.batcherFee, o.box.id.toString)
     }
     val openAsks = asks()
-    openAsks.filter(a => next >= a.expiry && a.box.value > MinBox && served(a.sellerHash, a.box, "ask", "seller")).foreach { a =>
+    openAsks.filter(a => now >= a.expiry && a.box.value > MinBox && served(a.sellerHash, a.box, "ask", "seller")).foreach { a =>
       work += packWork(s"return expired ask ${a.box.id} to its seller", s"refund-ask ${a.box.id}", a.box.value - MinBox,
         a.box.id.toString)
     }
@@ -207,7 +213,7 @@ trait StandardBatch extends AppBase { self: StandardApp =>
           val maturity = if (order.onClose) height.toLong + order.terms(3) else order.terms(3)
           val bond = StdBond(order.box, order.market, order.terms, order.principalTokens, order.borrowerHash,
             order.liqHash, o.feeReserve, height.toLong, maturity)
-          if (offerRefusal(o, bond, order.principal, 1L, 1L, oracleNow).nonEmpty) None
+          if (offerRefusal(o, bond, order.principal, 1L, 1L, usableOracle).nonEmpty) None
           else Some((impliedYield(o, order.repayment, order.principal, 1L, 1L, maturity), order.box.id.toString,
             Work(s"fill order ${order.box.id} from offer ${o.box.id}", s"match-offer ${o.box.id} --order ${order.box.id}",
               o.batcherFee, Set(o.box.id.toString, order.box.id.toString))))
@@ -219,7 +225,7 @@ trait StandardBatch extends AppBase { self: StandardApp =>
             val bond = liveBonds.find(_.asset == asset).get
             val price = if (o.market.token.isEmpty) math.max(askPrice(a, units)._1, MinBox) else askPrice(a, units)._1
             if (units < a.minFill && units != a.token.amount) None
-            else if (offerRefusal(o, bond, price, units, whole, oracleNow).nonEmpty) None
+            else if (offerRefusal(o, bond, price, units, whole, usableOracle).nonEmpty) None
             else Some((impliedYield(o, bond.repayment, price, units, whole, bond.maturity), a.box.id.toString,
               Work(s"buy $units of ${a.token.id} from ask ${a.box.id} with offer ${o.box.id}",
                 s"match-offer ${o.box.id} --ask ${a.box.id}" + (if (units != a.token.amount) s" --amount $units" else ""),

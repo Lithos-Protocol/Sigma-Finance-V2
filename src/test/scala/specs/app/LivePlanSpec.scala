@@ -118,7 +118,27 @@ class LivePlanSpec extends AnyPropSpec with Matchers {
     val s = LiveState(started = true, chain = false, maturityBlocks = 33, address = Some("9addr"),
       vars = Map("orderA" -> "aa", "M" -> "123"),
       steps = Map("A1" -> StepState(StepState.InFlight, Vector("tx1"), Vector(Vector("o0", "o1")), Some("create-order"),
-        Vector("note"), Vector("S1"), attempts = 2, misses = 1, firstMiss = 99L, ranAt = Some(7))))
+        Vector("note"), Vector("S1"), attempts = 2, misses = 1, firstMiss = 99L, ranAt = Some(7), notBefore = Some(8))))
+      .bindAs("A1", Seq("orderA" -> "bb", "reqA" -> "cc")).unbind("A1").bindAs("A2", Seq("orderA" -> "dd"))
     LiveState.decode(LiveState.encode(s)) shouldBe s
+  }
+
+  property("a dropped step's bindings are undone, to the latest binding still alive, in whatever order steps drop") {
+    val start = LiveState.fresh(chain = true, maturityBlocks = 40).bind("offer1" -> "o1")
+    // E2 and E6 rebind offer1 to their continuations; E7 binds reqE for the first time.
+    val bound = start.bindAs("E2", Seq("offer1" -> "e2")).bindAs("E6", Seq("offer1" -> "e6")).bindAs("E7", Seq("reqE" -> "r"))
+    bound.unbind("E6").vars("offer1") shouldBe "e2"
+    // The parent drops first while the child still stands; then the child: back to the value before both.
+    val parentFirst = bound.unbind("E2")
+    parentFirst.vars("offer1") shouldBe "e6"
+    parentFirst.unbind("E6").vars("offer1") shouldBe "o1"
+    bound.unbind("E6").unbind("E2").vars("offer1") shouldBe "o1"
+    // A name a dropped step bound first goes away; a step that bound nothing changes nothing.
+    bound.unbind("E7").vars.contains("reqE") shouldBe false
+    bound.unbind("A1") shouldBe bound
+    // A re-run after a drop binds afresh, and undoing it again restores the same earlier value.
+    val rerun = bound.unbind("E6").bindAs("E6", Seq("offer1" -> "e6b"))
+    rerun.vars("offer1") shouldBe "e6b"
+    rerun.unbind("E6").vars("offer1") shouldBe "e2"
   }
 }

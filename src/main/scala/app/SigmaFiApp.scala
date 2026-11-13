@@ -200,7 +200,7 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
     val scripts = bonds.map { b =>
       val liq = protocol.liquidationOf(b.liqScriptHash)
         .getOrElse(fail(s"bond ${b.box.id} names a liquidation script this client does not know"))
-      if (liq.name == "MaturityLiquidation" && height.toLong + 1L < b.maturity)
+      if (liq.name == "MaturityLiquidation" && height.toLong < b.maturity)
         fail(s"bond ${b.box.id} matures at height ${b.maturity}; it can be liquidated from then on")
       liq
     }

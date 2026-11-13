@@ -130,7 +130,7 @@ object StandardCommands {
       println(s"  collateral:  ${Fmt.contents(o.collateralErg, o.collateral)}")
       println(s"  liquidation: ${app.protocol.ruleOf(o.liqHash).fold(app.protocol.ruleName(o.liqHash))(app.describeRule(_, o.payload))}")
       println(s"  expiry:      height ${o.expiry}; fee ${Fmt.erg(o.expiryFee)}" +
-        (if (app.height.toLong + 1L >= o.expiry) " (EXPIRED: anyone may refund-order it for the fee)" else ""))
+        (if (app.height.toLong >= o.expiry) " (EXPIRED: anyone may refund-order it for the fee)" else ""))
       if (app.isOwnHash(o.borrowerHash)) println("  (your order)")
     }
   }
@@ -138,13 +138,15 @@ object StandardCommands {
   private def listBonds(app: StandardApp, node: NodeApi, mine: Boolean, liquidatable: Boolean): Unit = {
     indexStatus(node).foreach(System.err.println)
     val oracle = Try(app.oracle()).toOption.flatten
-    val next = app.height.toLong + 1L
+    // Paths open from a height count at the signing height; ones open before it, at the next block.
+    val now = app.height.toLong
+    val next = now + 1L
     def oracleBelow(b: StdBond): Boolean = (app.protocol.ruleOf(b.liqHash), oracle) match {
       case (Some(OracleRatio(_, _)), Some(o)) if b.payload.size >= 2 =>
         next - o.created <= b.payload(1) && app.protocol.cover(b, o.price).exists { case (c, d) => c * 10000 < d * b.payload(0) }
       case _ => false
     }
-    def canLiquidate(b: StdBond): Boolean = app.protocol.ruleOf(b.liqHash).isDefined && (next >= b.maturity || oracleBelow(b))
+    def canLiquidate(b: StdBond): Boolean = app.protocol.ruleOf(b.liqHash).isDefined && (now >= b.maturity || oracleBelow(b))
     val bonds = app.bonds()
       .filter(b => !liquidatable || canLiquidate(b))
       .filter(b => !mine || app.isWalletHash(b.borrowerHash) || app.walletHolds(b.asset))
@@ -153,7 +155,7 @@ object StandardCommands {
       val m = b.market
       println(s"Bond ${b.box.id}  bond asset ${b.asset}  ($m)")
       println(s"  repay:       ${Units.amount(b.repayment, m)} " +
-        (if (next >= b.maturity) s"(matured at ${b.maturity}: liquidatable)"
+        (if (now >= b.maturity) s"(matured at ${b.maturity}: liquidatable)"
         else s"before height ${b.maturity} (${b.maturity - app.height} blocks left)"))
       println(s"  principal:   ${Units.amount(b.principal, m)}; started at height ${b.start}")
       println(s"  collateral:  ${Fmt.contents(b.collateralErg, b.collateral)}; lender fee reserve ${Fmt.erg(b.feeReserve)}")
@@ -166,7 +168,7 @@ object StandardCommands {
         case _ =>
       }
       if (next < b.maturity)
-        println("  recollateralize: " + (if (next >= b.recollateralizableFrom) "open now"
+        println("  recollateralize: " + (if (now >= b.recollateralizableFrom) "open now"
           else s"from height ${b.recollateralizableFrom}"))
       if (!app.originVerified(b)) println("  WARNING: its asset was not minted by a standard order: this box proves nothing")
       else ExchangeCommands.metadataLine(app.bondMetadataIssues(b.asset))
