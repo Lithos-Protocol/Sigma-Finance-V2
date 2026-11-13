@@ -108,35 +108,43 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
       val maturity = w.h + 1000L
       val unit = w.app(l).walletBoxes.find(_.tokens.exists(_.id == bond.asset)).get
       text(unit, 4) shouldBe Some(s"ZCS-Bond-Unit-${bond.asset.toString.take(6)}")
-      text(unit, 5) shouldBe Some(s"ZC Standard bond. It lent 5 ERG at height ${w.h} and repays 6 ERG at height " +
-        s"$maturity. It liquidates at maturity if unpaid. Verify on chain.")
+      text(unit, 5) shouldBe Some(s"""{"zcs":1,"type":"bond unit","market":"ERG","principal":5,"repayment":6,""" +
+        s""""start":${w.h},"maturity":$maturity,"rule":"maturity","note":"Verify on chain."}""")
       text(unit, 6) shouldBe Some("0")
       w.app(l).bondMetadataIssues(bond.asset) shouldBe empty
     }
   }
 
-  property("metadata: the template formats SigUSD amounts, oracle ratios and Dutch auctions exactly") {
+  property("metadata: the template writes compact JSON with SigUSD amounts, oracle ratios and Dutch auctions exactly") {
     val asset = ErgoId.create("3fa2c1" + "00" * 29)
     val facts = StandardMetadata.BondFacts(Market.SigUsd, asset, 10000L, 10550L, 1712000L, 1749600L,
       StandardMetadata.ruleText(Some(OracleRatio(Market.SigUsd, protocol.market(Market.SigUsd).oracleRule)),
         Seq(15000L, 60L), Array.fill(32)(0.toByte)))
-    val terms = "lent 100 SigUSD at height 1712000 and repays 105.5 SigUSD at height 1749600. " +
-      "It liquidates below 150% collateral, or at maturity if unpaid."
-    StandardMetadata.bond(facts) shouldBe
-      Seq("ZCS-Bond-Unit-3fa2c1", s"ZC Standard bond. It $terms Verify on chain.", "0")
-    StandardMetadata.shares(Market.SigUsd, None, Some(facts)) shouldBe Seq("ZCS-Bond-Shares-3fa2c1",
-      s"ZC Standard shares. 1.0 shares equals 1% of bond 3fa2c1. The bond $terms Verify on chain.", "6")
+    val terms = """"principal":100,"repayment":105.5,"start":1712000,"maturity":1749600,"rule":"oracle","ratio":150"""
+    val note = """"note":"Verify on chain.""""
+    val unit = StandardMetadata.bond(facts)
+    unit shouldBe Seq("ZCS-Bond-Unit-3fa2c1", s"""{"zcs":1,"type":"bond unit","market":"SigUSD",$terms,$note}""", "0")
+    val shares = StandardMetadata.shares(Market.SigUsd, None, Some(facts))
+    shares shouldBe Seq("ZCS-Bond-Shares-3fa2c1",
+      s"""{"zcs":1,"type":"shares","shares":100,"bond":"3fa2c1","market":"SigUSD",$terms,$note}""", "6")
+    // Dutch auction shares take the same name; the description's type and auction tell them apart.
     val auction = Some(AuctionTerms(12000L, 9050L, 720L))
-    val sale = "If liquidated, its collateral is auctioned from 120% down to 90.5% of the repayment over 720 blocks."
-    StandardMetadata.shares(Market.SigUsd, auction, Some(facts)) shouldBe Seq("ZCS-Bond-Auction-Shares-3fa2c1",
-      s"ZC Standard shares. 1.0 shares equals 1% of bond 3fa2c1. The bond $terms $sale Verify on chain.", "6")
-    // Without the bond: the market's article is grammatical ("an ERG", "a SigUSD").
-    StandardMetadata.shares(Market.Erg, None, None) shouldBe Seq("ZCS-Bond-Shares",
-      "ZC Standard shares. 1.0 shares equals 1% of an ERG bond bought by a lend offer. Verify on chain.", "6")
-    StandardMetadata.shares(Market.SigUsd, auction, None) shouldBe Seq("ZCS-Bond-Auction-Shares",
-      s"ZC Standard shares. 1.0 shares equals 1% of a SigUSD bond bought by a lend offer. $sale Verify on chain.", "6")
-    StandardMetadata.ruleText(None, Seq.empty, Array.fill(32)(0xab.toByte)) shouldBe
-      "It liquidates under liquidation rule abababab."
+    val sale = """"auction":{"from":120,"to":90.5,"blocks":720}"""
+    val dutch = StandardMetadata.shares(Market.SigUsd, auction, Some(facts))
+    dutch shouldBe Seq("ZCS-Bond-Shares-3fa2c1",
+      s"""{"zcs":1,"type":"auction shares","shares":100,"bond":"3fa2c1","market":"SigUSD",$terms,$sale,$note}""", "6")
+    // Without the bond, as an offer writes them: the market and where they came from.
+    val viaOffer = StandardMetadata.shares(Market.Erg, None, None)
+    viaOffer shouldBe Seq("ZCS-Bond-Shares", s"""{"zcs":1,"type":"shares","shares":100,"market":"ERG","via":"lend offer",$note}""", "6")
+    val dutchViaOffer = StandardMetadata.shares(Market.SigUsd, auction, None)
+    dutchViaOffer shouldBe Seq("ZCS-Bond-Shares",
+      s"""{"zcs":1,"type":"auction shares","shares":100,"market":"SigUSD","via":"lend offer",$sale,$note}""", "6")
+    StandardMetadata.json(StandardMetadata.ruleText(None, Seq.empty, Array.fill(32)(0xab.toByte))) shouldBe
+      """{"rule":"other","ruleHash":"abababab"}"""
+    // Every description is valid JSON a wallet can parse.
+    Seq(unit, shares, dutch, viaOffer, dutchViaOffer).foreach(m => io.circe.parser.parse(m(1)).isRight shouldBe true)
+    io.circe.parser.parse(dutch(1)).toOption.flatMap(_.hcursor.downField("auction").get[BigDecimal]("to").toOption) shouldBe
+      Some(BigDecimal("90.5"))
   }
 
   property("metadata: a misleading name or an R7 set on a fill's unit is flagged") {
@@ -180,10 +188,11 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
       w.run(l, w.app(l).fractionalize(bond.asset.toString, ShareTerms(pullFee = fee, mintFee = fee, auction = auction)))
       val req = w.app(e).shareRequests().loneElement
       req.shares shouldBe 100000000L
-      StandardMetadata.text(req.metadata.head) shouldBe s"ZCS-Bond-Auction-Shares-${bond.asset.toString.take(6)}"
-      StandardMetadata.text(req.metadata(1)) should (startWith("ZC Standard shares. 1.0 shares equals 1% of bond ") and
-        include(s"The bond lent 5 ERG at height ${w.h} and repays 6 ERG at height ${w.h + 1000L}.") and
-        include("auctioned from 150% down to 90%") and endWith("Verify on chain."))
+      StandardMetadata.text(req.metadata.head) shouldBe s"ZCS-Bond-Shares-${bond.asset.toString.take(6)}"
+      StandardMetadata.text(req.metadata(1)) shouldBe s"""{"zcs":1,"type":"auction shares","shares":100,""" +
+        s""""bond":"${bond.asset.toString.take(6)}","market":"ERG","principal":5,"repayment":6,"start":${w.h},""" +
+        s""""maturity":${w.h + 1000L},"rule":"maturity","auction":{"from":150,"to":90,"blocks":500},""" +
+        """"note":"Verify on chain."}"""
       w.app(e).requestMetadataIssues(req) shouldBe empty
       w.run(e, w.app(e).mintShares(req.box.id.toString))
       val shares = w.app(l).walletBoxes.find(_.tokens.exists(_.id == req.shareId)).get
@@ -194,7 +203,7 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
       w.run(o, w.app(o).createOffer(offerSpec(w).copy(market = Market.SigUsd, capital = 1000L, fees = erg("0.5"),
         delivery = Some(OfferDelivery(ShareTerms(pullFee = fee, mintFee = fee, auction = auction))))))
       val offer = w.app(e).offers().loneElement
-      offer.metadata.map(StandardMetadata.text).head shouldBe "ZCS-Bond-Auction-Shares"
+      offer.metadata.map(StandardMetadata.text).head shouldBe "ZCS-Bond-Shares"
       w.app(e).offerMetadataIssues(offer) shouldBe empty
       w.run(b, w.app(b).createOrder(loan(Market.SigUsd, principal = 600L, repayment = 700L,
         collateral = Seq(Token(collateralToken, 5L)), rule = OracleChoice(15000L, 60L))(w)))

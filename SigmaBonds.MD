@@ -343,11 +343,11 @@ input. In brief:
   seller by hash puts that script's ErgoTree in context variable 64 of `INPUTS(0)`, unless an input or
   output already carries it. Any batcher then finds every script in one lookup. Batchers skip boxes
   that do not do this. Variables 64 to 127 are reserved for off-chain data.
-- **Token metadata** (recommended). Short names such as `ZCS-Bond-Unit-3fa2c1`,
-  `ZCS-Bond-Shares-3fa2c1` and `ZCS-Bond-Auction-Shares-3fa2c1`, and descriptions that state the
-  bond's terms in a few sentences from a fixed grammar. Both are built only from chain data, so any
-  client writes the same bytes and readers can flag a mismatch. Shares minted through a lend offer
-  omit the bond, which the offer cannot know when it is posted.
+- **Token metadata** (recommended). Short names, `ZCS-Bond-Unit-3fa2c1` for a bond unit and
+  `ZCS-Bond-Shares-3fa2c1` for its shares, with or without a Dutch auction, and compact JSON
+  descriptions of the bond's terms (and any auction) with a fixed key order. Both are built only from
+  chain data, so any client writes the same bytes and readers can flag a mismatch. Shares minted
+  through a lend offer omit the bond, which the offer cannot know when it is posted.
 - **Share count** (recommended). 100 shares with 6 decimals (N = 100,000,000), so `1.000000` is 1%
   of the bond, and share prices are quoted as a percentage of face. It stays off-chain: it protects
   no value, and enforcing it would change both mints and the lend offer.

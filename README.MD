@@ -92,10 +92,10 @@ sbt "runMain ksingh.sigmabonds.app.SigmaFiCli help"
 Every transaction follows the zcs1 off-chain rules in
 [docs/ZC_STANDARD_OFFCHAIN.md](./docs/ZC_STANDARD_OFFCHAIN.md). It discloses each script its boxes name
 by hash in context variable 64, unless an input or output already carries it, so any batcher can pay
-it. A fill names the lender's bond unit `ZCS-Bond-Unit-<first6>`, with a short description of the
-bond's terms. Shares default to 100 with 6 decimals (1.0 shares is 1% of the bond) and are named
-`ZCS-Bond-Shares-<first6>` or `ZCS-Bond-Auction-Shares-<first6>`. The listings flag anything
-nonstandard. `help` lists every option.
+it. A fill names the lender's bond unit `ZCS-Bond-Unit-<first6>`, with a compact JSON description of
+the bond's terms. Shares default to 100 with 6 decimals (1.0 shares is 1% of the bond) and are named
+`ZCS-Bond-Shares-<first6>`, with or without a Dutch auction. The listings flag anything nonstandard.
+`help` lists every option.
 
 **First generation, with `--old`.** `info`, `orders`, `bonds`, `claims`, `fill-order [--batching-fee
 <ERG>]`, `claim`, `cancel-order`, `repay` and `liquidate`, as before, for first-generation boxes. Those

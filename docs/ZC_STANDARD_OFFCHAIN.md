@@ -114,11 +114,14 @@ Names are short and say only what a token is. The terms go in the description.
 
 ```
 name     = "ZCS-Bond-" kind [ "-" id6 ]
-kind     = "Unit"             a bond unit
-         | "Shares"           shares from ZC_Standard_FractionalMint
-         | "Auction-Shares"   shares from ZC_Standard_DutchAuctionMint
+kind     = "Unit"       a bond unit
+         | "Shares"     shares from ZC_Standard_FractionalMint or ZC_Standard_DutchAuctionMint
 id6      = the first 6 lowercase hexadecimal characters of the bond asset id
 ```
+
+Standard and Dutch auction shares share a name on purpose: a holder sees shares of a bond, and the
+auction is a detail of how a liquidation pays out. The description's `type` and `auction` fields tell
+them apart.
 
 Bond units always carry the suffix, and for them it is the start of the token's own id. Shares carry
 the bond's suffix when the writer knows the bond (`fractionalize`) and leave it out when the writer
@@ -128,57 +131,56 @@ which is a hash over the request's registers, the name among them.
 | Token | Name |
 |---|---|
 | Bond unit | `ZCS-Bond-Unit-3fa2c1` |
-| Shares of that bond, from `fractionalize` | `ZCS-Bond-Shares-3fa2c1` |
-| Dutch auction shares of that bond | `ZCS-Bond-Auction-Shares-3fa2c1` |
-| Shares delivered through an offer | `ZCS-Bond-Shares`, or `ZCS-Bond-Auction-Shares` |
+| Shares of that bond, standard or Dutch auction | `ZCS-Bond-Shares-3fa2c1` |
+| Shares delivered through an offer | `ZCS-Bond-Shares` |
 
 ### Descriptions
 
-Each description is a few plain English sentences a wallet can show, built from the grammar below and
-ending in `Verify on chain.` Machines read the chain, not the description.
+Each description is one compact JSON object: no whitespace, keys in the fixed order below, keys that do
+not apply left out. Wallets can show it as it is or parse it. Machines read the chain, not the
+description.
 
-```
-unit-desc   = "ZC Standard bond. It " terms " Verify on chain."
-share-desc  = "ZC Standard shares. 1.0 shares equals 1% of " what [ " " auction ] " Verify on chain."
-what        = "bond " id6 ". The bond " terms                          bond known
-            | article " " market " bond bought by a lend offer."      bond unknown
-terms       = "lent " amount " at height " start " and repays " amount " at height " maturity ". " rule
-rule        = "It liquidates at maturity if unpaid."                                   MaturityLiquidation
-            | "It liquidates below " pct "% collateral, or at maturity if unpaid."     oracle rule with a ratio
-            | "It liquidates under liquidation rule " hex8 "."                         any other
-auction     = "If liquidated, its collateral is auctioned from " pct "% down to " pct
-              "% of the repayment over " length " blocks."
-amount      = number " " market
-market      = the market's name: "ERG" or "SigUSD"
-article     = "an" before a market name starting with a vowel letter ("an ERG"), otherwise "a"
-pct         = basis points over 100: the ratio is borrower value 7, the auction's opening and floor
-hex8        = the first 8 lowercase hexadecimal characters of the rule's hash
-```
+| Key | Value | In |
+|---|---|---|
+| `zcs` | `1`, the profile's version | every description |
+| `type` | `"bond unit"`, `"shares"` or `"auction shares"` | every description |
+| `shares` | `100`, the whole share supply in display units, so each share is 1% of the bond | shares |
+| `bond` | id6 of the bond asset | shares whose bond the writer knows |
+| `market` | `"ERG"` or `"SigUSD"`, the unit of every amount | every description |
+| `via` | `"lend offer"` | shares whose bond the writer does not know |
+| `principal`, `repayment` | amounts in the market's unit | bond units, shares whose bond is known |
+| `start`, `maturity` | heights | the same |
+| `rule` | `"maturity"`; `"oracle"`; or `"other"` | the same |
+| `ratio` | the oracle rule's ratio in percent (borrower value 7): liquidated below it, or at maturity if unpaid | with `"rule":"oracle"` |
+| `ruleHash` | the first 8 lowercase hexadecimal characters of the rule's hash | with `"rule":"other"` |
+| `auction` | `{"from":opening,"to":floor,"blocks":length}`: if liquidated, the collateral is auctioned for `from`% falling to `to`% of the repayment over `length` blocks | auction shares |
+| `note` | `"Verify on chain."` | every description |
 
 | Token | Description |
 |---|---|
-| Bond unit, oracle rule (177 bytes) | `ZC Standard bond. It lent 100 SigUSD at height 1712000 and repays 105.5 SigUSD at height 1749600. It liquidates below 150% collateral, or at maturity if unpaid. Verify on chain.` |
-| Bond unit, maturity rule | `ZC Standard bond. It lent 0.1 ERG at height 1915530 and repays 0.11 ERG at height 1922400. It liquidates at maturity if unpaid. Verify on chain.` |
-| Shares, bond known | `ZC Standard shares. 1.0 shares equals 1% of bond 3fa2c1. The bond lent 100 SigUSD at height 1712000 and repays 105.5 SigUSD at height 1749600. It liquidates below 150% collateral, or at maturity if unpaid. Verify on chain.` |
-| Dutch auction shares, bond known (321 bytes, the longest) | The same, then `If liquidated, its collateral is auctioned from 100% down to 90% of the repayment over 720 blocks.` before `Verify on chain.` |
-| Shares, bond unknown | `ZC Standard shares. 1.0 shares equals 1% of a SigUSD bond bought by a lend offer. Verify on chain.` |
-| Dutch auction shares, bond unknown | `ZC Standard shares. 1.0 shares equals 1% of an ERG bond bought by a lend offer. If liquidated, its collateral is auctioned from 100% down to 90% of the repayment over 720 blocks. Verify on chain.` |
+| Bond unit, oracle rule (169 bytes) | `{"zcs":1,"type":"bond unit","market":"SigUSD","principal":100,"repayment":105.5,"start":1712000,"maturity":1749600,"rule":"oracle","ratio":150,"note":"Verify on chain."}` |
+| Bond unit, maturity rule | `{"zcs":1,"type":"bond unit","market":"ERG","principal":0.1,"repayment":0.11,"start":1915530,"maturity":1922400,"rule":"maturity","note":"Verify on chain."}` |
+| Shares, bond known | `{"zcs":1,"type":"shares","shares":100,"bond":"3fa2c1","market":"SigUSD","principal":100,"repayment":105.5,"start":1712000,"maturity":1749600,"rule":"oracle","ratio":150,"note":"Verify on chain."}` |
+| Auction shares, bond known (247 bytes, the longest) | `{"zcs":1,"type":"auction shares","shares":100,"bond":"3fa2c1","market":"SigUSD","principal":100,"repayment":105.5,"start":1712000,"maturity":1749600,"rule":"oracle","ratio":150,"auction":{"from":100,"to":90,"blocks":720},"note":"Verify on chain."}` |
+| Shares, bond unknown | `{"zcs":1,"type":"shares","shares":100,"market":"SigUSD","via":"lend offer","note":"Verify on chain."}` |
+| Auction shares, bond unknown | `{"zcs":1,"type":"auction shares","shares":100,"market":"ERG","via":"lend offer","auction":{"from":100,"to":90,"blocks":720},"note":"Verify on chain."}` |
 
-A share's bond terms are the same sentences as its bond unit's, so a holder reads the whole bond
-from the share token. An offer's metadata is fixed before it buys anything, so shares it delivers
-name only the market and any auction.
+A share's bond terms are the same fields as its bond unit's, so a holder reads the whole bond from the
+share token. An offer's metadata is fixed before it buys anything, so shares it delivers name only the
+market and any auction.
 
 **Formatting**, so that every client writes the same bytes: ASCII only, encoded as EIP-4 `Coll[Byte]`.
-Amounts are in the market's unit (ERG has 9 decimals, SigUSD 2), with trailing zeros and a trailing
-point removed and no thousands separators. Percentages are basis points over 100, formatted the same
-way (`90`, `90.5`). Heights and block counts are plain integers.
+Amounts are JSON numbers in the market's unit (ERG has 9 decimals, SigUSD 2), with trailing zeros and
+a trailing point removed, no exponent and no thousands separators. Percentages are basis points over
+100, formatted the same way (`90`, `90.5`). Heights and block counts are plain integers. Strings are
+written without escapes, since every one is ASCII without quotes or backslashes.
 
 Decimals (R6) are `0` for a bond unit, which the order enforces, and `6` for shares (see "Share
 count").
 
 Descriptions are kept short. The bond's registers already hold every term, and a fill is built by
 batchers, whose block space is limited by size before cost (see "Cost and size" in SigmaBonds.MD). A
-bond unit's description is about 145 to 180 bytes. Shares that name their bond have the longest
+bond unit's description is about 150 to 170 bytes. Shares that name their bond have the longest
 descriptions, but the owner writes those with `fractionalize`, not a batcher in a fill. Shares an offer
 delivers, which a batcher's fill does write, carry the short form.
 

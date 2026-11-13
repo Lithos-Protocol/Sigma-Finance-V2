@@ -7,11 +7,15 @@ import scorex.util.encode.Base16
 /**
  * zcs1 token metadata: the EIP-4 name, description and decimals of bond units and shares, built only from
  * chain data so every client writes the same bytes and a reader can rebuild them to check (see
- * docs/ZC_STANDARD_OFFCHAIN.md, "Token metadata"). Display only: verification never trusts it.
+ * docs/ZC_STANDARD_OFFCHAIN.md, "Token metadata"). Descriptions are compact JSON with a fixed key order.
+ * Display only: verification never trusts it.
  */
 object StandardMetadata {
 
   val Profile = "zcs1"
+
+  /** The `zcs` field of every description: the profile's version. */
+  val Version = "1"
 
   /** zcs1's share count and decimals: 100.000000 shares is the whole bond, so 1.0 shares is 1% of it. */
   val ShareCount: Long = 100000000L
@@ -20,12 +24,15 @@ object StandardMetadata {
   /** A bond unit's decimals, which the standard order enforces. */
   val BondDecimals = "0"
 
-  /** The closing sentence of every description. */
+  /** The `note` field of every description. */
   val Verify = "Verify on chain."
 
-  /** What a bond's metadata is built from: the fill's market, asset, amounts, heights and rule sentence. */
+  /** A JSON field: its key, and its value already written as JSON. */
+  type Field = (String, String)
+
+  /** What a bond's metadata is built from: the fill's market, asset, amounts, heights and rule fields. */
   case class BondFacts(market: Market, asset: ErgoId, principal: Long, repayment: Long, start: Long, maturity: Long,
-                       rule: String)
+                       rule: Seq[Field])
 
   object BondFacts {
     def of(b: StdBond, rule: Option[LiquidationRule]): BondFacts =
@@ -42,43 +49,47 @@ object StandardMetadata {
 
   def id6(asset: ErgoId): String = asset.toString.take(6).toLowerCase
 
-  /** "an" before a market name that starts with a vowel letter ("an ERG bond"), "a" otherwise ("a SigUSD bond"). */
-  def article(m: Market): String = if (m.name.headOption.exists(c => "AEIOUaeiou".indexOf(c) >= 0)) "an" else "a"
+  /** A JSON string. Every value written here is ASCII; quotes and backslashes are escaped all the same. */
+  def str(s: String): String = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 
-  /** The sentence naming a bond's liquidation rule. */
-  def ruleText(rule: Option[LiquidationRule], payload: Seq[Long], liqHash: Array[Byte]): String = rule match {
-    case Some(AtMaturity(_)) => "It liquidates at maturity if unpaid."
-    case Some(OracleRatio(_, _)) if payload.nonEmpty =>
-      s"It liquidates below ${percent(payload.head)}% collateral, or at maturity if unpaid."
-    case _ => s"It liquidates under liquidation rule ${Base16.encode(liqHash).take(8)}."
+  /** A compact JSON object, keys in the order given. */
+  def json(fields: Seq[Field]): String = fields.map { case (k, v) => s"${str(k)}:$v" }.mkString("{", ",", "}")
+
+  /** The fields naming a bond's liquidation rule. */
+  def ruleText(rule: Option[LiquidationRule], payload: Seq[Long], liqHash: Array[Byte]): Seq[Field] = rule match {
+    case Some(AtMaturity(_)) => Seq("rule" -> str("maturity"))
+    case Some(OracleRatio(_, _)) if payload.nonEmpty => Seq("rule" -> str("oracle"), "ratio" -> percent(payload.head))
+    case _ => Seq("rule" -> str("other"), "ruleHash" -> str(Base16.encode(liqHash).take(8)))
   }
 
-  /** "lent {P} {M} at height {start} and repays {R} {M} at height {maturity}. {rule}" */
-  private def terms(f: BondFacts): String =
-    s"lent ${number(f.principal, f.market)} ${f.market.name} at height ${f.start} and repays " +
-      s"${number(f.repayment, f.market)} ${f.market.name} at height ${f.maturity}. ${f.rule}"
+  /** The bond's terms: principal, repayment, start, maturity and rule. */
+  private def terms(f: BondFacts): Seq[Field] = Seq(
+    "principal" -> number(f.principal, f.market), "repayment" -> number(f.repayment, f.market),
+    "start" -> f.start.toString, "maturity" -> f.maturity.toString) ++ f.rule
 
   /** A bond unit's (name, description, decimals). */
   def bond(f: BondFacts): Seq[String] = Seq(
     s"ZCS-Bond-Unit-${id6(f.asset)}",
-    s"ZC Standard bond. It ${terms(f)} $Verify",
+    json(Seq("zcs" -> Version, "type" -> str("bond unit"), "market" -> str(f.market.name)) ++ terms(f) ++
+      Seq("note" -> str(Verify))),
     BondDecimals)
-
-  /** "Shares" for standard shares, "Auction-Shares" for Dutch auction shares. */
-  def shareKind(auction: Option[AuctionTerms]): String = if (auction.isDefined) "Auction-Shares" else "Shares"
 
   /**
    * Shares' (name, description, decimals): naming the bond when the writer knows it, as `fractionalize` does,
-   * and without it when the writer does not, as a lend offer posted before it buys anything.
+   * and without it when the writer does not, as a lend offer posted before it buys anything. Standard and
+   * Dutch auction shares share a name; the description's `type` and `auction` tell them apart.
    */
   def shares(m: Market, auction: Option[AuctionTerms], bond: Option[BondFacts]): Seq[String] = {
-    val what = bond.fold(s"1.0 shares equals 1% of ${article(m)} ${m.name} bond bought by a lend offer.")(b =>
-      s"1.0 shares equals 1% of bond ${id6(b.asset)}. The bond ${terms(b)}")
-    val sale = auction.fold("")(a => s" If liquidated, its collateral is auctioned from ${percent(a.openingBps)}% " +
-      s"down to ${percent(a.floorBps)}% of the repayment over ${a.length} blocks.")
+    val whole = plain(BigDecimal(ShareCount) / BigDecimal(10).pow(ShareDecimals.toInt))
+    val head = Seq("zcs" -> Version, "type" -> str(if (auction.isDefined) "auction shares" else "shares"),
+      "shares" -> whole)
+    val what = bond.fold(Seq("market" -> str(m.name), "via" -> str("lend offer")))(b =>
+      Seq("bond" -> str(id6(b.asset)), "market" -> str(m.name)) ++ terms(b))
+    val sale = auction.toSeq.map(a => "auction" ->
+      json(Seq("from" -> percent(a.openingBps), "to" -> percent(a.floorBps), "blocks" -> a.length.toString)))
     Seq(
-      s"ZCS-Bond-${shareKind(auction)}" + bond.fold("")(b => s"-${id6(b.asset)}"),
-      s"ZC Standard shares. $what$sale $Verify",
+      "ZCS-Bond-Shares" + bond.fold("")(b => s"-${id6(b.asset)}"),
+      json(head ++ what ++ sale ++ Seq("note" -> str(Verify))),
       ShareDecimals)
   }
 
