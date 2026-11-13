@@ -109,6 +109,17 @@ class LivePlanSpec extends AnyPropSpec with Matchers {
     run.exists(a => a.command.contains("batch") && a.flag("run")) shouldBe true
   }
 
+  property("every step explains itself in a sentence or two, and every explanation belongs to a step") {
+    plan.foreach(s => withClue(s"${s.id}: ") {
+      s.about should not be empty
+      s.about.length should be <= 320
+      s.about.forall(c => c >= ' ' && c <= '~') shouldBe true
+    })
+    (LivePlan.About.keySet -- plan.map(_.id)) shouldBe empty
+    LiveTest.wrap("one two three four", 9) shouldBe Seq("one two", "three", "four")
+    LiveTest.wrap("", 9) shouldBe empty
+  }
+
   property("a variable is filled in, and a missing one is named") {
     LivePlan.fill("claim {orderA} --amount {n}", Map("orderA" -> "x", "n" -> "5")) shouldBe Right("claim x --amount 5")
     LivePlan.fill("claim {orderA}", Map.empty) shouldBe Left("orderA")

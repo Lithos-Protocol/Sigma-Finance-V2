@@ -34,7 +34,7 @@ object LiveTest {
       |                   press Enter to pause
       |  status           every step: done, in flight, waiting (and on what), failed or skipped
       |  plan             the steps, their tracks and what each builds on
-      |  show <step>      a step's command line, transactions, output boxes and notes
+      |  show <step>      what a step does and shows off, its command line, transactions, output boxes and notes
       |  vars             the box and token ids steps have found
       |  retry <step> ... run failed or skipped steps again; `retry failed` re-runs every failed step. A step
       |                   whose transaction left the mempool unconfirmed runs again by itself (twice at most)
@@ -48,6 +48,15 @@ object LiveTest {
       |Anything else is a SigmaFi CLI command, run in the same session: e.g. `bonds --mine` or `help`.
       |Progress is saved after every change, so `exit` (or Ctrl+C) and starting again resumes the run.
       |""".stripMargin
+
+  /** `text` broken into lines of at most `width` characters at spaces (a longer word gets a line of its own). */
+  def wrap(text: String, width: Int): Seq[String] =
+    text.split(" ").filter(_.nonEmpty).foldLeft(Vector.empty[String]) { (lines, word) =>
+      lines.lastOption match {
+        case Some(last) if last.length + 1 + word.length <= width => lines.init :+ s"$last $word"
+        case _ => lines :+ word
+      }
+    }
 
   def main(args: Array[String]): Unit = {
     var stateFile = "sigmafi-livetest.json"
@@ -121,6 +130,9 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
   private def st(id: String): StepState = state.step(id)
   private def set(id: String)(f: StepState => StepState): Unit = { state = state.update(id)(f); save() }
   private def say(s: String): Unit = println(s)
+
+  /** A step's explanation, wrapped and indented under its title. */
+  private def explain(s: Step): Unit = LiveTest.wrap(s.about, 96).foreach(line => say(s"    $line"))
   private def short(id: String): String = if (id.length > 12) id.take(8) + ".." else id
 
   // ═══ THE CHAIN ════════════════════════════════════════════════════════════
@@ -416,6 +428,7 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
         // A moment for the node's mempool view to take in what the previous step just submitted.
         if (chained) Thread.sleep(1000)
         say(s"\n[${s.id}] ${s.title}" + (if (chained) " (chained through the mempool)" else ""))
+        explain(s)
         say(s"> $full")
         val before = session.submissions.size
         val (ok, out, err) = capture(session.execute(Args.parse(Args.tokenize(full)).withDefaults(launch)))
@@ -563,6 +576,7 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
   private def setup(s: Step, v: View): Unit = {
     if (!state.started && !start()) return
     say(s"\n[${s.id}] ${s.title}")
+    explain(s)
     say(s"> (node wallet) POST /wallet/transaction/send: 1 asset issue and $SplitBoxes payments to this wallet")
     val sent = Try(session.withStandard(launch, mempool = false) { (app, node) =>
       val me = Json.fromString(app.myAddress.toString)
@@ -827,6 +841,7 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
   private def show(id: String): Unit = find(id).foreach { s =>
     val ss = st(s.id)
     say(s"${s.id}  ${s.title}  (${s.track}, ${ss.status})")
+    explain(s)
     if (s.command.nonEmpty) say(s"  command:  ${fill(s.command, state.vars).fold(m => s"${s.command}  (no {$m} yet)", identity)}")
     ss.command.foreach(c => say(s"  ran:      $c" + ss.ranAt.fold("")(h => s"  at height $h") + s", attempt ${ss.attempts}"))
     if (s.expect.nonEmpty) say(s"  expects:  ${s.expect.map(e => fill(e, state.vars).getOrElse(e)).mkString(", ")}")

@@ -69,12 +69,14 @@ case class Bind(name: String, output: Int, title: String = "")
  * A listing or refusal never changes the chain or binds anything, so a step waiting on one only waits for it
  * to have run, whatever its outcome. `skipIf` skips the step when that variable is already bound. `noDefer`
  * fails the step at once rather than retrying it after the transactions in flight confirm. `last` steps run
- * once every other step is over. `expect` may name variables too.
+ * once every other step is over. `expect` may name variables too. `about` says in a sentence or two what the
+ * step does and what it shows off; the runner prints it under the step's title.
  */
 case class Step(id: String, track: String, title: String, kind: Kind, command: String,
                 after: Seq[String] = Nil, settled: Seq[String] = Nil, gate: Gate = Gate.Open,
                 binds: Seq[Bind] = Nil, expect: Seq[String] = Nil, check: Check = Check.NoCheck,
-                skipIf: Option[String] = None, noDefer: Boolean = false, last: Boolean = false) {
+                skipIf: Option[String] = None, noDefer: Boolean = false, last: Boolean = false,
+                about: String = "") {
   /** The variables the command and the gate read. */
   def reads: Seq[String] = (LivePlan.placeholders(command) ++ expect.flatMap(LivePlan.placeholders) ++ (gate match {
     case Gate.Expired(_, b) => Seq(b)
@@ -165,7 +167,10 @@ object LivePlan {
 
   private def out(name: String, i: Int) = Bind(name, i)
 
-  val steps: Seq[Step] = Seq(
+  /** Every step, each with its explanation from `About`. */
+  lazy val steps: Seq[Step] = defined.map(s => s.copy(about = About.getOrElse(s.id, "")))
+
+  private val defined: Seq[Step] = Seq(
     // ─── basics: listings that need nothing ──────────────────────────────────
     read("R1", "basics", "Pinned contracts, network and wallet", "info",
       Seq("ZC Standard, from pinned trees", "MAINNET", "Wallet address")),
@@ -357,5 +362,171 @@ object LivePlan {
     end("Z4", "No asks left", "asks --mine", "No asks."),
     end("Z5", "No share requests or vaults left", "shares --mine", "No share requests or vaults."),
     end("Z6", "Nothing left to claim", "claims", "Nothing to claim.")
+  )
+
+  /** What each step does and what it shows off, a sentence or two, printed under the step's title. */
+  val About: Map[String, String] = Map(
+    // basics
+    "R1" -> ("Prints the pinned ZC Standard contracts, the network and the wallet this run acts as. Shows the " +
+      "CLI building every contract from the pinned trees and talking to a mainnet node."),
+    "R2" -> ("Compiles the first-generation production contracts behind --old. Shows the old contracts still " +
+      "build next to the standard set."),
+    "R3" -> "Lists first-generation orders on the node. Shows the --old commands still read the production boxes.",
+    "R4" -> "Lists this wallet's first-generation bonds. Read only, like every R step.",
+    "R5" -> "Lists first-generation bonds ready to claim. Read only, like every R step.",
+    "S1" -> ("The node wallet mints a worthless test token and splits ERG into separate boxes for this wallet, in " +
+      "one transaction. The token stands in for collateral the oracle can't price, and the boxes let independent " +
+      "steps run side by side."),
+
+    // D/E: an offer, a NAV ask, Dutch shares, liquidation at maturity, an auction
+    "O1" -> ("Posts a lend offer: 0.6 ERG that any batcher may lend at 5% a year or better to oracle-rule bonds " +
+      "collateralized at 150% or more. It also accepts Dutch auction shares (floor at least 100%, auction at most " +
+      "100 blocks), so this track can use it three different ways."),
+    "E1" -> ("A borrower asks for 0.1 ERG, repaying 0.12 at height M, against 0.25 ERG and 1,000 test tokens under " +
+      "the oracle rule at 150%. The ERG alone covers about 208% of the repayment, so the O1 offer will fund it."),
+    "D1" -> ("A plain order for 0.1 ERG, repaying 0.11 at height M, under the maturity liquidation rule. This wallet " +
+      "fills it by hand, and it is liquidated at maturity together with bond E."),
+    "C1" -> ("An order backed by only 0.1 ERG against a 0.12 ERG repayment, about 83%, well under its 150% oracle " +
+      "ratio. It exists to be refused by an offer, then filled by hand and liquidated early."),
+    "C1x" -> ("Tries to match the O1 offer with order C, which the CLI must refuse. Shows an offer's collateral floor " +
+      "is checked before anything is built, so no batcher can fund a bond the lender wouldn't accept."),
+    "E2" -> ("This wallet, as batcher, matches the O1 offer with order E: a new bond whose unit goes to the offer's " +
+      "owner. Shows an offer funding a brand-new bond in one transaction, with the yield test, the collateral policy " +
+      "reading the oracle, and the offer continuing with what is left."),
+    "D2" -> ("This wallet fills order D itself, paying the principal and taking the bond's unit. Shows the basic " +
+      "peer-to-peer fill: three bond units minted, one to the lender and two kept as the bond's reserve."),
+    "D2x" -> ("Tries to liquidate bond D before its maturity, which the CLI must refuse. Shows a maturity-rule bond " +
+      "is safe from liquidation until its maturity height."),
+    "E3" -> "Lists the O1 offer after it funded bond E. Shows the offer's continuation with its remaining capital.",
+    "E4" -> ("Lists bond E's unit on a NAV ask at the bond's accrued value less 1%. Shows an ask whose price follows " +
+      "the bond's value block by block instead of a fixed number."),
+    "E5" -> "Lists the NAV ask with its current price. Shows readers computing the accrued-value price as the chain does.",
+    "E6" -> ("The O1 offer buys bond E's unit from the NAV ask; the unit returns to this wallet, which owns both. " +
+      "Shows an offer buying an existing bond: the origin check that proves the bond genuine, and the ask's pricing " +
+      "expression running on chain."),
+    "E7" -> ("Puts bond E's unit into a Dutch auction mint request: if the bond is liquidated, its collateral is " +
+      "auctioned from 300% down to 250% of the repayment over 20 blocks. The high percentages make sure the auction " +
+      "really opens, since the vault will hold less ERG than that."),
+    "E8" -> ("Mints the Dutch shares, with this wallet as the batcher keeping the mint fee. The owner gets 100 shares, " +
+      "and the share vault locks the bond unit."),
+    "E9" -> ("Lists 40% of the Dutch shares on a fixed-price ask for 0.04 ERG. Shows a share holding sold in part " +
+      "on a plain sale order."),
+    "E10" -> ("The O1 offer buys the Dutch shares from the ask. Shows an offer buying auction shares, checking their " +
+      "auction terms against the floor and length it accepts."),
+    "E11" -> ("Cancels what is left of the O1 offer, returning its capital. Shows the owner can withdraw an offer " +
+      "at any time."),
+    "DE1" -> ("Waits for height M, then liquidates bonds D and E in one transaction. Shows two bonds with different " +
+      "rules (maturity, and oracle at maturity) settled together for one miner fee."),
+    "D3" -> ("Claims liquidated bond D with its unit: the collateral goes to the unit's holder, and all three bond " +
+      "units burn. Shows the lender's side of a liquidation."),
+    "E12" -> ("Pulls bond E's liquidated collateral into its Dutch share vault; anyone can, for the pull fee. The vault " +
+      "holds less ERG than the auction floor, so the auction of the test tokens opens."),
+    "E13" -> "Lists the share vault with its auction open and the current price. Shows the falling price as readers see it.",
+    "E14" -> ("Buys the auction's lot, the test tokens, by topping the vault's ERG up to the current target. Shows " +
+      "anyone can buy a lot, and since the price only falls, a purchase priced now stays valid."),
+    "E15" -> ("Claims with 30% of the Dutch shares, taking that share of the vault's ERG. Shows a partial claim paying " +
+      "pro rata and leaving the vault open for the rest."),
+    "E16" -> ("Claims with every remaining share, burning them and the vault's reserve. Shows the final claim closing " +
+      "the vault completely."),
+
+    // A: shares of a repaid bond
+    "A1" -> ("An order for 0.1 ERG, repaying 0.11 in exactly 400 blocks, under the maturity rule. --exact-maturity " +
+      "keeps it off the 21,600-block maturity grid, so the test doesn't wait a month."),
+    "A1m" -> ("Lists order A from the mempool right after it is submitted, before it confirms. Shows the mempool " +
+      "lookups that let later steps chain without waiting for blocks."),
+    "A2" -> ("This wallet fills order A, paying 0.1 ERG and taking bond A's unit. That unit is split into shares " +
+      "next."),
+    "A2x" -> ("Tries to claim bond A before it is repaid or liquidated, which the CLI must refuse. Shows a unit claims " +
+      "nothing until its bond settles."),
+    "A3" -> ("Puts bond A's unit into a mint request for 100 shares with 6 decimals. Shows the zcs1 share format: " +
+      "1.0 shares is 1% of the bond, and the name and description are built from the bond."),
+    "A4" -> "Lists the share request. Shows it waiting for any batcher to mint it.",
+    "A5" -> ("Mints bond A's shares, with this wallet as the batcher keeping the mint fee. The owner gets 100 shares, " +
+      "and the vault locks the unit until the bond settles."),
+    "A6" -> ("Lists 40% of the shares on a fixed-price ask for 0.04 ERG. The ask's minimum fill defaults to the " +
+      "smallest lot that still claims a raw unit of the repayment."),
+    "A7" -> ("Lists the ask with its price as a percentage of face value, about 91% here. Shows share prices quoted " +
+      "so they compare across bonds of any size."),
+    "A8" -> ("Buys 10% of the shares back from the ask, a partial fill. Shows the ask paying its seller and carrying " +
+      "on with the rest."),
+    "A9" -> "Cancels the rest of the ask, returning the unsold shares. Shows the seller can withdraw an ask at any time.",
+    "A10" -> ("The borrower repays bond A: the collateral comes back, and the repayment waits in the bond vault for " +
+      "the unit, which the share vault holds. The normal, happy ending of a bond."),
+    "A11" -> ("Pulls the repayment into the share vault; anyone can, for the pull fee. All three bond units burn, and " +
+      "the vault now holds ERG for the shareholders."),
+    "A12" -> "Claims with 25% of the shares, taking that share of the repayment. Shows a pro-rata claim after a repayment.",
+    "A13" -> ("Claims with every remaining share, closing the vault. It waits for A9, so every unsold share is back in " +
+      "this wallet."),
+
+    // B: recollateralize, repay from collateral
+    "B1" -> ("An on-close order for 0.1 ERG against 0.3 ERG and 1,000 test tokens: its 90-block term starts when it " +
+      "is filled. Shows an order whose maturity is set by the fill rather than in advance."),
+    "B2" -> ("This wallet fills order B, starting its 90-block term. It also starts the 60-block wait before the bond " +
+      "can take more collateral."),
+    "B2x" -> ("Tries to add collateral to bond B within 60 blocks of its fill, which the CLI must refuse. Shows the " +
+      "wait between moves that stops a borrower dodging a liquidation by moving the bond again and again."),
+    "B3" -> ("Adds 0.02 ERG and 500 more test tokens to bond B once the 60 blocks have passed. The check confirms " +
+      "the bond then holds 1,500 tokens."),
+    "B4" -> ("Repays bond B out of the ERG already locked in it as collateral, so the borrower brings nothing from " +
+      "outside. The rest of the collateral, tokens included, comes back."),
+    "B5" -> "Claims repaid bond B with its unit, taking the 0.11 ERG repayment. All three bond units burn.",
+
+    // C: early liquidation by the oracle rule
+    "C2" -> ("This wallet fills order C anyway, starting a bond that is already below its 150% ratio. It is what C6 " +
+      "liquidates early."),
+    "C3" -> ("Lists bond C as liquidatable. Shows readers applying the oracle rule to find bonds anyone may " +
+      "liquidate now."),
+    "C4" -> "Puts bond C's unit into a share mint request. It is never minted: C5 takes it back.",
+    "C5" -> ("Cancels the share request, returning the unit. Shows the owner can take a unit back out of a request " +
+      "nobody has minted yet."),
+    "C6" -> ("One transaction liquidates bond C by the oracle rule and refunds expired order K2. Shows unrelated work " +
+      "packed together for one miner fee, as a batcher would."),
+    "C7" -> "Lists bond C as claimable after its liquidation.",
+    "C8" -> ("Claims liquidated bond C with its unit: the collateral comes to the unit's holder and all three bond " +
+      "units burn."),
+
+    // K: expiries and cancels
+    "K1" -> "An order that expires in 10 blocks, set up to be refunded.",
+    "K1x" -> ("Tries to refund order K1 before it expires, which the CLI must refuse. Shows that until its expiry, " +
+      "only the borrower can take an order back."),
+    "K1b" -> ("Runs the batch scan once K1 has expired and finds its refund. Shows a batcher discovering work that " +
+      "pays it."),
+    "K1r" -> ("Refunds expired order K1 to its borrower. Anyone may do this from the expiry height and keep the expiry " +
+      "fee; here this wallet is both."),
+    "K2" -> "Another order expiring in 10 blocks. Its refund rides along with bond C's liquidation in C6.",
+    "K3" -> ("An order on the SigUSD market: borrow 1 SigUSD against 0.05 ERG. Nobody fills it; it shows the SigUSD " +
+      "market's contracts taking an order."),
+    "K4" -> "Lists the SigUSD order, with amounts in SigUSD.",
+    "K5" -> "Cancels the SigUSD order, returning its collateral. Shows the borrower can cancel at any time.",
+    "K6" -> "A small lend offer that expires in 10 blocks, set up to be refunded.",
+    "K7" -> ("Refunds the expired offer to its owner. Anyone may, keeping the batcher fee; it is how a contract-owned " +
+      "offer gets its funds back without signing."),
+    "K8" -> "An ask selling 100 test tokens for 0.01 ERG that expires in 10 blocks, set up to be refunded.",
+    "K9" -> "Refunds the expired ask to its seller. Anyone may, keeping the ask's refund fee.",
+    "K10" -> "An ask selling 100 test tokens for 1 SigUSD. Shows the sale order on the SigUSD market.",
+    "K11" -> "Cancels the SigUSD ask, returning the tokens.",
+
+    // G: a batch run
+    "G1" -> ("An on-close order for 0.1 ERG, repaying 0.12 after 60 blocks, under the oracle rule. It is the order " +
+      "the batch run fills."),
+    "O3" -> ("A lend offer of 0.3 ERG that has every bond unit it buys minted into shares for its owner, paying " +
+      "batchers 0.006 ERG. Shows an offer that ends in shares rather than a unit."),
+    "G2" -> ("Runs the batch scan and waits until its only work is matching order G with offer O3. That way the batch " +
+      "run touches nobody else's boxes."),
+    "G3" -> ("A batch run fills order G from the offer, delivering the unit into a share mint request, then mints the " +
+      "shares in a second, chained transaction. Shows a batcher doing the whole job with no input from the lender."),
+    "G4" -> "Mints the delivered shares, in case the batch run stopped before it did. Skipped when it already did.",
+    "G5" -> ("Claims with every share before the bond settles: the shares and the vault's reserve burn, and the bond " +
+      "unit comes back. Shows whoever holds every share can turn them back into the unit until the pull."),
+    "G6" -> "The borrower repays bond G.",
+    "G7" -> "Claims repaid bond G with the unit that came back in G5. All three bond units burn.",
+
+    // end
+    "Z1" -> "Checks this wallet has no open orders left.",
+    "Z2" -> "Checks this wallet has no bonds left.",
+    "Z3" -> "Checks this wallet has no lend offers left.",
+    "Z4" -> "Checks this wallet has no asks left.",
+    "Z5" -> "Checks this wallet has no share requests or vaults left.",
+    "Z6" -> "Checks nothing is left for this wallet to claim."
   )
 }
