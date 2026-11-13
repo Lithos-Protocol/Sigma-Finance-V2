@@ -15,13 +15,18 @@ import scala.util.Try
 /**
  * What a run may do beyond reading: which wallet address to act as, the fee, and whether to submit. `spent`
  * collects the boxes transactions submitted in this session spent, so a later command never builds on them
- * while the node still lists them; a shell session shares one set across its commands.
+ * while the node still lists them; a shell session shares one set across its commands. `submitted` records
+ * every transaction a run submits, for a caller driving the CLI (the live test).
  */
 case class AppSettings(address: Option[String] = None,
                        walletPass: Option[String] = None,
                        fee: Long = Parameters.MinFee,
                        send: Boolean = false,
-                       spent: mutable.Set[String] = mutable.Set.empty[String])
+                       spent: mutable.Set[String] = mutable.Set.empty[String],
+                       submitted: mutable.Buffer[Submission] = mutable.ArrayBuffer.empty[Submission])
+
+/** A transaction a run submitted: its title, its id, and the ids of its output boxes in order. */
+case class Submission(title: String, txId: String, outputs: Seq[String])
 
 /** A transaction built and ready for the node wallet, with what it does in words. */
 case class Prepared(title: String, tx: org.ergoplatform.appkit.UnsignedTransaction, notes: Seq[String])
@@ -147,12 +152,13 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
       p.tx.getDataInputs.asScala.map(b => Base16.encode(b.getBytes)))
     val id = node.checkTransaction(signed)
     out(s"The node wallet signed it, and the node accepts it: $id")
-    signed.hcursor.downField("outputs").focus.flatMap(_.asArray).getOrElse(Vector.empty).zipWithIndex.foreach {
-      case (o, i) => o.hcursor.downField("boxId").as[String].foreach(boxId => out(s"  output $i box id: $boxId"))
-    }
+    val outputIds = signed.hcursor.downField("outputs").focus.flatMap(_.asArray).getOrElse(Vector.empty)
+      .map(_.hcursor.downField("boxId").as[String].getOrElse(""))
+    outputIds.zipWithIndex.foreach { case (boxId, i) => if (boxId.nonEmpty) out(s"  output $i box id: $boxId") }
     if (settings.send) {
       val sent = node.sendTransaction(signed)
       settings.spent ++= p.tx.getInputs.asScala.map(_.getId.toString)
+      settings.submitted += Submission(p.title, sent, outputIds)
       out(s"Submitted: $sent")
       Some(sent)
     } else {

@@ -107,6 +107,41 @@ command it is typed with; a `--send` given at launch is ignored. `--node`, `--ap
 `--wallet-pass` can also come from `SIGMAFI_NODE`, `SIGMAFI_API_KEY` and `SIGMAFI_WALLET_PASS`. If the
 CLI unlocks the wallet for a command, it locks it again afterwards.
 
+### Live test
+
+`sbt livetest` walks the CLI through every ZC Standard command on mainnet. Your node wallet is borrower,
+lender, seller, buyer and batcher throughout, so everything except miner fees comes back to it. It
+needs about 4 ERG and no SigUSD: loans are 0.1 ERG, at most about 2.7 ERG sits in contracts at once,
+and the miner fees come to about 0.07 ERG. A run takes about 70 blocks (roughly 2.5 hours), set by the
+bond's 60-block recollateralize wait; `skip B3` saves about an hour.
+
+```bash
+sbt "livetest --node http://127.0.0.1:9053 --api-key <key> --wallet-pass <pass>"
+```
+
+```text
+livetest> plan      the steps, by track
+livetest> next      run the next ready step; the first transaction asks for a yes
+livetest> auto      run steps as they become ready, waiting for confirmations and heights; Enter pauses
+livetest> status
+```
+
+Each step is a CLI command line, run in one CLI session, with the box ids earlier steps found filled
+in. A setup transaction mints a worthless test token and splits ERG into boxes. The token is
+collateral the oracle does not price, which the Dutch auction's lot and the token-collateral paths
+need. Where the CLI can, a step builds on transactions still in the mempool (`--mempool`). It waits for
+confirmation where the CLI reads the chain's history: an offer or a share request checks a bond asset's
+origin, which needs the order spent on chain. A step that fails while what it built on is unconfirmed
+runs again once that confirms, and the final report lists those.
+
+Steps also run the listings and check what they show, and run commands the CLI must refuse: a claim
+before settlement, recollateralizing within 60 blocks, an early maturity liquidation, a refund before
+expiry, and an offer facing an undercollateralized order. Progress is saved to `sigmafi-livetest.json`,
+so `exit` and starting again resumes. Everything printed also goes to `sigmafi-livetest.log`. `cleanup`
+lists whatever of the wallet's is still open, and `cleanup run` closes it. Options: `--no-chain`,
+`--maturity-blocks <n>` (default 40), `--state <file>`, `--log <file>`. SigUSD loans and offers are not
+covered; a SigUSD order and ask are only created and cancelled.
+
 ## Development
 - [ZC Standard reference](./docs/ZC_STANDARD_REFERENCE.md): every standard contract's tree hash, template
   hash and addresses, and each expression's hash, generated from the compiler alongside the pinned trees

@@ -165,6 +165,14 @@ object SigmaFiCli {
     /** Scripts seen and boxes spent so far: shared by every command this session runs. */
     private val scripts = new ScriptBook
     private val spent = scala.collection.mutable.Set.empty[String]
+    /** Every transaction this session's commands submitted, in order. */
+    val submissions: scala.collection.mutable.ArrayBuffer[Submission] = scala.collection.mutable.ArrayBuffer.empty
+
+    /** Boxes a transaction made outside the CLI spent (the live test's setup), so no command builds on them. */
+    def markSpent(boxIds: Seq[String]): Unit = spent ++= boxIds
+
+    /** The node as the launch options name it; `mempool` also reads unconfirmed transactions. */
+    def nodeApi(mempool: Boolean = false): NodeApi = new NodeApi(nodeUrl, apiKeyFor(launch), mempool)
 
     /** Reads commands until `exit` or the end of input. */
     def shell(): Unit = {
@@ -191,29 +199,21 @@ object SigmaFiCli {
       try {
         if (a.command.isEmpty || a.command.contains("help") || a.flag("help")) println(Usage)
         else {
-          val apiKey = apiKeyFor(a)
           // A batch run reads the mempool, so a later round finds what an earlier one submitted.
           val mempool = a.flag("mempool") || (a.command.contains("batch") && a.flag("run"))
-          val node = new NodeApi(a.opt("node").map(_.stripSuffix("/")).getOrElse(nodeUrl), apiKey, mempool)
-          val ctx = context(node, a.opt("node").map(_.stripSuffix("/")).getOrElse(nodeUrl), apiKey)
-          val settings = AppSettings(
-            address = a.opt("address"),
-            walletPass = a.opt("wallet-pass").orElse(env("SIGMAFI_WALLET_PASS")),
-            fee = a.opt("fee").map(parseErg).getOrElse(org.ergoplatform.appkit.Parameters.MinFee),
-            send = a.flag("send"),
-            spent = spent)
+          val hasApiKey = apiKeyFor(a).isDefined
           if (a.flag("old")) {
+            val (node, ctx, settings) = parts(a, mempool)
             val app = new SigmaFiApp(ctx, node, settings, compiled = Some(old(ctx)))
-            try OldCommands.dispatch(app, node, a, apiKey.isDefined) finally app.close()
-          } else {
-            val app = new StandardApp(ctx, node, settings, protocol = standard, scripts = scripts)
+            try OldCommands.dispatch(app, node, a, hasApiKey) finally app.close()
+          } else withStandard(a, mempool) { (app, node) =>
             // A follow-up runs as its own command, with a fresh context, and keeps this one's node options,
             // --send and mempool reading.
             def followUp(line: String): Boolean =
               Try(Args.parse(Args.tokenize(line) ++ (if (a.flag("send")) Seq("--send") else Seq.empty) ++
                 (if (mempool) Seq("--mempool") else Seq.empty)).withDefaults(a))
                 .fold(e => { report(e); false }, execute)
-            try StandardCommands.dispatch(app, node, a, apiKey.isDefined, followUp) finally app.close()
+            StandardCommands.dispatch(app, node, a, hasApiKey, followUp)
           }
         }
         true
@@ -222,6 +222,31 @@ object SigmaFiCli {
           report(e)
           false
       }
+
+    /**
+     * Runs `f` with a ZC Standard app over a fresh context, as a command gets one: `a` gives the node options,
+     * the address, fee and --send. Used by every standard command, and by code that drives the CLI from
+     * outside the shell (the live test). The wallet is locked again afterwards if this unlocked it.
+     */
+    def withStandard[A](a: Args, mempool: Boolean)(f: (StandardApp, NodeApi) => A): A = {
+      val (node, ctx, settings) = parts(a, mempool)
+      val app = new StandardApp(ctx, node, settings, protocol = standard, scripts = scripts)
+      try f(app, node) finally app.close()
+    }
+
+    private def parts(a: Args, mempool: Boolean): (NodeApi, BlockchainContext, AppSettings) = {
+      val apiKey = apiKeyFor(a)
+      val url = a.opt("node").map(_.stripSuffix("/")).getOrElse(nodeUrl)
+      val node = new NodeApi(url, apiKey, mempool)
+      val settings = AppSettings(
+        address = a.opt("address"),
+        walletPass = a.opt("wallet-pass").orElse(env("SIGMAFI_WALLET_PASS")),
+        fee = a.opt("fee").map(parseErg).getOrElse(org.ergoplatform.appkit.Parameters.MinFee),
+        send = a.flag("send"),
+        spent = spent,
+        submitted = submissions)
+      (node, context(node, url, apiKey), settings)
+    }
 
     private def apiKeyFor(a: Args): Option[String] = a.opt("api-key").orElse(env("SIGMAFI_API_KEY"))
 

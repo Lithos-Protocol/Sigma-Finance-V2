@@ -114,6 +114,18 @@ class NodeApi(nodeUrl: String, apiKey: Option[String], val mempool: Boolean = fa
 
   def sendTransaction(signed: Json): String = txId("/transactions", post("/transactions", signed))
 
+  /**
+   * Have the node wallet build, sign and submit a transaction for `requests`: payments (`address`, `value`,
+   * `assets`) and at most one asset issue (`address`, `ergValue`, `amount`, `name`, `description`,
+   * `decimals`), whose token id is the transaction's first input. Returns the transaction id.
+   */
+  def walletTransactionSend(requests: Seq[Json], fee: Long): String =
+    txId("/wallet/transaction/send", post("/wallet/transaction/send", Json.obj(
+      "requests" -> Json.fromValues(requests),
+      "fee" -> Json.fromLong(fee),
+      "inputsRaw" -> Json.arr(),
+      "dataInputsRaw" -> Json.arr())))
+
   // ─── http ────────────────────────────────────────────────────────────────
 
   private def unspentQuery(offset: Int, limit: Int): Seq[(String, Any)] =

@@ -542,7 +542,7 @@ blake2b256 over UTF-8 source text after normalizing CRLF to LF; these fingerprin
 | `contracts/old/MaturityLiquidation.ergo` | `ba5f0f3647f5f73c3d81a61ffb599119731c89efab5dc1c65d125144520af19e` |
 | `src/main/scala/client/ScriptGenerator.scala` | `9e4865d047444921bb85e57562d193602e197a60dacfd5d1eae3e1250a949dfe` |
 | `src/main/scala/work/lithos/mutations/Contract.scala` | `fe1e473783454eab1b759feb7ea3ab9c757d8e26ec0aef615dd45a5573021213` |
-| `build.sbt` | `cf57add2522b5386c30651edc6759e5fe1f917119360849bb3e1da27b27534f1` |
+| `build.sbt` | `076681fc6386d44c3b933f07d0f6cbbb9ba65f64469d57bae9ad95f378f58646` |
 | `project/build.properties` | `e6023cb99f0ff57fdcb183b400632402e711320ee722372eb7a6a844ba9f4897` |
 
 <!-- END GENERATED CONTRACT REFERENCE -->

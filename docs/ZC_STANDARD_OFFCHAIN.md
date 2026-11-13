@@ -316,10 +316,13 @@ floor, an ask's price or `--nav`, and a Dutch auction's opening, floor and lengt
    node. The offline specs render it with the same codec.
 2. Confirm that browser wallets (EIP-12) keep context extensions on the user's own inputs when they
    sign, so a dApp can write variable 64. The node wallet's `/wallet/transaction/sign` takes them.
-3. Confirm the mempool lookups on a live node: the parameter names come from the node's source
-   (`BlockchainApiRoute`, `UtxoApiRoute`, `WalletApiRoute`), but whether the wallet's
-   `minConfirmations=-1` also leaves out boxes spent in the mempool was not established. The CLI also
-   remembers what its own session spent.
+3. Confirm the mempool lookups on a live node. The parameter names come from the node's source
+   (`BlockchainApiRoute`, `UtxoApiRoute`, `WalletApiRoute`). A live node (6.1.7) accepts the unspent
+   lookups' `includeUnconfirmed` and `excludeMempoolSpent`; this was checked read-only on 2026-11-12,
+   with nothing in its mempool. Whether they find unconfirmed boxes, and whether the wallet's
+   `minConfirmations=-1` also leaves out boxes spent in the mempool, is still open. `sbt livetest`
+   chains its steps through these lookups and reports any step that only passed once its inputs
+   confirmed. The CLI also remembers what its own session spent.
 4. Specs for packing pulls, and for several refunds or liquidations of one owner in a single
    transaction, in the contract harness.
 5. Check how wallets show the supply of a bond unit (3, issued across two outputs) and of shares (2N+1).

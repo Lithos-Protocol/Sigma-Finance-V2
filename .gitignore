@@ -14,3 +14,8 @@ project/metals.sbt
 
 # Local planning notes
 /SIGMAFI_PLAN.MD
+
+# The live test's progress and output
+/sigmafi-livetest.json
+/sigmafi-livetest.json.tmp
+/sigmafi-livetest.log

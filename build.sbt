@@ -45,3 +45,6 @@ Compile / run / outputStrategy := Some(StdoutOutput)
 
 // `sbt sigmafi` starts the shell; anything after it is passed on, e.g. `sbt "sigmafi --node <url>"`.
 addCommandAlias("sigmafi", "runMain ksingh.sigmabonds.app.SigmaFiCli")
+
+// `sbt livetest` walks the CLI through every ZC Standard command against a live node (see the README).
+addCommandAlias("livetest", "runMain ksingh.sigmabonds.livetest.LiveTest")
