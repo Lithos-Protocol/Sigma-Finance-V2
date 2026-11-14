@@ -37,6 +37,7 @@ object LiveTest {
       |  show <step>      what a step does and shows off, its command line, transactions, output boxes and notes
       |  vars             the box and token ids steps have found
       |  retry <step> ... run failed or skipped steps again; `retry failed` re-runs every failed step. A step
+      |                   with recorded transactions is rechecked rather than submitted again. A step
       |                   whose transaction left the mempool unconfirmed runs again by itself (twice at most)
       |  skip <step>      skip a step (B3, the recollateralize 60 blocks after a fill, saves about an hour)
       |  chain on|off     whether steps chain through the mempool or wait for confirmations
@@ -220,30 +221,7 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
   }
 
   /** What must hold once a step confirms; None when it does. */
-  private def verify(s: Step): Option[String] = Try {
-    val n = session.nodeApi()
-    def v(name: String) = state.vars(name)
-    def box(id: String) = n.boxById(id).flatMap(j => Try(NodeJson.box(j)).toOption)
-    s.check match {
-      case Check.NoCheck => None
-      case Check.TokenGone(t) =>
-        val left = n.unspentByTokenId(v(t))
-        if (left.isEmpty) None else Some(s"${left.size} unspent box(es) still hold token ${v(t)}")
-      case Check.VaultState(b, want) => box(v(b)).flatMap(protocol.asShareVault) match {
-        case None => Some(s"box ${v(b)} is not a share vault")
-        case Some(vault) if vault.holding => Some("the vault still holds its bond unit")
-        case Some(vault) if !vault.state.contains(want.toByte) =>
-          Some(s"the vault's state is ${vault.state.fold("unset")(_.toString)}, not $want")
-        case _ => None
-      }
-      case Check.BondHolds(b, t, amount) => box(v(b)).flatMap(protocol.asBond) match {
-        case None => Some(s"box ${v(b)} is not a live bond")
-        case Some(bond) =>
-          val held = bond.collateral.filter(_.id.toString == v(t)).map(_.amount).sum
-          if (held == amount) None else Some(s"the bond holds $held of token ${v(t)}, not $amount")
-      }
-    }
-  }.fold(e => Some(s"the check could not read the node: ${e.getMessage}"), identity)
+  private def verify(s: Step): Option[String] = LiveChecks.verify(s, state, session.nodeApi(), protocol)
 
   // ═══ READINESS ════════════════════════════════════════════════════════════
 
@@ -855,21 +833,20 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
   }
 
   /**
-   * `retry failed` re-runs every failed step; otherwise each step named. A step whose transactions never
-   * reached the chain has its bindings undone first, so it builds on what was there before it.
+   * `retry failed` retries every failed step; otherwise each step named. Recorded transactions go back
+   * through confirmation and verification, preserving their evidence and bindings. If they really dropped,
+   * settle/dropped will undo the bindings before resubmitting. Unsubmitted steps run again directly.
    */
   private def retry(ids: Seq[String]): Unit = {
     val chosen = if (ids == Seq("failed")) plan.filter(s => st(s.id).status == Failed) else ids.flatMap(find)
     if (chosen.isEmpty) say("Nothing to retry.")
-    val n = session.nodeApi()
     chosen.foreach { s =>
       st(s.id).status match {
         case Failed | Skipped =>
-          val onChain = st(s.id).txs.exists(tx => Try(n.transactionById(tx)).toOption.flatten.isDefined)
-          if (!onChain) state = state.unbind(s.id)
-          set(s.id)(ss => ss.copy(status = Pending, txs = Vector.empty, outputs = Vector.empty, waitFor = Vector.empty,
-            attempts = 0, misses = 0, notBefore = None, notes = ss.notes :+ "retried"))
-          say(s"${s.id} will run again.")
+          state = state.retry(s.id)
+          save()
+          if (st(s.id).status == InFlight) say(s"${s.id} will recheck its submitted transactions.")
+          else say(s"${s.id} will run again.")
         case other => say(s"${s.id} is $other: only a failed or skipped step can be retried.")
       }
     }

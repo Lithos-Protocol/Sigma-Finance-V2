@@ -1,9 +1,11 @@
 {
-    // Standard NAV-priced ask (the shell).
+    // Standard expression-priced ask (the shell).
     // An ZC_Standard_SaleOrder with one more condition on a fill: a pricing expression the seller chose
     // must also pass. The expression works a price out of on-chain state, so the seller never
     // updates the ask. A new way to price is a new expression, not a new ask contract.
-    // ZC_Standard_AccruedValue_Pricing is the first: a bond's accrued value plus or minus a margin.
+    // ZC_Standard_AccruedValue_Pricing: accrued value plus or minus a margin.
+    // ZC_Standard_YieldAsk_Pricing: a price preserving a chosen simple block yield.
+    // Guarded versions additionally require minimum collateral cover at a fresh oracle.
     // Nothing here verifies what the token is: a buyer, or a buying contract, does that.
     //
     // CONSTANTS

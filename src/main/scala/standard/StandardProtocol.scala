@@ -27,13 +27,15 @@ case class OracleRatio(market: Market, expression: Contract) extends Liquidation
 }
 
 /**
- * A standard order. `terms` is R4 exactly as the bond will copy it: 0 repayment, 1 principal nanoERG,
+ * A fixed or priced order. `terms` is R4; a priced fill resolves principal before copying it: 0 repayment, 1 principal nanoERG,
  * 2 repayment ERG floor, 3 maturity height or duration, 4 expiry height, 5 expiry fee, 6 mode, 7.. payload.
- * `guardHash` is R8, the fill guard expression a fill must also pass, when the borrower set one; the
+ * `guardHash` is fixed Order R8 or PricedOrder R8(1), the optional fill guard; the
  * standard guard reads its minimum fill ratio at payload(2).
  */
 case class StdOrder(box: InputUTXO, market: Market, terms: Seq[Long], principalTokens: Seq[Token],
-                    borrowerHash: Array[Byte], liqHash: Array[Byte], guardHash: Option[Array[Byte]] = None) {
+                    borrowerHash: Array[Byte], liqHash: Array[Byte], guardHash: Option[Array[Byte]] = None,
+                    pricingHash: Option[Array[Byte]] = None, pricingTerms: Seq[Long] = Seq.empty) {
+  def priced: Boolean = pricingHash.isDefined
   /** The guard's minimum collateral ratio at the fill, in basis points of the repayment. */
   def fillRatio: Option[Long] = guardHash.flatMap(_ => payload.lift(2))
   def repayment: Long = terms(0)
@@ -111,16 +113,16 @@ case class StdShareVault(box: InputUTXO, dutch: Boolean, bondAsset: ErgoId, n: L
   def currencyToken: Option[ErgoId] = currency.filter(_.length == 32).map(new ErgoId(_))
 }
 
-/** An ask: a ZC_Standard_SaleOrder, or a ZC_Standard_NavAsk (`nav`) priced by its R6 expression. */
-case class StdAsk(box: InputUTXO, market: Market, nav: Boolean, sellerHash: Array[Byte], terms: Seq[Long],
-                  pricingHash: Option[Array[Byte]], navAsset: Option[ErgoId]) {
+/** An ask: a ZC_Standard_SaleOrder, or a ZC_Standard_PricedAsk (`priced`) priced by its R6 expression. */
+case class StdAsk(box: InputUTXO, market: Market, priced: Boolean, sellerHash: Array[Byte], terms: Seq[Long],
+                  pricingHash: Option[Array[Byte]], pricedAsset: Option[ErgoId], yieldBased: Boolean = false) {
   def token: Token = box.tokens.head
   def numerator: Long = terms(0)
   def denominator: Long = terms(1)
   def minFill: Long = terms(2)
   def expiry: Long = terms(3)
-  def margin: Long = if (nav) terms(4) else 0L
-  def wholeUnits: Long = if (nav) terms(5) else 1L
+  def margin: Long = if (!priced) 0L else terms.lift(if (yieldBased) 6 else 4).getOrElse(0L)
+  def wholeUnits: Long = if (priced) terms(5) else 1L
   /** The fixed price (a sale order's price, a NAV ask's floor) of `units` raw units. */
   def fixedPrice(units: Long): BigInt = (BigInt(units) * numerator + denominator - 1) / denominator
 }
@@ -157,12 +159,13 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
 
   val bondTemplateHash: Array[Byte] = templateHash(market(Market.Erg).bond.ergoTree)
   val orderTemplateHash: Array[Byte] = templateHash(market(Market.Erg).order.ergoTree)
+  val pricedOrderTemplateHash: Array[Byte] = templateHash(market(Market.Erg).pricedOrder.ergoTree)
 
   private def marketWhere(tree: ErgoTree, of: MarketContracts => Contract): Option[Market] =
     Market.all.find(m => sameTree(tree, of(market(m)).ergoTree))
 
   def bondMarket(tree: ErgoTree): Option[Market] = marketWhere(tree, _.bond)
-  def orderMarket(tree: ErgoTree): Option[Market] = marketWhere(tree, _.order)
+  def orderMarket(tree: ErgoTree): Option[Market] = marketWhere(tree, _.order).orElse(marketWhere(tree, _.pricedOrder))
 
   // ─── liquidation rules ───────────────────────────────────────────────────
 
@@ -181,20 +184,47 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
     principal <- tokensReg(box, 5)
     borrower <- bytesReg(box, 6) if borrower.length == 32
     liq <- bytesReg(box, 7) if liq.length == 32
-  } yield StdOrder(box, m, terms.toSeq, principal, borrower, liq, bytesReg(box, 8))
+  } yield {
+    val priced = sameTree(box.input.getErgoTree, market(m).pricedOrder.ergoTree)
+    val policies = if (priced) bytesListReg(box, 8).getOrElse(Seq.empty) else Seq.empty
+    StdOrder(box, m, terms.toSeq, principal, borrower, liq,
+      if (priced) policies.lift(1).filter(_.nonEmpty) else bytesReg(box, 8),
+      if (priced) Some(policies.headOption.getOrElse(Array.emptyByteArray)) else None,
+      if (priced) longsReg(box, 9).fold(Seq.empty[Long])(_.toSeq) else Seq.empty)
+  }
+
+  def orderPricingOf(order: StdOrder): Contract = {
+    val c = market(order.market)
+    Seq(c.navOrderPricing, c.yieldOrderPricing).find(p => order.pricingHash.exists(_.sameElements(p.hashedValueBytes)))
+      .getOrElse(throw app.CliError("the order names an unknown pricing expression"))
+  }
+
+  def yieldOrder(order: StdOrder): Boolean = order.pricingHash.exists(_.sameElements(market(order.market).yieldOrderPricing.hashedValueBytes))
 
   /** Whether `hash` is the standard fill guard compiled for `m`. */
   def isFillGuard(hash: Array[Byte], m: Market): Boolean = hash.sameElements(market(m).fillGuard.hashedValueBytes)
 
-  /** Whether a NAV ask's R6 names the guarded pricing expression, which also holds a sale to a minimum cover. */
-  def isGuarded(ask: StdAsk): Boolean = ask.pricingHash.exists(_.sameElements(market(ask.market).guardedPricing.hashedValueBytes))
+  /** Whether a priced ask's R6 names a guarded pricing expression, which also holds a sale to a minimum cover. */
+  def isGuarded(ask: StdAsk): Boolean = ask.pricingHash.exists(h =>
+    Seq(market(ask.market).guardedPricing, market(ask.market).guardedYieldPricing).exists(_.hashedValueBytes.sameElements(h)))
 
-  /** A guarded ask's (minimum cover in basis points, maximum oracle age): R5(6) and R5(7). */
+  def yieldAsk(ask: StdAsk): Boolean = ask.pricingHash.exists(h =>
+    Seq(market(ask.market).yieldPricing, market(ask.market).guardedYieldPricing).exists(_.hashedValueBytes.sameElements(h)))
+
+  /** A guarded ask's (minimum cover bps, oracle age): NAV R5(6..7), yield R5(7..8). */
   def saleGuard(ask: StdAsk): Option[(Long, Long)] =
-    if (isGuarded(ask) && ask.terms.size >= 8) Some(ask.terms(6) -> ask.terms(7)) else None
+    if (!isGuarded(ask)) None else {
+      val offset = if (yieldAsk(ask)) 7 else 6
+      if (ask.terms.size >= offset + 2) Some(ask.terms(offset) -> ask.terms(offset + 1)) else None
+    }
 
-  /** The pricing expression a NAV ask's R6 names, as the bytes its var 2 carries. */
-  def pricingOf(ask: StdAsk): Contract = if (isGuarded(ask)) market(ask.market).guardedPricing else market(ask.market).pricing
+  /** The pricing expression a priced ask's R6 names, as the bytes its var 2 carries. */
+  def pricingOf(ask: StdAsk): Contract = {
+    val c = market(ask.market)
+    Seq(c.pricing, c.guardedPricing, c.yieldPricing, c.guardedYieldPricing)
+      .find(p => ask.pricingHash.exists(_.sameElements(p.hashedValueBytes)))
+      .getOrElse(throw app.CliError("the ask names an unknown pricing expression"))
+  }
 
   def asBond(box: InputUTXO): Option[StdBond] = for {
     m <- bondMarket(box.input.getErgoTree)
@@ -215,7 +245,7 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
     } yield StdSettlement(box, box.tokens.head.id, bondId, path == 1.toByte)
 
   val askTemplateHash: Array[Byte] = templateHash(market(Market.Erg).saleOrder.ergoTree)
-  val navAskTemplateHash: Array[Byte] = templateHash(market(Market.Erg).navAsk.ergoTree)
+  val pricedAskTemplateHash: Array[Byte] = templateHash(market(Market.Erg).pricedAsk.ergoTree)
   val offerTemplateHash: Array[Byte] = templateHash(market(Market.Erg).offer.ergoTree)
   val dutchMintTemplateHash: Array[Byte] = templateHash(market(Market.Erg).dutchMint.ergoTree)
 
@@ -247,7 +277,7 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
   def asAsk(box: InputUTXO): Option[StdAsk] = {
     val tree = box.input.getErgoTree
     val sale = marketWhere(tree, _.saleOrder)
-    val nav = marketWhere(tree, _.navAsk)
+    val nav = marketWhere(tree, _.pricedAsk)
     for {
       m <- sale.orElse(nav)
       if box.tokens.size == 1
@@ -256,7 +286,8 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
       if terms(0) > 0L && terms(1) > 0L
       pricing <- if (nav.isDefined) bytesReg(box, 6).map(Some(_)) else Some(None)
       asset <- if (nav.isDefined) bytesReg(box, 7).filter(_.length == 32).map(a => Some(new ErgoId(a))) else Some(None)
-    } yield StdAsk(box, m, nav.isDefined, seller, terms.toSeq, pricing, asset)
+    } yield StdAsk(box, m, nav.isDefined, seller, terms.toSeq, pricing, asset, pricing.exists(h =>
+      Seq(market(m).yieldPricing, market(m).guardedYieldPricing).exists(_.hashedValueBytes.sameElements(h))))
   }
 
   def asOffer(box: InputUTXO): Option[StdOffer] = for {
@@ -285,7 +316,7 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
   def namedScriptRegister(tree: ErgoTree): Option[Int] =
     if (orderMarket(tree).isDefined) Some(6)
     else if (bondMarket(tree).isDefined) Some(5)
-    else if (Seq[MarketContracts => Contract](_.offer, _.saleOrder, _.navAsk).exists(marketWhere(tree, _).isDefined)) Some(4)
+    else if (Seq[MarketContracts => Contract](_.offer, _.saleOrder, _.pricedAsk).exists(marketWhere(tree, _).isDefined)) Some(4)
     else if (isShareMint(tree)) Some(7)
     else None
 

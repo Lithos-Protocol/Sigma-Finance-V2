@@ -1,5 +1,5 @@
 {
-    // Standard pricing expression for ZC_Standard_NavAsk.
+    // Standard pricing expression for ZC_Standard_PricedAsk.
     // Executed through the ask's context var 2 with the ASK as SELF. It prices a live standard bond,
     // or shares of one, at its accrued value plus or minus the seller's margin. The ask pins this
     // expression's hash in R6, so a seller chooses it and a batcher cannot swap it.

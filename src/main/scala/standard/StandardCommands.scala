@@ -45,6 +45,8 @@ object StandardCommands {
   // ═══ ARGUMENTS ════════════════════════════════════════════════════════════
 
   private def loan(a: Args, app: StandardApp): StdLoan = {
+    if (a.flag("nav") && a.opt("yield").isDefined) throw CliError("choose --nav or --yield, not both")
+    if (a.opt("margin").isDefined && !a.flag("nav") && a.opt("yield").isEmpty) throw CliError("--margin needs --nav or --yield")
     if (a.opt("principal-token").isDefined)
       throw CliError("a ZC Standard loan is lent in its market's asset: use --market SigUSD --principal <amount>")
     val market = a.opt("market").map(n => Market.named(n).getOrElse(
@@ -98,7 +100,9 @@ object StandardCommands {
         case OnClose(_) => None
       },
       allowLiquidatable = a.flag("allow-liquidatable"),
-      fillRatio = fillRatio)
+      fillRatio = fillRatio,
+      price = if (a.flag("nav")) Some(NavOrderPrice(ExchangeCommands.signedBps(a.opt("margin").getOrElse("0"))))
+        else a.opt("yield").map(s => YieldOrderPrice(ExchangeCommands.nonNegativeBps(s), ExchangeCommands.signedBps(a.opt("margin").getOrElse("0")))))
   }
 
   /** "150" or "150.5" percent as basis points, for the option `key`. */
@@ -123,9 +127,11 @@ object StandardCommands {
     Market.all.foreach { m =>
       show(s"Bond ($m)", c.market(m).bond)
       show(s"Order ($m)", c.market(m).order)
+      show(s"PricedOrder ($m)", c.market(m).pricedOrder)
     }
     println(s"Bond template hash:  ${Base16.encode(app.protocol.bondTemplateHash)}")
     println(s"Order template hash: ${Base16.encode(app.protocol.orderTemplateHash)}")
+    println(s"PricedOrder template hash: ${Base16.encode(app.protocol.pricedOrderTemplateHash)}")
     app.protocol.rules.foreach(r => println(s"Liquidation ${r.name}: ${Base16.encode(r.expression.hashedValueBytes)}"))
     println("Every pinned tree, with addresses: docs/ZC_STANDARD_REFERENCE.md")
     if (hasApiKey) println(s"Wallet address: ${app.myAddress}")
@@ -139,6 +145,12 @@ object StandardCommands {
       val m = o.market
       println(s"Order ${o.box.id}  ($m, ${if (o.onClose) "on-close" else "fixed maturity"})")
       println(s"  borrow:      ${Units.amount(o.principal, m)}; repay ${Units.amount(o.repayment, m)}")
+      if (o.priced) {
+        val quote = Try(app.orderPrincipal(o, app.height.toLong + 3L, app.height.toLong))
+          .map(p => Units.amount(p, m)).getOrElse("unavailable (unknown or invalid policy, expired curve, or maturity too near)")
+        val label = Try(app.protocol.orderPricingOf(o)).map(_ => if (app.protocol.yieldOrder(o)) "block yield" else "NAV").getOrElse("UNKNOWN")
+        println(s"  PricedOrder: $label; quoted principal above is its floor; fill principal now: $quote")
+      }
       println("  maturity:    " + (if (o.onClose) s"${o.terms(3)} blocks after the fill"
         else s"height ${o.terms(3)} (${o.terms(3) - app.height} blocks from now)"))
       println(s"  collateral:  ${Fmt.contents(o.collateralErg, o.collateral)}")

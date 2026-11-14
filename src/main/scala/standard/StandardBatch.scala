@@ -209,7 +209,8 @@ trait StandardBatch extends AppBase { self: StandardApp =>
     val taken = mutable.Set.empty[String]
     allOffers.filter(o => next < o.expiry && alone(o.batcherFee) && served(o.ownerHash, o.box, "lend offer", "owner"))
       .sortBy(o => (-o.batcherFee, o.box.id.toString)).foreach { o =>
-        val fromOrders = orderSources.filter(x => x.market == o.market && !taken(x.box.id.toString)).flatMap { order =>
+        val fromOrders = orderSources.filter(x => x.market == o.market && !taken(x.box.id.toString)).flatMap { original =>
+          val order = resolveOrder(original, height.toLong)
           val maturity = if (order.onClose) height.toLong + order.terms(3) else order.terms(3)
           val bond = prospective(order, height.toLong, maturity, o.feeReserve)
           if (offerRefusal(o, bond, order.principal, 1L, 1L, usableOracle).nonEmpty ||

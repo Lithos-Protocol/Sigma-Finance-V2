@@ -1,0 +1,82 @@
+{
+    // PricedAsk block-yield policy, var 2; ask R5(4)=reference buyer yield bps per 262800 blocks.
+    // R5(5)=units per bond, R5(6)=signed price margin bps, R7=bond asset, var 3=live bond data input.
+    // paid*N*(B+yield*D)*10000 >= sold*R*B*(10000+margin), B=2628000000, D=maturity-HEIGHT.
+    // Simple block yield, conditional on full repayment at maturity, excluding fees.
+    // R5(7..8)=minimum cover and oracle age; the independent sale guard matches GuardedNav.
+    val terms = SELF.R5[Coll[Long]].get
+    val payoutIndex = getVar[Int](0).get
+    val nextIndex = getVar[Int](1)
+    val stateIndex = getVar[Int](3).get
+
+    if (terms.size < 9 || SELF.tokens.size != 1 ||
+        payoutIndex < 0 || payoutIndex >= OUTPUTS.size ||
+        stateIndex < 0 || stateIndex >= CONTEXT.dataInputs.size) {
+        sigmaProp(false)
+    } else {
+        val yieldBps = terms(4)
+        val wholeUnits = terms(5)
+        val margin = terms(6)
+        val minBps = terms(7)
+        val maxAge = terms(8)
+        val asset = SELF.R7[Coll[Byte]].get
+        val state = CONTEXT.dataInputs(stateIndex)
+        val isBond =
+            blake2b256(state.propositionBytes) == CONST_BOND_HASH &&
+            state.tokens.size > 0 && state.tokens(0)._1 == asset && state.tokens(0)._2 == 2L
+        val oracleNFT = fromBase16("6a2b821b5727e85beb5e78b4efb9f0250d59cd48481d2ded2c23e91ba1d07c66")
+        val sigUSD = fromBase16("03faf2cb329f2e90d6d23b58d91bbb6c046aa143261cc21f52fbe2824bfcbf04")
+        val pools = CONTEXT.dataInputs.filter { (b: Box) =>
+            b.tokens.exists { (t: (Coll[Byte], Long)) => t._1 == oracleNFT && t._2 == 1L }
+        }
+
+        if (!isBond || yieldBps < 0L || margin <= -10000L || margin > 1000000L ||
+            wholeUnits < 1L || wholeUnits > 1000000000L ||
+            minBps <= 0L || maxAge < 1L || maxAge > 100000L || pools.size != 1) {
+            sigmaProp(false)
+        } else {
+            val borrower = state.R6[Coll[Long]].get
+            val lender = state.R9[Coll[Long]].get
+            val repaysERG = CONST_REPAYMENT_TOKEN == SELF.id.slice(0, 0)
+            val supported = repaysERG || CONST_REPAYMENT_TOKEN == sigUSD
+            val repayment = borrower(0)
+            val fee = lender(0)
+            val maturity = lender(2)
+            val blocksLeft = maturity - HEIGHT.toLong
+
+            val payout = OUTPUTS(payoutIndex)
+            val paid = if (repaysERG) {
+                payout.value
+            } else if (payout.tokens.size > 0 && payout.tokens(0)._1 == CONST_REPAYMENT_TOKEN) {
+                payout.tokens(0)._2
+            } else 0L
+            val remaining = if (nextIndex.isDefined) OUTPUTS(nextIndex.get).tokens(0)._2 else 0L
+            val sold = SELF.tokens(0)._2 - remaining
+
+            val pool = pools(0)
+            val price = pool.R4[Long].get
+            val epoch = pool.R5[Int].get
+            val created = pool.creationInfo._1.toLong
+            val fresh = created >= 0L && created <= HEIGHT.toLong && HEIGHT.toLong - created <= maxAge
+
+            if (repayment <= 0L || blocksLeft <= 0L || sold < 1L ||
+                !supported || !fresh || price <= 0L || epoch < 0 || fee < 0L || fee > state.value) {
+                sigmaProp(false)
+            } else {
+                val scale = 2628000000L.toBigInt
+                val collateralUSD = state.tokens.slice(1, state.tokens.size).fold(0L, { (a: Long, t: (Coll[Byte], Long)) =>
+                    if (t._1 == sigUSD) a + t._2 else a
+                })
+                val collateralValue = (state.value - fee).toBigInt * 100L.toBigInt +
+                    price.toBigInt * collateralUSD.toBigInt
+                val debtValue = if (repaysERG) repayment.toBigInt * 100L.toBigInt
+                    else price.toBigInt * repayment.toBigInt
+                sigmaProp(
+                    paid.toBigInt * wholeUnits.toBigInt * (scale + yieldBps.toBigInt * blocksLeft.toBigInt) * 10000L.toBigInt >=
+                        sold.toBigInt * repayment.toBigInt * scale * (10000L + margin).toBigInt &&
+                    collateralValue * 10000L.toBigInt >= debtValue * minBps.toBigInt
+                )
+            }
+        }
+    }
+}

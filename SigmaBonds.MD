@@ -26,16 +26,18 @@ All paths are under `contracts/bonds/`. Names drop the `ZC_Standard_` prefix.
 |---|---|---|
 | `core/` | `Bond` | The live bond: holds the collateral, repays or liquidates into the vault |
 | `core/` | `BondVault` | Holds a settlement; the asset holder claims it |
-| `P2P/` | `Order` | A borrower's request for a loan; the fill mints the bond asset |
+| `P2P/` | `Order`, `PricedOrder` | A borrower's request for a loan; the fill mints the bond asset |
 | `P2P/` | `SaleOrder` | A fixed-price ask for any token |
-| `P2P/` | `NavAsk` | An ask priced by an expression the seller picks |
+| `P2P/` | `PricedAsk` | An ask priced by an expression the seller picks |
 | `P2P/` | `LendOffer` | A lender's yield bid: fills orders and buys from asks |
 | `lender-scripts/` | `FractionalMint`, `FractionalVault` | Turn one bond unit into N fungible shares |
 | `lender-scripts/` | `DutchAuctionMint`, `DutchAuctionVault` | The same, with a Dutch auction of liquidated collateral |
 | `liquidations/` | `MaturityLiquidation` | Liquidation rule: at or after maturity |
 | `liquidations/` | `ERG_SigUSD_Liquidation` | Liquidation rule: an oracle collateral ratio, or maturity |
 | `policies/` | `ERG_SigUSD_CollateralPolicy` | The lend offer's risk rule |
-| `policies/` | `AccruedValue_Pricing` | The NAV ask's first pricing rule |
+| `policies/` | `AccruedValue_Pricing`, `YieldAsk_Pricing` | A priced ask's NAV or simple block-yield rule |
+| `policies/` | `NavOrder_Pricing`, `YieldOrder_Pricing` | A priced order's principal rule |
+| `policies/` | `ERG_SigUSD_GuardedYield_Pricing` | Yield pricing with a sale collateral guard |
 | `policies/` | `ERG_SigUSD_FillGuard` | The borrower's guard: an order fills only at a minimum collateral ratio |
 | `policies/` | `ERG_SigUSD_GuardedNav_Pricing` | Accrued-value pricing with the seller's guard: an ask sells only at a minimum collateral ratio |
 
@@ -116,13 +118,35 @@ cannot stamp a later one to lock the borrower out.
 From the expiry height on, anyone may return the order, tagged with its id, to the borrower and keep
 the expiry fee.
 
+### Priced order
+
+`PricedOrder` is an additional issuer, with the same collateral, lifecycle, three-unit mint and
+output positions as `Order`. Repayment and all non-price terms remain fixed. Its expression prices
+**principal only**; the bond records the actual payment, excluding the returned expiry fee.
+An ERG payment minus that fee equals bond R6(1), and its tokens equal bond R7 exactly.
+For a token loan only the principal token amount may change; the nanoERG beside it stays fixed.
+
+R4-R7 follow `Order`, except principal amounts are floors (and the NAV anchor). R8 is a
+`Coll[Coll[Byte]]` of exactly `(pricing expression hash, fill guard hash or empty bytes)`.
+R9 is a `Coll[Long]` payload of at most 64 values. Fill context var 2 supplies mandatory pricing,
+var 1 the optional collateral guard. They run separately with the order as `SELF`.
+Pricing cannot change repayment, collateral, maturity rules, borrower, liquidation expression or fees.
+Cancel and expiry need neither expression, even if pricing data are malformed.
+
+`NavOrder_Pricing` uses R9 `(reference height, margin bps)`: the reference equals the order's
+creation height and the endpoint is the bond's actual maturity. It supports fixed and on-close
+maturity. An on-close endpoint moves with the fill: waiting raises the required principal, but the
+post-fill duration stays fixed. `YieldOrder_Pricing` uses R9 `(yield bps per 262800 blocks, price margin bps)` and
+calculates principal from the fixed repayment and remaining blocks. The original principal floor
+always applies. See [pricing rules and examples](docs/ZC_STANDARD_PRICING.md).
+
 ### Bond
 
 | Register | Contents |
 |---|---|
 | R4 | Originating order id, which is also the asset id |
 | R5 | Borrower script hash |
-| R6 | The order's borrower terms, copied exactly |
+| R6 | Borrower terms; copied exactly from `Order`, or with actual principal resolved by `PricedOrder` |
 | R7 | Principal tokens |
 | R8 | Liquidation expression hash |
 | R9 `Coll[Long]` | Lender values: (liquidation fee reserve, start height, maturity height) |
@@ -175,7 +199,7 @@ Both parties must inspect the expression: its hash is a commitment, not a proof 
 
 A token X is a genuine standard bond if two things hold:
 
-1. **Origin.** The box whose id is X was spent as a standard `Order`. Off-chain, fetch the box by id
+1. **Origin.** The box whose id is X was spent as an accepted `Order` or `PricedOrder`. Off-chain, fetch the box by id
    from the indexed node and compare its script. On-chain, a contract takes the serialized box as a
    context variable and checks `blake2b256(bytes) == X` and that `Global.deserializeTo[Box](bytes)`
    carries the order script. Because that box minted X under the order's rules, the supply is 3
@@ -253,10 +277,10 @@ A buyer reads the payout, not the ask's price, and requires R5 to equal the unit
 batcher cannot have an ask sell 10 units, deliver 6 and charge the buyer for all 10. Any new kind of
 ask that keeps the convention works with existing offers.
 
-### Sale order and NAV ask
+### Sale order and priced ask
 
 `SaleOrder` sells at a fixed price per raw unit, `ceil(units × numerator / denominator)`, with
-partial fills and a minimum fill. `NavAsk` does the same with a fixed floor price, plus a pricing
+partial fills and a minimum fill. `PricedAsk` does the same with a fixed floor price, plus a pricing
 expression the seller pins in R6; a new pricing method is a new expression, not a new ask.
 
 `AccruedValue_Pricing` prices a live bond, or u of its N shares, at accrued value plus a signed
@@ -264,11 +288,18 @@ margin: `P + (R − P) × (HEIGHT − start) / (maturity − start)`, all read f
 maturity and at settlement, because the state box is then no longer a live bond. The price rises
 every block, so a fill pays for the height it lands at.
 
-Both asks are paid in one asset, compiled in per market.
+`YieldAsk_Pricing` instead enforces `paid * N * (B + yield_bps * D) * 10000 >= sold * R * B * (10000 + margin_bps)`,
+where `B = 10000 * 262800` and `D` is remaining blocks. Its R5(4) is a nonnegative reference yield,
+R5(5) the units per bond, and R5(6) the signed price margin with NAV's bounds. The guarded version
+adds R5(7..8) minimum-cover/oracle-age parameters; guarded NAV retains its original R5(6..7). Both price only live bonds, before maturity; they are quoted
+returns conditional on repayment, not collateral valuations or guaranteed returns.
+
+Both asks are paid in one asset, compiled in per market. `PricedAsk` retains the former `NavAsk`
+script bytes: it is a generic policy shell, with NAV and yield as alternative expressions.
 
 ### Lend offer
 
-`LendOffer` holds a lender's capital and buys at a minimum **simple-interest yield**:
+`LendOffer` holds a lender's capital and buys at a minimum **simple block yield** (normalized over 262800 blocks):
 
 ```
 R × 10000 × 262800 ≥ P × (10000 × 262800 + yield_bps × D)
@@ -284,7 +315,7 @@ shares. An offer set below it never fills; its owner cancels it, or anyone refun
 
 The offer buys from three sources, chosen by context variables:
 
-1. **A new bond**: it fills a standard order. The order's own script validates the bond.
+1. **A new bond**: it fills an accepted `Order` or `PricedOrder`. The issuing script validates the bond.
 2. **An existing bond unit** from any ask: it verifies the origin from the order's serialized box
    and requires the live bond as a data input.
 3. **Shares** from any ask: it also verifies the mint request's serialized box. Dutch auction shares
@@ -334,7 +365,7 @@ Every box that waits on someone has a way out.
 
 | Box | Owner, any time | Anyone |
 |---|---|---|
-| Order | Borrower cancels | From expiry: refund to the borrower for the expiry fee |
+| Order, PricedOrder | Borrower cancels | From expiry: refund to the borrower for the expiry fee |
 | Lend offer | Owner cancels | From expiry: refund to the owner for the offer's batcher fee |
 | Sale order, NAV ask | Seller cancels | From expiry: refund to the seller for the nanoERG funded above 0.001 ERG |
 | Fractional or Dutch mint request | Owner cancels | The mint itself, for the mint fee, at any time |
@@ -409,3 +440,12 @@ input. In brief:
 
 Lenders and borrowers must evaluate collateral authenticity and their own risk before agreeing to a
 loan.
+
+## Pricing extension compatibility (2026-11-14)
+
+The fixed order, bond, bond vault, fractional and Dutch contracts are unchanged. `PricedAsk` is a
+source/pin-name rename of `NavAsk` with identical tree bytes. `PricedOrder` and its pricing expressions
+are new. `LendOffer` now pins both accepted issuing hashes for primary fills and secondary origin
+checks; its tree/address changes. Existing boxes cannot be upgraded by replacing source files.
+The CLI pins and generated reference include the new set. Validation is offline; new priced paths
+have not been run against a live node. Historical cost figures above predate this extension.

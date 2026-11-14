@@ -93,9 +93,13 @@ object ExchangeCommands {
 
   private def sell(app: StandardApp, a: Args): Prepared = {
     val m = market(a)
+    if (a.flag("nav") && a.opt("yield").isDefined) throw CliError("choose --nav or --yield, not both")
+    if (a.opt("margin").isDefined && !a.flag("nav") && a.opt("yield").isEmpty) throw CliError("--margin needs --nav or --yield")
     val price = if (a.flag("nav")) NavPrice(a.opt("margin").map(signedBps).getOrElse(0L),
       a.opt("price").map(Units.parse(_, m, "--price")))
-    else FixedPrice(Units.parse(a.opt("price").getOrElse(throw CliError("give --price <total> or --nav")), m, "--price"))
+    else if (a.opt("yield").isDefined) YieldPrice(nonNegativeBps(a.need("yield")), a.opt("price").map(Units.parse(_, m, "--price")),
+      a.opt("margin").map(signedBps).getOrElse(0L))
+    else FixedPrice(Units.parse(a.opt("price").getOrElse(throw CliError("give --price <total>, --nav or --yield <percent>")), m, "--price"))
     if (a.opt("oracle-age").isDefined && a.opt("min-cover").isEmpty) throw CliError("--oracle-age on an ask needs --min-cover")
     val guard = percent(a, "min-cover").map { bps =>
       if (bps <= 0L) throw CliError("--min-cover must be positive")
@@ -107,10 +111,16 @@ object ExchangeCommands {
   }
 
   /** A signed margin in percent, e.g. -2 or 1.5, as basis points. */
-  private def signedBps(s: String): Long = {
+  private[standard] def signedBps(s: String): Long = {
     val bps = Try(BigDecimal(s) * 100).getOrElse(throw CliError(s"--margin: $s is not a percentage"))
     if (!bps.isWhole) throw CliError(s"--margin: $s has more than 2 decimals")
     Try(bps.toLongExact).getOrElse(throw CliError(s"--margin: $s is too large"))
+  }
+
+  private[standard] def nonNegativeBps(s: String): Long = {
+    val bps = Try(BigDecimal(s) * 100).getOrElse(throw CliError(s"--yield: $s is not a percentage"))
+    if (!bps.isWhole || bps < 0) throw CliError("--yield must be nonnegative, with at most 2 decimals")
+    Try(bps.toLongExact).getOrElse(throw CliError("--yield is too large"))
   }
 
   private def offerSpec(app: StandardApp, a: Args): OfferSpec = {
@@ -181,14 +191,17 @@ object ExchangeCommands {
     if (asks.isEmpty) println("No asks.")
     asks.foreach { a =>
       val guard = app.protocol.saleGuard(a)
-      val fixed = !a.nav || (guard.isDefined && a.margin == StandardProtocol.GuardedFixedMargin)
-      println(s"Ask ${a.box.id}  ${a.token.amount} of ${a.token.id}  (${if (fixed) "fixed price" else "NAV"}" +
+      val yieldBased = app.protocol.yieldAsk(a)
+      val fixed = !a.priced || (!yieldBased && guard.isDefined && a.margin == StandardProtocol.GuardedFixedMargin)
+      val known = !a.priced || Try(app.protocol.pricingOf(a)).isSuccess
+      println(s"Ask ${a.box.id}  ${a.token.amount} of ${a.token.id}  (${if (fixed) "fixed price" else if (!known) "unknown pricing" else if (yieldBased) "block yield" else "NAV"}" +
         s"${if (guard.isDefined) ", guarded" else ""}, paid in ${a.market})")
       val price = Try(app.askPrice(a, a.token.amount)._1).toOption
       val face = price.flatMap(p => app.faceBps(a.token.id, p, a.token.amount))
       println("  price:  " + price.fold("not fillable now (its bond is not live)")(p => s"${Units.amount(p, a.market)} for all") +
         face.fold("")(f => s" (${Units.percent(f)} of face)") +
-        (if (a.nav && !fixed) s"; NAV ${if (a.margin >= 0) "+" else "-"}${Units.percent(a.margin.abs)}, ${a.wholeUnits} unit(s) per bond" else ""))
+        (if (yieldBased) s"; ${Units.percent(a.terms(4))} reference simple buyer yield per 262800 blocks, price margin ${Units.percent(a.margin)}, fees excluded"
+         else if (a.priced && known && !fixed) s"; NAV ${if (a.margin >= 0) "+" else "-"}${Units.percent(a.margin.abs)}, ${a.wholeUnits} unit(s) per bond" else ""))
       guard.foreach { case (minBps, age) =>
         println(s"  sale guard: sells only while its bond is at ${Units.percent(minBps)} cover or more " +
           s"(oracle at most $age blocks old)")
@@ -208,7 +221,7 @@ object ExchangeCommands {
     offers.foreach { o =>
       val m = o.market
       println(s"Offer ${o.box.id}  (${m})")
-      println(s"  capital ${Units.amount(o.capital, m)} at ${Units.percent(o.yieldBps)} a year or better; " +
+      println(s"  capital ${Units.amount(o.capital, m)} at ${Units.percent(o.yieldBps)} per 262800 blocks or better; " +
         s"bonds maturing in ${o.terms(1)} to ${o.terms(2)} blocks; minimum price ${Units.amount(o.minPrice, m)}")
       println(s"  oracle-rule bonds at a ratio of at least ${Units.percent(o.floorBps)}, oracle at most ${o.maxAge} blocks old")
       println(s"  batcher fee ${Fmt.erg(o.batcherFee)}; new-bond fee reserve ${Fmt.erg(o.feeReserve)}" +

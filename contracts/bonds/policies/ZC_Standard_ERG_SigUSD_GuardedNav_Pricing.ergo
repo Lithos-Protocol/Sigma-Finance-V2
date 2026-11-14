@@ -1,5 +1,5 @@
 {
-    // Standard guarded pricing expression for ZC_Standard_NavAsk: ZC_Standard_AccruedValue_Pricing
+    // Standard guarded pricing expression for ZC_Standard_PricedAsk: ZC_Standard_AccruedValue_Pricing
     // plus the seller's sale guard. Executed through the ask's context var 2 with the ASK as SELF.
     // It prices exactly as AccruedValue_Pricing does, and also refuses any sale while the bond's
     // collateral is worth less than the seller's minimum ratio of its repayment at a fresh oracle

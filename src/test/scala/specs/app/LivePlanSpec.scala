@@ -109,6 +109,32 @@ class LivePlanSpec extends AnyPropSpec with Matchers {
     run.exists(a => a.command.contains("batch") && a.flag("run")) shouldBe true
   }
 
+  property("priced issuance covers both policies and maturity modes, and yield asks finish before repayment") {
+    def args(id: String) = Args.parse(Args.tokenize(LivePlan.fill(byId(id).command, sample).right.get))
+    for ((id, nav, onClose) <- Seq(("A1", true, false), ("B1", true, true), ("E1", false, false), ("G1", false, true))) {
+      withClue(s"$id: ") {
+        args(id).flag("nav") shouldBe nav
+        args(id).opt("yield").isDefined shouldBe !nav
+        args(id).opt("duration").isDefined shouldBe onClose
+        args(id).opt("margin").isDefined shouldBe true
+      }
+    }
+    Seq("A2", "B2", "E2", "G3").foreach { id =>
+      byId(id).check shouldBe a[Check.PricedFill]
+      byId(id).binds.exists(_.output == 2) shouldBe true
+    }
+    Seq("A6", "E9").foreach { id =>
+      args(id).opt("yield").isDefined shouldBe true
+      args(id).opt("margin").isDefined shouldBe true
+      byId(id).check shouldBe a[Check.AskPricing]
+    }
+    args("E9").opt("min-cover") shouldBe Some("150")
+    // A yield ask needs a live bond; the old fixed ask could trade after repayment.
+    closure(byId("A10")) should contain("A9")
+    args("K1").flag("nav") shouldBe true
+    args("K3").opt("yield").isDefined shouldBe true
+  }
+
   property("every step explains itself in a sentence or two, and every explanation belongs to a step") {
     plan.foreach(s => withClue(s"${s.id}: ") {
       s.about should not be empty
@@ -151,5 +177,39 @@ class LivePlanSpec extends AnyPropSpec with Matchers {
     val rerun = bound.unbind("E6").bindAs("E6", Seq("offer1" -> "e6b"))
     rerun.vars("offer1") shouldBe "e6b"
     rerun.unbind("E6").vars("offer1") shouldBe "e2"
+  }
+
+  property("retrying a submitted failure preserves its transactions and historical bindings for rechecking") {
+    for (status <- Seq(StepState.Failed, StepState.Skipped)) {
+      val submitted = StepState(status, txs = Vector("pullTx"), outputs = Vector(Vector("openVault")),
+        attempts = 3, misses = 2, firstMiss = 123L, notBefore = Some(100))
+      val state = LiveState.fresh(chain = true, maturityBlocks = 40)
+        .update("E12")(_ => submitted)
+        .bindAs("E12", Seq("vaultE" -> "openVault"))
+        .bindAs("E14", Seq("vaultE" -> "soldVault"))
+      val retried = LiveState.decode(LiveState.encode(state.retry("E12")))
+      retried.step("E12").status shouldBe StepState.InFlight
+      retried.step("E12").txs shouldBe submitted.txs
+      retried.step("E12").outputs shouldBe submitted.outputs
+      retried.step("E12").attempts shouldBe 0
+      retried.step("E12").misses shouldBe 0
+      retried.step("E12").firstMiss shouldBe 0L
+      retried.step("E12").notBefore shouldBe None
+      retried.vars("vaultE") shouldBe "soldVault"
+      retried.checkVars("E12")("vaultE") shouldBe "openVault"
+      retried.checkVars("E14")("vaultE") shouldBe "soldVault"
+    }
+  }
+
+  property("retrying an unsubmitted failure undoes its bindings and lets the command run again") {
+    val state = LiveState.fresh(chain = true, maturityBlocks = 40)
+      .bindAs("E8", Seq("vaultE" -> "mintedVault"))
+      .bindAs("E12", Seq("vaultE" -> "droppedVault"))
+      .update("E12")(_.copy(status = StepState.Failed))
+    val retried = state.retry("E12")
+    retried.step("E12").status shouldBe StepState.Pending
+    retried.step("E12").txs shouldBe empty
+    retried.vars("vaultE") shouldBe "mintedVault"
+    retried.checkVars("E12")("vaultE") shouldBe "mintedVault"
   }
 }

@@ -29,7 +29,7 @@ object ZcStandardSpecBase {
    * The contracts compiled per repayment (or payment) asset beyond the bond and order: the lend offer,
    * both asks, the two expressions they run, and the Dutch auction mint.
    */
-  case class Market(offer: Contract, saleOrder: Contract, navAsk: Contract, pricing: Contract,
+  case class Market(offer: Contract, saleOrder: Contract, pricedAsk: Contract, pricing: Contract,
                     policy: Contract, dutchMint: Contract, fillGuard: Contract, guardedPricing: Contract)
 
   case class Exchange(erg: Market, token: Market, dutchVault: Contract)
@@ -53,7 +53,7 @@ object ZcStandardSpecBase {
     val s = compiled(ctx)
     def market(m: StdMarket): Market = {
       val c = s.market(m)
-      Market(c.offer, c.saleOrder, c.navAsk, c.pricing, c.policy, c.dutchMint, c.fillGuard, c.guardedPricing)
+      Market(c.offer, c.saleOrder, c.pricedAsk, c.pricing, c.policy, c.dutchMint, c.fillGuard, c.guardedPricing)
     }
     Exchange(market(StdMarket.Erg), market(StdMarket.SigUsd), s.dutchVault)
   }

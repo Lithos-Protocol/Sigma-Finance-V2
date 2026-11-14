@@ -52,20 +52,32 @@ class ZcStandardProbeSpec extends AnyPropSpec with ContractSpecBase {
           val c = s.market(m)
           pins(c.bond, s.vault.hashedPropBytes) shouldBe true
           pins(c.order, c.bond.hashedPropBytes) shouldBe true
-          Seq(c.order, c.bond, s.fractionalMint, c.dutchMint).foreach(t => pins(c.offer, t.hashedPropBytes) shouldBe true)
+          Seq(c.order, c.pricedOrder, c.bond, s.fractionalMint, c.dutchMint).foreach(t => pins(c.offer, t.hashedPropBytes) shouldBe true)
+          pins(c.pricedOrder, c.bond.hashedPropBytes) shouldBe true
           pins(c.dutchMint, s.dutchVault.hashedPropBytes) shouldBe true
           pins(c.dutchMint, c.bond.hashedPropBytes) shouldBe true
           pins(c.policy, c.oracleRule.hashedValueBytes) shouldBe true
           pins(c.pricing, c.bond.hashedPropBytes) shouldBe true
           pins(c.guardedPricing, c.bond.hashedPropBytes) shouldBe true
+          pins(c.yieldPricing, c.bond.hashedPropBytes) shouldBe true
+          pins(c.guardedYieldPricing, c.bond.hashedPropBytes) shouldBe true
           // The repayment token is compiled into every per-market script of a token market.
           m.token.foreach { id =>
-            Seq(c.bond, c.order, c.offer, c.saleOrder, c.navAsk, c.dutchMint, c.oracleRule, c.policy, c.pricing,
-              c.fillGuard, c.guardedPricing)
+            Seq(c.bond, c.order, c.offer, c.saleOrder, c.pricedAsk, c.dutchMint, c.oracleRule, c.policy, c.pricing,
+              c.fillGuard, c.guardedPricing, c.pricedOrder, c.navOrderPricing, c.yieldOrderPricing,
+              c.yieldPricing, c.guardedYieldPricing)
               .foreach(t => pins(t, id.getBytes) shouldBe true)
           }
         }
       }
+    }
+  }
+
+  property("priced orders share a template across repayment assets") {
+    withCtx { ctx =>
+      val s = ZcStandardSpecBase.compiled(ctx)
+      s.market(Market.Erg).pricedOrder.ergoTree.template.toSeq shouldBe
+        s.market(Market.SigUsd).pricedOrder.ergoTree.template.toSeq
     }
   }
 }

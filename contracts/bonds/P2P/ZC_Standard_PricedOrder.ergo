@@ -1,0 +1,167 @@
+{
+    // Standard expression-priced primary borrow order. The fixed Order remains a separate type.
+    // Constants, collateral, expiry, mint supply (3: 2 state + 1 circulating), start/maturity,
+    // cancellation and refund conventions are identical to ZC_Standard_Order.
+    // CONST_BOND_HASH: standard bond tree hash; CONST_REPAYMENT_TOKEN: empty for ERG, else its token.
+    // R4: Coll[Long], 7..64 borrower terms as in Order. R4(1) is the minimum principal nanoERG
+    //   (and NAV anchor for ERG). Every term except the resolved ERG principal is copied unchanged.
+    // R5: Coll[(Coll[Byte],Long)], minimum principal tokens (and NAV anchor for a token loan).
+    // R6: borrower script hash; R7: liquidation expression hash, both copied as in Order.
+    // R8: Coll[Coll[Byte]], exactly (pricing expression hash, fill guard hash or empty bytes).
+    // R9: Coll[Long], 0..64 pricing payload values, interpreted only by the pricing expression.
+    //   NavOrder_Pricing: (reference height, margin bps). Fixed or on-close maturity.
+    //   YieldOrder_Pricing: (yield bps per 262800 blocks, price margin bps). Fixed or on-close maturity.
+    // Fill context: 1 optional guard bytes, 2 mandatory pricing bytes. Each runs with ORDER as SELF.
+    // OUTPUTS(0) unit, OUTPUTS(1) bond, OUTPUTS(2) borrower payout. The bond records the actual
+    //   principal: R6(1) for ERG, R7(0)._2 for a token. Payout ERG less expiry refund equals R6(1),
+    //   and payout tokens equal bond R7 exactly. Token loans keep the original nanoERG beside them.
+    // Price expressions add a minimum payment; they cannot change repayment, maturity rules,
+    //   collateral, borrower, liquidation expression, fees or mint supply. Overpayment is allowed
+    //   only when the resolved principal records it. No future accrued value starts from a stale P.
+    // NAV/yield quotes are conditional on repayment; neither values collateral nor guarantees return.
+    // A borrower chooses the pricing/guard expressions; hashes commit to bytes, not their safety.
+    // Refund/cancel paths deliberately do not read pricing/guard registers, including malformed ones.
+
+    def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
+        OUTPUTS.fold(0L, { (a: Long, b: Box) =>
+            val count = b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                if (t._1 == tokenId) z + t._2 else z
+            })
+            a + count
+        })
+    }
+
+    val borrowerHash = SELF.R6[Coll[Byte]].get
+    val minted = numTokenInOutputs(SELF.id)
+
+    if (minted > 0L) {
+        // Fill
+        val borrower = SELF.R4[Coll[Long]].get
+        if (borrower.size < 7 || borrower.size > 64 || OUTPUTS.size < 3) {
+            sigmaProp(false)
+        } else {
+            val lenderOut = OUTPUTS(0)
+            val bond = OUTPUTS(1)
+            val principal = OUTPUTS(2)
+            val lender = bond.R9[Coll[Long]].get
+            if (lender.size != 3) {
+                sigmaProp(false)
+            } else {
+                val expiryFee = borrower(5)
+                val mode = borrower(6)
+                val collateralERG = SELF.value - expiryFee
+                val fee = lender(0)
+                val start = lender(1)
+                val maturity = lender(2)
+                val quotedTokens = SELF.R5[Coll[(Coll[Byte], Long)]].get
+                val principalTokens = bond.R7[Coll[(Coll[Byte], Long)]].get
+                val resolved = bond.R6[Coll[Long]].get
+                val decimals = fromBase16("30")
+
+                // Lent and repaid in one asset, the repayment asset: the principal is that asset
+                // alone, and the repayment needs nothing beside it but a box minimum. The empty
+                // collection is taken from the box so the compiler cannot fold the constant.
+                val noToken = SELF.id.slice(0, 0)
+                val singleAsset = if (CONST_REPAYMENT_TOKEN == noToken) {
+                    principalTokens.size == 0 && borrower(1) > 0L && borrower(2) <= borrower(0)
+                } else {
+                    principalTokens.size == 1 && principalTokens(0)._1 == CONST_REPAYMENT_TOKEN &&
+                    principalTokens(0)._2 > 0L &&
+                    borrower(1) <= 1000000L && borrower(2) <= 1000000L
+                }
+
+                val borrowerValid =
+                    singleAsset &&
+                    borrower(0) > 0L && borrower(1) >= 0L && borrower(2) > 0L &&
+                    (mode == 0L || mode == 1L) &&
+                    expiryFee >= 2000000L && expiryFee <= SELF.value - 1000000L &&
+                    HEIGHT.toLong < borrower(4)
+
+                val mintValid =
+                    SELF.id == INPUTS(0).id && minted == 3L &&
+                    lenderOut.tokens.size > 0 &&
+                    lenderOut.tokens(0)._1 == SELF.id && lenderOut.tokens(0)._2 == 1L &&
+                    lenderOut.R4[Coll[Byte]].isDefined &&
+                    lenderOut.R5[Coll[Byte]].isDefined &&
+                    lenderOut.R6[Coll[Byte]].get == decimals
+
+                val bondValid =
+                    blake2b256(bond.propositionBytes) == CONST_BOND_HASH &&
+                    bond.tokens.size > 0 &&
+                    bond.tokens(0)._1 == SELF.id && bond.tokens(0)._2 == 2L &&
+                    bond.tokens.slice(1, bond.tokens.size) == SELF.tokens &&
+                    fee >= 0L && bond.value >= collateralERG && bond.value - collateralERG >= fee &&
+                    bond.value - fee >= 1000000L &&
+                    bond.R4[Coll[Byte]].get == SELF.id &&
+                    bond.R5[Coll[Byte]].get == borrowerHash &&
+                    resolved.size == borrower.size && resolved(0) == borrower(0) &&
+                    resolved.slice(2, resolved.size) == borrower.slice(2, borrower.size) &&
+                    (if (CONST_REPAYMENT_TOKEN == noToken) {
+                        quotedTokens.size == 0 && resolved(1) >= borrower(1)
+                    } else {
+                        resolved(1) == borrower(1) && quotedTokens.size == 1 &&
+                        quotedTokens(0)._1 == CONST_REPAYMENT_TOKEN && quotedTokens(0)._2 > 0L &&
+                        principalTokens(0)._2 >= quotedTokens(0)._2
+                    }) &&
+                    bond.R8[Coll[Byte]].get == SELF.R7[Coll[Byte]].get
+
+                // The bond's creation height is its start: the bond counts its recollateralize wait from it.
+                val startValid = start <= HEIGHT.toLong && start >= HEIGHT.toLong - 8L &&
+                    bond.creationInfo._1.toLong == start
+                val maturityValid = maturity > HEIGHT.toLong + 1L && (
+                    if (mode == 0L) maturity == borrower(3)
+                    else borrower(3) >= 30L && maturity == start + borrower(3)
+                )
+
+                val principalPaid =
+                    blake2b256(principal.propositionBytes) == borrowerHash &&
+                    principal.value >= expiryFee && principal.value - expiryFee == resolved(1) &&
+                    principal.tokens == principalTokens
+
+                val core = borrowerValid && mintValid && bondValid && startValid && maturityValid && principalPaid
+
+                // Two independent commitments: pricing is mandatory; the collateral guard is optional.
+                // They run as this order, after the core binds the actual payment to the bond registers.
+                val policies = SELF.R8[Coll[Coll[Byte]]].get
+                val payload = SELF.R9[Coll[Long]].get
+                if (policies.size != 2 || payload.size > 64) {
+                    sigmaProp(false)
+                } else {
+                    val pricing = policies(0)
+                    val guard = policies(1)
+                    sigmaProp(core && pricing.size == 32 &&
+                        blake2b256(getVar[Coll[Byte]](2).get) == pricing) && executeFromVar[SigmaProp](2) &&
+                        (if (guard.size == 0) sigmaProp(true)
+                         else sigmaProp(guard.size == 32 && blake2b256(getVar[Coll[Byte]](1).get) == guard) &&
+                             executeFromVar[SigmaProp](1))
+                }
+            }
+        }
+    } else {
+        // Cancel: an independent borrower-authorized co-spend, valid even for malformed terms.
+        val borrowerAuth = INPUTS.exists { (b: Box) =>
+            b.id != SELF.id && blake2b256(b.propositionBytes) == borrowerHash
+        }
+        if (borrowerAuth) {
+            sigmaProp(true)
+        } else {
+            // Expiry refund, by anyone. Context var 0: Int refund output index.
+            val borrower = SELF.R4[Coll[Long]].get
+            val refundIndex = getVar[Int](0).get
+            if (borrower.size < 7 || borrower.size > 64 || refundIndex < 0 || refundIndex >= OUTPUTS.size) {
+                sigmaProp(false)
+            } else {
+                val fee = borrower(5)
+                val refund = OUTPUTS(refundIndex)
+                sigmaProp(
+                    HEIGHT.toLong >= borrower(4) &&
+                    fee >= 2000000L && fee <= SELF.value - 1000000L &&
+                    blake2b256(refund.propositionBytes) == borrowerHash &&
+                    refund.R4[Coll[Byte]].get == SELF.id &&
+                    refund.value >= SELF.value - fee &&
+                    refund.tokens == SELF.tokens
+                )
+            }
+        }
+    }
+}

@@ -423,9 +423,9 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
   // ─── from a NAV ask ───────────────────────────────────────────────────────
 
   /** A NAV ask for `amount` of `token`, `whole` of which make one bond, at accrued value with no margin. */
-  private def navAskBox(ctx: BlockchainContext, kind: Kind, token: ErgoId, amount: Long, whole: Long,
+  private def pricedAskBox(ctx: BlockchainContext, kind: Kind, token: ErgoId, amount: Long, whole: Long,
                         asset: ErgoId): UTXO =
-    UTXO(marketOf(ctx, kind).navAsk, minBox, Seq(Token(token, amount)),
+    UTXO(marketOf(ctx, kind).pricedAsk, minBox, Seq(Token(token, amount)),
       Seq(bytesValue(hashOf(otherTree(ctx))), longsValue(1L, 1000000000L, 1L, ctx.getHeight + 5000L, 0L, whole),
         bytesValue(marketOf(ctx, kind).pricing.hashedValueBytes), bytesValue(asset.getBytes)))
 
@@ -446,7 +446,7 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
         val askVars = Seq[(Byte, ErgoValue[_])](2.toByte -> liqVar(marketOf(ctx, kind).pricing), 3.toByte -> ErgoValue.of(0))
         // A whole unit: the ask's pricing expression and the offer's policy share the state box.
         val l = live(ctx, kind, liq = oracleRuleOf(ctx, kind))
-        val unitAsk = navAskBox(ctx, kind, l.f.asset, 1L, 1L, l.f.asset)
+        val unitAsk = pricedAskBox(ctx, kind, l.f.asset, 1L, 1L, l.f.asset)
         val unitPrice = accrued(l, 1L, 1L)
         def unitTx(paid: Long): UnsignedTransaction = buyTx(l, offer, unitAsk, 1L, paid, policy = policy,
           askVars = askVars, data = Seq(oracleBox(l.f, created = l.height)))
@@ -454,7 +454,7 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
         rejectsAtSigning(executor(ctx), unitTx(unitPrice - 1L))
         // 30 of 1000 shares: the offer also reads the mint request's bytes. The heaviest match there is.
         val w = wrapped(ctx, kind, scripts(ctx).fractionalMint, Seq(1000L, pullFee, mintFee), liq = oracleRuleOf(ctx, kind))
-        val shareAsk = navAskBox(ctx, kind, w.shareId, 100L, 1000L, w.l.f.asset)
+        val shareAsk = pricedAskBox(ctx, kind, w.shareId, 100L, 1000L, w.l.f.asset)
         val sharePrice = accrued(w.l, 30L, 1000L)
         def shareTx(paid: Long): UnsignedTransaction = buyTx(w.l, offer, shareAsk, 30L, paid, request = w.request,
           policy = policy, askVars = askVars, data = Seq(oracleBox(w.l.f, created = w.l.height)))

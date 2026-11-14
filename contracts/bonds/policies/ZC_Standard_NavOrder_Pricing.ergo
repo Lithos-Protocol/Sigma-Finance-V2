@@ -1,0 +1,30 @@
+{
+    // PricedOrder var 2. R9 = (reference height, signed margin bps); fixed or on-close maturity.
+    // Quote P0 is order R4(1) for ERG, or R5(0)._2 for a token. R is fixed order R4(0).
+    // Minimum principal = max(P0, ceil((P0*(M-H) + R*(H-reference))*(10000+margin) /
+    //                                 ((M-reference)*10000))). The shell enforces P0 and actual payment.
+    // Reference must be this order's creation height: no mutable external time anchor or oracle.
+    val terms = SELF.R4[Coll[Long]].get
+    val payload = SELF.R9[Coll[Long]].get
+    if (terms.size < 7 || payload.size != 2) {
+        sigmaProp(false)
+    } else {
+        val reference = payload(0)
+        val margin = payload(1)
+        // The shell validates M against the fixed height or the fill's start + duration.
+        // For on-close orders the endpoint moves with the fill, while the reference stays fixed.
+        val maturity = OUTPUTS(1).R9[Coll[Long]].get(2)
+        val term = maturity - reference
+        val elapsed = HEIGHT.toLong - reference
+        val erg = CONST_REPAYMENT_TOKEN == SELF.id.slice(0, 0)
+        val quoted = if (erg) terms(1) else SELF.R5[Coll[(Coll[Byte], Long)]].get(0)._2
+        val bond = OUTPUTS(1)
+        val principal = if (erg) bond.R6[Coll[Long]].get(1) else bond.R7[Coll[(Coll[Byte], Long)]].get(0)._2
+        sigmaProp(reference >= 0L && reference == SELF.creationInfo._1.toLong &&
+            term > 0L && elapsed >= 0L && elapsed < term && quoted > 0L && terms(0) > 0L &&
+            margin > -10000L && margin <= 1000000L &&
+            principal.toBigInt * term.toBigInt * 10000L.toBigInt >=
+                (quoted.toBigInt * (term - elapsed).toBigInt + terms(0).toBigInt * elapsed.toBigInt) *
+                (10000L + margin).toBigInt)
+    }
+}

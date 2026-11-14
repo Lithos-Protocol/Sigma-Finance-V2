@@ -17,6 +17,10 @@ case object MaturityChoice extends RuleChoice
 /** `ratioBps`: liquidate strictly below this collateral ratio (15000 = 150%); `maxAge`: oldest oracle, blocks. */
 case class OracleChoice(ratioBps: Long, maxAge: Long) extends RuleChoice
 
+sealed trait OrderPrice
+case class NavOrderPrice(marginBps: Long = 0L) extends OrderPrice
+case class YieldOrderPrice(yieldBps: Long, marginBps: Long = 0L) extends OrderPrice
+
 /**
  * A borrower's terms for a standard order. A standard loan is lent and repaid in one asset, the market's:
  * `principal` and `repayment` are nanoERG for ERG, raw token units for a token market.
@@ -24,7 +28,8 @@ case class OracleChoice(ratioBps: Long, maxAge: Long) extends RuleChoice
 case class StdLoan(market: Market, principal: Long, repayment: Long, collateralErg: Long,
                    collateralTokens: Seq[Token], schedule: Schedule, rule: RuleChoice,
                    expiry: Long, expiryFee: Long, requestedMaturity: Option[Long] = None,
-                   allowLiquidatable: Boolean = false, fillRatio: Option[Long] = None)
+                   allowLiquidatable: Boolean = false, fillRatio: Option[Long] = None,
+                   price: Option[OrderPrice] = None)
 
 /**
  * The ZC Standard set over a single Ergo node: the CLI's default commands. It builds with the pinned trees
@@ -50,9 +55,10 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
 
   // ═══ LOOKING AROUND ═══════════════════════════════════════════════════════
 
-  /** Every market's orders: they share one template, so one indexed lookup finds them all. */
+  /** One indexed lookup per issuing type finds all its markets. */
   def orders(): Seq[StdOrder] =
-    decoded(node.unspentByTemplateHash(Base16.encode(protocol.orderTemplateHash))).flatMap(protocol.asOrder)
+    Seq(protocol.orderTemplateHash, protocol.pricedOrderTemplateHash)
+      .flatMap(h => decoded(node.unspentByTemplateHash(Base16.encode(h)))).flatMap(protocol.asOrder)
 
   def bonds(): Seq[StdBond] =
     decoded(node.unspentByTemplateHash(Base16.encode(protocol.bondTemplateHash))).flatMap(protocol.asBond)
@@ -88,7 +94,7 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
   def originVerified(bond: StdBond): Boolean =
     node.boxById(bond.asset.toString).exists { json =>
       NodeJson.spentBy(json).isDefined &&
-        Try(NodeJson.box(json)).toOption.exists(o => sameTree(o.input.getErgoTree, protocol.market(bond.market).order.ergoTree))
+        Try(NodeJson.box(json)).toOption.exists(o => protocol.orderMarket(o.input.getErgoTree).contains(bond.market))
     }
 
   /**
@@ -139,6 +145,44 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
   }
 
   // ═══ BORROWER ═════════════════════════════════════════════════════════════
+
+  private[standard] def byteArraysValue(items: Seq[Array[Byte]]): ErgoValue[_] =
+    ErgoValue.of(sigma.Colls.fromArray(items.map(i => sigma.Colls.fromArray(i)).toArray)(sigma.collRType(sigma.ByteType)),
+      org.ergoplatform.appkit.ErgoType.collType(org.ergoplatform.appkit.scalaapi.scalaByteType))
+
+  /** Minimum principal at an inclusion height, without fees or the refunded expiry fee. */
+  def orderPrincipal(order: StdOrder, at: Long, start: Long): Long = {
+    if (!order.priced) return order.principal
+    val expression = protocol.orderPricingOf(order)
+    val maturity = if (order.onClose) addAmount(start, order.terms(3)) else order.terms(3)
+    val data = order.pricingTerms
+    val (num, den) = if (expression.hashedValueBytes.sameElements(protocol.market(order.market).yieldOrderPricing.hashedValueBytes)) {
+      if (data.size != 2 || data.head < 0L || data(1) <= -10000L || data(1) > 1000000L || maturity <= at) fail("invalid yield pricing terms or no blocks left to maturity")
+      (BigInt(order.repayment) * 2628000000L * (10000L + data(1)),
+        (BigInt(2628000000L) + BigInt(data.head) * (maturity - at)) * 10000L)
+    } else {
+      if (data.size != 2 || data.head != order.box.input.getCreationHeight.toLong ||
+        data.head < 0L || at < data.head || maturity <= at || data(1) <= -10000L || data(1) > 1000000L)
+        fail("invalid NAV pricing terms: the order's creation height and a future maturity are required")
+      val term = maturity - data.head
+      val elapsed = at - data.head
+      ((BigInt(order.principal) * (term - elapsed) + BigInt(order.repayment) * elapsed) * (10000L + data(1)),
+        BigInt(term) * 10000L)
+    }
+    val result = ((num + den - 1) / den).max(BigInt(order.principal))
+    if (result <= 0 || !result.isValidLong) fail("the priced principal is outside the supported amount range")
+    result.toLong
+  }
+
+  /** Quote a few blocks ahead; store exactly what is actually paid in the standard bond. */
+  private[standard] def resolveOrder(order: StdOrder, start: Long): StdOrder = {
+    val amount = orderPrincipal(order, height.toLong + 3L, start)
+    if (!order.priced) order
+    else order.market.token match {
+      case None => order.copy(terms = order.terms.updated(1, amount))
+      case Some(id) => order.copy(principalTokens = Seq(Token(id, amount)))
+    }
+  }
 
   /**
    * The collateral, under the market's order. R4 to R7 are the terms the bond will copy. The wallet funds it,
@@ -195,13 +239,27 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
       case Some(id) => (0L, MinBox, Seq(Token(id, loan.principal)))
     }
     val terms = Seq(loan.repayment, principalErg, floor, maturityTerm, loan.expiry, loan.expiryFee, mode) ++ payload
-    val order = UTXO(protocol.market(m).order, addAmount(loan.collateralErg, loan.expiryFee), loan.collateralTokens,
-      Seq(longsValue(terms: _*), tokensValue(principalTokens), bytesValue(hashOf(myTree)),
-        bytesValue(rule.hashedValueBytes)) ++
-        loan.fillRatio.map(_ => bytesValue(protocol.market(m).fillGuard.hashedValueBytes)))
+    val c = protocol.market(m)
+    val pricing = loan.price.map {
+      case NavOrderPrice(margin) =>
+        if (margin <= -10000L || margin > 1000000L) fail("the margin must be above -100% and at most 10000%")
+        c.navOrderPricing -> Seq(height.toLong, margin)
+      case YieldOrderPrice(rate, margin) =>
+        if (rate < 0L) fail("the yield cannot be negative")
+        if (margin <= -10000L || margin > 1000000L) fail("the margin must be above -100% and at most 10000%")
+        c.yieldOrderPricing -> Seq(rate, margin)
+    }
+    val coreRegs = Seq(longsValue(terms: _*), tokensValue(principalTokens), bytesValue(hashOf(myTree)), bytesValue(rule.hashedValueBytes))
+    val extraRegs = pricing.fold(loan.fillRatio.map(_ => bytesValue(c.fillGuard.hashedValueBytes)).toSeq) { case (expression, data) =>
+      Seq(byteArraysValue(Seq(expression.hashedValueBytes,
+        if (loan.fillRatio.isDefined) c.fillGuard.hashedValueBytes else Array.emptyByteArray)), longsValue(data: _*))
+    }
+    val order = UTXO(if (pricing.isDefined) c.pricedOrder else c.order,
+      addAmount(loan.collateralErg, loan.expiryFee), loan.collateralTokens, coreRegs ++ extraRegs,
+      if (pricing.isDefined) Some(height) else None)
 
     val notes = Seq(
-      s"borrow: ${Units.amount(loan.principal, m)}; repay ${Units.amount(loan.repayment, m)}",
+      s"${if (loan.price.isDefined) "principal floor" else "borrow"}: ${Units.amount(loan.principal, m)}; repay ${Units.amount(loan.repayment, m)}",
       s"collateral: ${Fmt.contents(loan.collateralErg, loan.collateralTokens)}",
       loan.schedule match {
         case FixedMaturity(h) => s"maturity: height $h (${h - height} blocks from now)" +
@@ -217,7 +275,11 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
       s"expiry: height ${loan.expiry}; from then anyone may return it to you and keep the ${Fmt.erg(loan.expiryFee)} " +
         "expiry fee, which a fill refunds to you instead") ++ coverNotes ++ termNotes :+
       "Output 0 is the order. Cancel it any time before it is filled with `cancel-order <its box id>`."
-    prepare("Create order", plan(Seq.empty, Seq(order)), notes)
+    val priceNotes = loan.price.toSeq.map {
+      case NavOrderPrice(m) => s"PricedOrder: NAV principal from height $height, margin ${Units.percent(m)}; the quoted principal is also its floor"
+      case YieldOrderPrice(y, m) => s"PricedOrder: principal at reference ${Units.percent(y)} simple yield per 262800 blocks, price margin ${Units.percent(m)}, subject to the principal floor; fees excluded"
+    }
+    prepare("Create order", plan(Seq.empty, Seq(order)), notes ++ priceNotes)
   }
 
   /**
@@ -278,10 +340,12 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
       }
     }
 
-  /** The order as a fill spends it: with its fill guard's expression in context var 1 when R8 names one. */
-  private[standard] def orderInput(order: StdOrder): InputUTXO =
-    if (order.guardHash.isEmpty) order.box
-    else order.box.withCtxVar(1.toByte, bytesValue(protocol.market(order.market).fillGuard.valueBytes))
+  /** Fill witnesses in ascending order: optional guard in var 1, mandatory priced-order policy in var 2. */
+  private[standard] def orderInput(order: StdOrder): InputUTXO = {
+    val guarded = if (order.guardHash.isEmpty) order.box
+      else order.box.withCtxVar(1.toByte, bytesValue(protocol.market(order.market).fillGuard.valueBytes))
+    if (order.priced) guarded.withCtxVar(2.toByte, bytesValue(protocol.orderPricingOf(order).valueBytes)) else guarded
+  }
 
   /**
    * zcs1: no fill or purchase leaves a bond below its own oracle ratio, which anyone could liquidate at once. It
@@ -325,9 +389,10 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
    */
   def fillOrder(orderId: String, feeReserve: Long, allowLiquidatable: Boolean = false): Prepared = {
     if (feeReserve < 0L) fail("the fee reserve cannot be negative")
-    val order = protocol.asOrder(unspent(orderId)).getOrElse(fail(s"$orderId is not a ZC Standard order"))
+    val original = protocol.asOrder(unspent(orderId)).getOrElse(fail(s"$orderId is not a ZC Standard order"))
+    checkOrder(original)
+    val order = resolveOrder(original, height.toLong)
     val m = order.market
-    checkOrder(order)
     val rule = protocol.ruleOf(order.liqHash)
       .getOrElse(fail("the order names a liquidation expression this client does not know"))
     rule match {
@@ -375,6 +440,13 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
 
   /** The fill's own checks, so a lender learns why before the node refuses. */
   private[standard] def checkOrder(o: StdOrder): Unit = {
+    if (o.priced) {
+      val policies = bytesListReg(o.box, 8).getOrElse(Seq.empty)
+      if (policies.size != 2 || policies.head.length != 32 ||
+        (policies(1).nonEmpty && policies(1).length != 32) || o.pricingTerms.size > 64)
+        fail("the priced order has malformed policy commitments")
+      orderPrincipal(o, height.toLong + 3L, height.toLong)
+    }
     val oneAsset = o.market.token match {
       case None => o.principalTokens.isEmpty && o.principalErg > 0L && o.ergFloor <= o.repayment
       case Some(id) => o.principalTokens.map(_.id) == Seq(id) && o.principalErg <= MinBox && o.ergFloor <= MinBox

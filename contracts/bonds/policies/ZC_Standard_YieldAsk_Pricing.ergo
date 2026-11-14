@@ -1,0 +1,56 @@
+{
+    // PricedAsk block-yield policy, var 2; ask R5(4)=reference buyer yield bps per 262800 blocks.
+    // R5(5)=units per bond, R5(6)=signed price margin bps, R7=bond asset, var 3=live bond data input.
+    // paid*N*(B+yield*D)*10000 >= sold*R*B*(10000+margin), B=2628000000, D=maturity-HEIGHT.
+    // Simple block yield, conditional on full repayment at maturity, excluding fees.
+    val terms = SELF.R5[Coll[Long]].get
+    val payoutIndex = getVar[Int](0).get
+    val nextIndex = getVar[Int](1)
+    val stateIndex = getVar[Int](3).get
+
+    if (terms.size < 7 || SELF.tokens.size != 1 ||
+        payoutIndex < 0 || payoutIndex >= OUTPUTS.size ||
+        stateIndex < 0 || stateIndex >= CONTEXT.dataInputs.size) {
+        sigmaProp(false)
+    } else {
+        val yieldBps = terms(4)
+        val wholeUnits = terms(5)
+        val margin = terms(6)
+        val asset = SELF.R7[Coll[Byte]].get
+        val state = CONTEXT.dataInputs(stateIndex)
+        val isBond =
+            blake2b256(state.propositionBytes) == CONST_BOND_HASH &&
+            state.tokens.size > 0 && state.tokens(0)._1 == asset && state.tokens(0)._2 == 2L
+
+        if (!isBond || yieldBps < 0L || margin <= -10000L || margin > 1000000L ||
+            wholeUnits < 1L || wholeUnits > 1000000000L) {
+            sigmaProp(false)
+        } else {
+            val borrower = state.R6[Coll[Long]].get
+            val lender = state.R9[Coll[Long]].get
+            val repaysERG = CONST_REPAYMENT_TOKEN == SELF.id.slice(0, 0)
+            val repayment = borrower(0)
+            val maturity = lender(2)
+            val blocksLeft = maturity - HEIGHT.toLong
+
+            val payout = OUTPUTS(payoutIndex)
+            val paid = if (repaysERG) {
+                payout.value
+            } else if (payout.tokens.size > 0 && payout.tokens(0)._1 == CONST_REPAYMENT_TOKEN) {
+                payout.tokens(0)._2
+            } else 0L
+            val remaining = if (nextIndex.isDefined) OUTPUTS(nextIndex.get).tokens(0)._2 else 0L
+            val sold = SELF.tokens(0)._2 - remaining
+
+            if (repayment <= 0L || blocksLeft <= 0L || sold < 1L) {
+                sigmaProp(false)
+            } else {
+                val scale = 2628000000L.toBigInt
+                sigmaProp(
+                    paid.toBigInt * wholeUnits.toBigInt * (scale + yieldBps.toBigInt * blocksLeft.toBigInt) * 10000L.toBigInt >=
+                        sold.toBigInt * repayment.toBigInt * scale * (10000L + margin).toBigInt
+                )
+            }
+        }
+    }
+}

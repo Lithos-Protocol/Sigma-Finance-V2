@@ -16,10 +16,10 @@ maturity grid, batching and defaults.
 | Folder (`contracts/bonds/`) | Contracts (`ZC_Standard_*`) |
 |---|---|
 | `core/` | `Bond`, `BondVault`: the bond and the vault its settlement pays |
-| `P2P/` | `Order`, `LendOffer`, `SaleOrder`, `NavAsk`: borrowing, lending and trading |
+| `P2P/` | `Order`, `PricedOrder`, `LendOffer`, `SaleOrder`, `PricedAsk`: borrowing, lending and trading |
 | `lender-scripts/` | `FractionalMint`, `FractionalVault`, `DutchAuctionMint`, `DutchAuctionVault`: shares |
 | `liquidations/` | `MaturityLiquidation`, `ERG_SigUSD_Liquidation`: when a bond may be liquidated |
-| `policies/` | `ERG_SigUSD_CollateralPolicy`, `AccruedValue_Pricing`: an offer's risk rule, an ask's price |
+| `policies/` | `ERG_SigUSD_CollateralPolicy`, NAV/yield pricing and collateral guards: risk and price policies |
 
 How it works, in brief:
 
@@ -70,6 +70,8 @@ sbt "runMain ksingh.sigmabonds.app.SigmaFiCli help"
   asset was really minted by a standard order), `claims`
 - Borrower: `create-order` (ERG or SigUSD market; maturity or oracle-ratio liquidation; a fixed
   maturity at least 21,600 blocks out snaps to the grid unless `--exact-maturity`; an oracle order
+  accepts optional `--nav [--margin <percent>]` or `--yield <percent> [--margin <percent>]` to create a `PricedOrder` that
+  prices principal while keeping repayment fixed (both fixed and on-close maturity); an oracle order
   carries a fill guard that its contract enforces, at `--ratio` or `--fill-ratio`, unless
   `--no-fill-guard`), `cancel-order`, `repay [--from-collateral]`, `recollateralize`
 - Lender: `fill-order [--fee-reserve <ERG>]` (CLI minimum and default 0.05 ERG), `claim`. A fill or
@@ -81,9 +83,11 @@ sbt "runMain ksingh.sigmabonds.app.SigmaFiCli help"
   collateral), `mint-shares` and `pull` (anyone, for the fees the owner committed), `buy-lot` (anyone,
   at an open auction's current price), `claim-shares`, `cancel-share-request`
 - Asks: `asks` (prices also as a percentage of face), `sell` (a fixed `--price`, or `--nav` at a bond's
-  accrued value plus a margin; `--min-cover` adds a sale guard that stops sales while the bond's
+  accrued value plus a margin, or `--yield <percent>` at a simple block yield; `--price` can also set a
+  floor on either expression-priced ask; both policies accept signed `--margin` on the calculated
+  price, which changes the resulting yield; `--min-cover` adds a sale guard that stops sales while the bond's
   collateral is thin), `buy`, `cancel-ask`, `refund-ask`
-- Lend offers: `offers`, `create-offer` (a yearly yield, a maturity window, a collateral floor, and
+- Lend offers: `offers`, `create-offer` (a block-yield limit, a maturity window, a collateral floor, and
   optionally `--deliver-shares` into fractional or Dutch shares), `cancel-offer`, `refund-offer`, and
   `match-offer --order | --ask`, which anyone runs for the offer's batcher fee. An offer's policy buys
   only bonds with the oracle liquidation rule, since it measures their collateral at the oracle price.
@@ -91,6 +95,12 @@ sbt "runMain ksingh.sigmabonds.app.SigmaFiCli help"
   any box it passes over because it does not disclose a script it names; `batch --run` does the work
   in rounds, packing refunds and liquidations, matching each offer to its best-yield source, and
   scanning again with mempool lookups so fills chain through an offer's continuation. `--send` submits.
+
+Pricing formulas, register layouts, fees, block inclusion and examples are in
+[docs/ZC_STANDARD_PRICING.md](./docs/ZC_STANDARD_PRICING.md). `PricedAsk` is the generic name of the
+former `NavAsk`: renaming it does not change its tree. `PricedOrder` is an additional issuing type;
+fixed `Order` and `SaleOrder` remain. The bond and settlement scripts are unchanged. Updated lend
+offers accept both issuing types; existing offer boxes keep their original issuer restrictions.
 
 Every transaction follows the zcs1 off-chain rules in
 [docs/ZC_STANDARD_OFFCHAIN.md](./docs/ZC_STANDARD_OFFCHAIN.md). It discloses each script its boxes name
@@ -140,10 +150,18 @@ runs again once that confirms, and the final report lists those. A step whose tr
 mempool unconfirmed has the ids it found undone and runs again, and `retry failed` re-runs every failed
 step.
 
+The pricing paths include fixed and on-close NAV/yield orders with explicit margins, NAV unit
+resale, yield-priced partial share sales and guarded yield-priced Dutch shares. Priced-fill checks
+compare the actual borrower payment (less the expiry refund) with the bond's recorded principal;
+ask checks verify the policy and margin. Each check reads the step's own historical outputs even
+after later steps spend them. The short offer matches use explicit price discounts to cover fees.
+The full coverage matrix is in [the pricing guide](docs/ZC_STANDARD_PRICING.md#live-test-coverage).
+
 Steps also run the listings and check what they show, and run commands the CLI must refuse: a claim
 before settlement, recollateralizing within 60 blocks, an early maturity liquidation, a refund before
 expiry, and an offer facing an undercollateralized order. Progress is saved to `sigmafi-livetest.json`,
-so `exit` and starting again resumes. Everything printed also goes to `sigmafi-livetest.log`. `cleanup`
+so `exit` and starting again resumes. Use a fresh `--state <file>` to exercise the revised pricing
+paths from scratch; completed steps in an older progress file are not rerun. Everything printed also goes to `sigmafi-livetest.log`. `cleanup`
 lists whatever of the wallet's is still open, and `cleanup run` closes it. Options: `--no-chain`,
 `--maturity-blocks <n>` (default 40), `--state <file>`, `--log <file>`. SigUSD loans and offers are not
 covered; a SigUSD order and ask are only created and cancelled.

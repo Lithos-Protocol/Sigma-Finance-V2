@@ -143,3 +143,40 @@ reserves to the vault on repayment, pinned principal registers, Long maturity/du
 overflow rejection, and settlement R6 Byte markers (0 repayment / 1 liquidation). The conversion
 expression reads principal data directly from bond R6(2)/R7. Application tests exercise fee funding,
 refund balances, metadata precision and schedules above Int.MaxValue end to end.
+
+## Expression pricing (2026-11-14)
+
+`ZcStandardPricedOrderSpec` signs both principal policies in ERG and SigUSD, including exact
+one-unit price boundaries, independent guard/pricing witnesses, immutable non-price fields,
+principal records, delayed on-close NAV, fixed principal floors and malformed-policy exits.
+`ZcStandardAskSpec` also signs yield-priced units and partial shares. `StandardPricedAppSpec`
+exercises both policies/markets through wallet and lend-offer fills, guarded resale with new
+issuer origins, metadata, fractional trading, repayment and claims. `ZcStandardProbeSpec` verifies
+pinned trees, both issuer hashes and template consistency of the priced order. See
+[docs/ZC_STANDARD_PRICING.md](docs/ZC_STANDARD_PRICING.md) for the full interface.
+
+Regenerate the pins before testing a contract change:
+
+```text
+sbt "Test / runMain org.lithosprotocol.sigmafi.specs.bonds.ZcStandardReference --write"
+sbt "testOnly org.lithosprotocol.sigmafi.specs.bonds.ZcStandard* org.lithosprotocol.sigmafi.specs.app.Standard*"
+sbt test
+```
+
+These are offline interpreter checks, not proof of live-node admission or a deployment. Existing
+live-test flows remain available, but this session does not broadcast transactions or claim the
+new priced paths have passed a live run.
+
+Initial pricing validation on 2026-11-14: all 461 tests across 23 suites passed, and CLI help ran successfully.
+
+### Yield margins and live-plan commands
+
+`LivePlanSpec` asserts both pricing policies and maturity modes are covered, with margins, payment
+bindings, ask-policy checks and sale-before-repayment ordering. `LivePricingSpec` signs the actual
+A/B/E CLI commands over FakeNode and G's offer match, including guarded yield-priced Dutch shares,
+then runs the same historical confirmation checks as the live runner. Interpreter pricing specs
+cover signed margins before rounding and unchanged floor/guard enforcement. This remains offline
+validation: adding the plan does not broadcast transactions or establish live-node evidence.
+
+Yield-margin/live-plan follow-up on 2026-11-14: all 467 tests across 24 suites passed; CLI help and
+pinned-reference checks passed. No live-node transactions were broadcast.

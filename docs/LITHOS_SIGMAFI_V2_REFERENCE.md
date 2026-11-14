@@ -12,6 +12,16 @@ The generated block contains full ErgoTrees, raw template hex, both kinds of has
 constant with its type and serialized value, concrete ERG/SigUSD addresses, and liquidation expression bytes.
 The authored sections describe how to use them. Do not hand-edit the generated block.
 
+## Current standard pricing extension
+
+This document's generated trees describe the historical first-generation integration, not the ZC
+Standard. The current `PricedOrder`/`PricedAsk` extension, accepted issuer hashes and block-yield
+pricing are specified in [ZC_STANDARD_PRICING.md](./ZC_STANDARD_PRICING.md), with current trees in
+[ZC_STANDARD_REFERENCE.md](./ZC_STANDARD_REFERENCE.md). Consumers of the standard must recognize
+both `Order` and `PricedOrder` origins, use resolved principal in metadata and matching, and select
+the committed pricing expression. A `PricedAsk` retains the old `NavAsk` tree; updated standard
+lend offers have new trees. No Lithos client code or deployments are changed by this repository work.
+
 ## Compiler and regeneration
 
 The reference uses this repository's Scala 2.12.18, Appkit 6.0.0, resolved sigma-state 6.0.2,

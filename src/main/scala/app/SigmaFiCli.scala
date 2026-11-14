@@ -73,6 +73,9 @@ object SigmaFiCli {
       |      The order expires after --expires-in blocks (default 5040, or half a fixed maturity's term if
       |      less); then anyone may return it to you for the --expiry-fee (default 0.005 ERG, at least 0.002),
       |      which a fill refunds to you instead.
+      |      Optional --nav [--margin <percent>] or --yield <percent> [--margin <percent>] creates a PricedOrder.
+      |      Repayment stays fixed; --principal is its floor (and NAV anchor). Both support fixed or on-close maturity.
+      |      Yield uses simple return per 262800 blocks; no calendar clock or compounding, fees excluded.
       |  cancel-order <order box id>
       |  repay <bond box id> [--from-collateral]
       |      --from-collateral repays out of the bond's own ERG or repayment token, as far as it holds them
@@ -107,10 +110,13 @@ object SigmaFiCli {
       |
       |  Asks (sell any token, paid in a market's asset):
       |  asks [--mine]
-      |  sell <token id> --amount <n> [--market ERG|SigUSD] (--price <total> | --nav [--margin <percent>]
+      |  sell <token id> --amount <n> [--market ERG|SigUSD] (--price <total> | --nav [--margin <percent>] | --yield <percent> [--margin <percent>]
       |               [--price <floor total>]) [--min-fill <n>] [--expires-in <blocks>] [--refund-fee <ERG>]
       |               [--min-cover <percent> [--oracle-age <blocks>]]
       |      --nav prices a bond unit or its shares at the bond's accrued value plus --margin (may be negative).
+      |      --yield uses a PricedAsk at a simple buyer yield per 262800 blocks, fees excluded.
+      |      Both policies accept signed --margin on the calculated price; this changes the resulting yield.
+      |      With --nav or --yield, --price is an optional floor for the total amount.
       |      Shares' --min-fill defaults to the least lot that claims a raw unit of the repayment.
       |      --min-cover adds a sale guard to a bond unit or its shares, at either price: the ask sells only
       |      while the bond's collateral is worth at least that share of its repayment at an oracle price at
@@ -122,7 +128,7 @@ object SigmaFiCli {
       |
       |  Lend offers (a yield bid that batchers fill from orders and asks):
       |  offers [--mine]
-      |  create-offer --capital <amount> --yield <percent a year> --collateral-floor <percent>
+      |  create-offer --capital <amount> --yield <percent per 262800 blocks> --collateral-floor <percent>
       |               [--market ERG|SigUSD] [--min-blocks <n>] [--max-blocks <n>] [--min-price <amount>]
       |               [--batcher-fee <ERG>] [--fee-reserve <ERG>] [--oracle-age <blocks>] [--expires-in <blocks>]
       |               [--fees <ERG>] [--min-auction-floor <percent> --max-auction-length <blocks>]
@@ -359,7 +365,7 @@ object Args {
   val Options: Set[String] = SessionOptions ++ Set(
     "principal", "principal-token", "repayment", "collateral-erg", "collateral-token", "batching-fee",
     "liquidation", "maturity", "term", "duration",
-    "market", "ratio", "oracle-age", "expires-in", "expiry-fee", "fee-reserve", "add-erg", "add-token",
+    "market", "ratio", "oracle-age", "fill-ratio", "min-cover", "expires-in", "expiry-fee", "fee-reserve", "add-erg", "add-token",
     "shares", "share-name", "share-description", "decimals", "pull-fee", "mint-fee",
     "auction-opening", "auction-floor", "auction-length", "amount",
     "price", "margin", "min-fill", "refund-fee",

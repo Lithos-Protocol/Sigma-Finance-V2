@@ -27,7 +27,7 @@ Four principles:
 | Area | Fixed on-chain | Left off-chain |
 |---|---|---|
 | Deployment | Each tree pins the hashes of the trees it reads | Whether each market's constants agree (an order's repayment token and its bond's, an offer's five constants). Pinned in [ZC_STANDARD_REFERENCE.md](./ZC_STANDARD_REFERENCE.md). |
-| Expressions | Their hashes only (bond R8, order R8, offer R6, NAV ask R6) | The expression bytes a spender supplies; whether a bond's liquidation rule is the one compiled for its market |
+| Expressions | Their hashes only (bond R8, fixed order R8, priced order R8, offer R6, priced ask R6) | The expression bytes a spender supplies; whether a bond's liquidation rule is the one compiled for its market |
 | Verification | Origin and state checks inside the lend offer | Every other reader (wallet, UI, a direct purchase) runs the recipe in SigmaBonds.MD itself |
 | Scripts behind hashes | Borrower, owner and seller as blake2b256 of their scripts | Finding the script to pay: **script disclosure** below |
 | Token metadata | A bond unit's EIP-4 R4 and R5 exist and R6 is "0"; a share's R4 to R6 copy its request's R9 | Every name and description: **token metadata** below |
@@ -36,6 +36,22 @@ Four principles:
 | Heights | Expiries, maturity at least one block away, start within 8 blocks, oracle age at most 100,000 | Expiry lengths, the maturity grid, oracle-age defaults |
 | Matching | An offer never does worse than its terms; one offer per transaction | Which order or ask each offer takes, in what order, and what is packed together |
 | Display | Nothing | Units, rates, dates, prices of shares |
+
+## Expression-priced orders and asks
+
+[ZC_STANDARD_PRICING.md](./ZC_STANDARD_PRICING.md) specifies NAV and simple block-yield policies,
+principal-only resolution, signed price margins for both policies, register layouts, rounding, on-close behavior, fees and CLI examples.
+`Order` and `SaleOrder` retain fixed terms. `PricedOrder` is a separate accepted issuer; `PricedAsk`
+is the generic expression shell formerly named `NavAsk`. A reader authenticates either accepted
+issuing tree, including when verifying a bond's secondary sale or fractional shares.
+
+Clients resolve priced principal before checking bids, ranking matches, building metadata or paying
+the borrower. They never use its stored principal floor as its fill price. A three-block lookahead
+is used for increasing NAV/yield prices; the bond records the actual amount paid, not the curve's
+reference amount. Unknown policies do not silently fall back to NAV: direct fills/buys refuse them,
+and matching skips them. Cancel and expiry refunds remain available without policy witnesses.
+Pricing and collateral-guard commitments are independent. No rate or pricing mode is chosen for the
+user. Block yields use 262800 blocks as a scale, with no compounding or calendar-time guarantee.
 
 ## Script disclosure (required)
 
@@ -47,10 +63,10 @@ cannot look a script up by its hash, so every box must lead to its scripts in on
 
 | Box | Register | Script |
 |---|---|---|
-| Order | R6 | Borrower |
+| Order, PricedOrder | R6 | Borrower |
 | Bond | R5 | Borrower (copied from the order) |
 | Lend offer | R4 | Owner |
-| Sale order, NAV ask | R4 | Seller |
+| Sale order, PricedAsk | R4 | Seller |
 | Fractional or Dutch mint request | R7 | Owner |
 
 **Writers.** A transaction that creates any of these boxes, including a continuation or a request a
@@ -389,7 +405,7 @@ when the order's oracle age is at least the offer's. The values are the CLI's cu
 | Ask refund fee | 0.002 ERG | none |
 | ERG carried by a SigUSD offer for fees | 0.5 ERG | — |
 | Ask minimum fill, offer minimum price | 1 raw unit | — |
-| NAV ask margin | 0% | above −100% |
+| NAV pricing margin | 0% | above −100% |
 | Fill guard on an oracle order | on, at the order's own liquidation ratio | at least that ratio |
 | Sale guard | off; its oracle age 30 blocks when set | 1 to 100,000 blocks |
 | Share count, decimals | 100,000,000 (100 shares), 6 | 1 to 1,000,000,000 |
@@ -400,8 +416,8 @@ floor, an ask's price or `--nav`, and a Dutch auction's opening, floor and lengt
 ## Display
 
 - Amounts in the market's unit: ERG with 9 decimals, SigUSD with 2.
-- Yields as simple APR per 262,800 blocks. A year is a block count, so slow blocks mean a lower
-  calendar rate than quoted. Say so wherever a rate is shown.
+- Yields as simple return normalized over 262,800 blocks, never an exact calendar rate or compounded
+  APY. Display the block normalization wherever a yield is shown; fee treatment is described in the pricing guide.
 - Heights with an approximate date at 2 minutes per block.
 - Share prices as a percentage of face (see "Share count").
 - Flags for anything a reader could not verify: an unverified origin, an unknown expression,

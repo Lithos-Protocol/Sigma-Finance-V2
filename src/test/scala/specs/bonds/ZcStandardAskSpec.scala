@@ -7,7 +7,7 @@ import org.scalatest.propspec.AnyPropSpec
 import work.lithos.mutations.{Contract, InputUTXO, Token, UTXO}
 
 /**
- * ZC_Standard_SaleOrder, ZC_Standard_NavAsk with ZC_Standard_AccruedValue_Pricing, and the shared
+ * ZC_Standard_SaleOrder, ZC_Standard_PricedAsk with ZC_Standard_AccruedValue_Pricing, and the shared
  * templates of every contract compiled per asset. The seller is `other`; buyers are the executor.
  */
 class ZcStandardAskSpec extends AnyPropSpec with ZcStandardSpecBase {
@@ -42,11 +42,11 @@ class ZcStandardAskSpec extends AnyPropSpec with ZcStandardSpecBase {
       val e = exchange(ctx)
       e.dutchVault.ergoTree.version shouldBe 3
       Seq(e.erg, e.token).foreach { m =>
-        Seq(m.offer, m.saleOrder, m.navAsk, m.pricing, m.policy, m.dutchMint).foreach(_.ergoTree.version shouldBe 3)
+        Seq(m.offer, m.saleOrder, m.pricedAsk, m.pricing, m.policy, m.dutchMint).foreach(_.ergoTree.version shouldBe 3)
       }
       // An indexed node lists every market of a contract by template hash. The expressions run through
       // executeFromVar are not trees anyone lists, so only the four box scripts are checked.
-      Seq(e.erg.offer -> e.token.offer, e.erg.saleOrder -> e.token.saleOrder, e.erg.navAsk -> e.token.navAsk,
+      Seq(e.erg.offer -> e.token.offer, e.erg.saleOrder -> e.token.saleOrder, e.erg.pricedAsk -> e.token.pricedAsk,
         e.erg.dutchMint -> e.token.dutchMint).foreach { case (erg, token) =>
         erg.ergoTree.bytes should not be token.ergoTree.bytes
         erg.ergoTree.template shouldBe token.ergoTree.template
@@ -164,7 +164,7 @@ class ZcStandardAskSpec extends AnyPropSpec with ZcStandardSpecBase {
                      floor: (Long, Long) = (1L, 1000000000L), minFill: Long = 1L, expiry: Long = -1L,
                      value: Long = minBox, pricing: Contract = null): UTXO = {
     val ctx = n.f.ctx
-    UTXO(marketOf(ctx, n.f.kind).navAsk, value, Seq(Token(token, amount)),
+    UTXO(marketOf(ctx, n.f.kind).pricedAsk, value, Seq(Token(token, amount)),
       Seq(sellerHash(ctx),
         longsValue(floor._1, floor._2, minFill, if (expiry < 0L) n.f.maturity + 100L else expiry, margin, wholeUnits),
         bytesValue((if (pricing == null) marketOf(ctx, n.f.kind).pricing else pricing).hashedValueBytes),
@@ -248,6 +248,39 @@ class ZcStandardAskSpec extends AnyPropSpec with ZcStandardSpecBase {
         next.withRegNum(5, longsValue(1L, 1000000000L, 1L, n.f.maturity + 100L, -9000L, 1000L)),
         next.subValue(1L)).foreach { bad =>
         rejectsAtSigning(executor(ctx), navTx(n, ask, 7L, price, next = bad))
+      }
+    }
+  }
+
+  for (kind <- kinds) {
+    property(s"yield-priced ask $kind: units and partial shares enforce the exact block-yield price, floor and expiry") {
+      withCtx { ctx =>
+        val n = nav(ctx, kind)
+        val m = if (kind == ErgBond) ksingh.sigmabonds.standard.Market.Erg else ksingh.sigmabonds.standard.Market.SigUsd
+        val expression = ZcStandardSpecBase.compiled(ctx).market(m).yieldPricing
+        Seq((n.f.asset, 1L, 1L), (forSale, 1000L, 7L)).foreach { case (token, whole, sold) =>
+          for (margin <- Seq(-250L, 0L, 250L)) {
+            val rate = 1000L
+            val amount = ceilDiv(BigInt(n.repayment) * sold * 2628000000L * (10000L + margin),
+              BigInt(whole) * (BigInt(2628000000L) + BigInt(rate) * (n.f.maturity - n.height)) * 10000L)
+            val base = navBox(n, token, whole, whole, rate, pricing = expression)
+            val ask = base.withRegNum(5, longsValue((base.parseCollReg[Long](1).toSeq :+ margin): _*))
+            accepts(executor(ctx), navTx(n, ask, sold, amount, expression = expression))
+            rejectsAtSigning(executor(ctx), navTx(n, ask, sold, amount - 1L, expression = expression))
+            rejectsAtSigning(executor(ctx), navTx(n, ask, sold, amount, expression = alwaysTrue(ctx)))
+            rejectsAtSigning(executor(ctx), navTx(n, ask, sold, amount * 2L, expression = expression, height = n.f.maturity.toInt))
+            val floor = ask.withRegNum(5, longsValue(Seq(amount + 1L, sold, 1L, n.f.maturity + 100L, rate, whole, margin): _*))
+            rejectsAtSigning(executor(ctx), navTx(n, floor, sold, amount, expression = expression))
+            accepts(executor(ctx), navTx(n, floor, sold, amount + 1L, expression = expression))
+            val negative = ask.withRegNum(5, longsValue(Seq(1L, 1000000000L, 1L, n.f.maturity + 100L, -1L, whole, margin): _*))
+            rejectsAtSigning(executor(ctx), navTx(n, negative, sold, amount, expression = expression))
+          }
+          Seq(-10000L, 1000001L).foreach { invalidMargin =>
+            val raw = navBox(n, token, whole, whole, 1000L, pricing = expression)
+            val bad = raw.withRegNum(5, longsValue((raw.parseCollReg[Long](1).toSeq :+ invalidMargin): _*))
+            rejectsAtSigning(executor(ctx), navTx(n, bad, sold, n.repayment * 2L, expression = expression))
+          }
+        }
       }
     }
   }

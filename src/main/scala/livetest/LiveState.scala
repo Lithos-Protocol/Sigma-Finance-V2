@@ -45,6 +45,20 @@ case class LiveState(started: Boolean, chain: Boolean, maturityBlocks: Int, addr
   def update(id: String)(f: StepState => StepState): LiveState = copy(steps = steps.updated(id, f(step(id))))
   def bind(kv: (String, String)*): LiveState = copy(vars = vars ++ kv)
 
+  /** A confirmation check reads the outputs this step bound, even after a successor rebinds their names. */
+  def checkVars(id: String): Map[String, String] =
+    vars ++ log.filter(e => e.step == id && e.alive).sortBy(_.seq).map(e => e.name -> e.value)
+
+  /** Keep submitted transactions for confirmation checks; only an unsubmitted step may run again directly. */
+  def retry(id: String): LiveState = {
+    val submitted = step(id).txs.nonEmpty
+    val next = if (submitted) this else unbind(id)
+    next.update(id)(ss => ss.copy(status = if (submitted) StepState.InFlight else StepState.Pending,
+      outputs = if (submitted) ss.outputs else Vector.empty, waitFor = Vector.empty,
+      attempts = 0, misses = 0, firstMiss = 0L, notBefore = None,
+      notes = ss.notes :+ (if (submitted) "rechecking submitted transactions" else "retried")))
+  }
+
   /** Bind as `step` did, logging what each name held before. */
   def bindAs(step: String, kv: Seq[(String, String)]): LiveState = {
     val seq = (0L +: log.map(_.seq)).max + 1L

@@ -10,12 +10,14 @@ import work.lithos.mutations.{Contract, InputUTXO, Token, UTXO}
 
 import scala.util.Try
 
-/** How an ask is priced: a fixed total for its units, or accrued value plus a margin with an optional floor. */
+/** How an ask is priced: a fixed total, or NAV/block yield with a signed price margin and optional floor. */
 sealed trait AskPrice
 /** `total` raw units of the market's asset for all the ask's units: the price per unit is total / amount. */
 case class FixedPrice(total: Long) extends AskPrice
 /** `marginBps` over NAV (signed); `floorTotal`, when given, is the least the whole amount may sell for. */
 case class NavPrice(marginBps: Long, floorTotal: Option[Long]) extends AskPrice
+/** Reference simple yield in bps per 262800 blocks, signed price margin, and optional floor. */
+case class YieldPrice(yieldBps: Long, floorTotal: Option[Long] = None, marginBps: Long = 0L) extends AskPrice
 
 /**
  * A seller's sale guard: the ask sells only while the bond's collateral is worth at least `minBps` of its
@@ -24,7 +26,7 @@ case class NavPrice(marginBps: Long, floorTotal: Option[Long]) extends AskPrice
 case class SaleGuard(minBps: Long, maxAge: Long)
 
 /**
- * Asks: ZC_Standard_SaleOrder at a fixed price, and ZC_Standard_NavAsk at a bond's accrued value through
+ * Asks: ZC_Standard_SaleOrder at a fixed price, and ZC_Standard_PricedAsk at a bond's accrued value through
  * ZC_Standard_AccruedValue_Pricing. Either sells any token; a NAV ask sells a bond unit or shares of one.
  */
 trait StandardAsks extends AppBase { self: StandardApp =>
@@ -33,7 +35,7 @@ trait StandardAsks extends AppBase { self: StandardApp =>
 
   def asks(): Seq[StdAsk] =
     (decoded(nodeApi.unspentByTemplateHash(Base16.encode(protocol.askTemplateHash))) ++
-      decoded(nodeApi.unspentByTemplateHash(Base16.encode(protocol.navAskTemplateHash)))).flatMap(protocol.asAsk)
+      decoded(nodeApi.unspentByTemplateHash(Base16.encode(protocol.pricedAskTemplateHash)))).flatMap(protocol.asAsk)
 
   /** A bond asset and how many raw units make one bond: the unit itself (1), or a share (N of its vault). */
   def bondOf(token: ErgoId): Option[(ErgoId, Long)] =
@@ -41,8 +43,8 @@ trait StandardAsks extends AppBase { self: StandardApp =>
     else shareVault(token).map(v => v.bondAsset -> v.n)
 
   /** The live bond a NAV ask prices, which its expression reads as a data input. */
-  def navBond(ask: StdAsk): StdBond = {
-    val asset = ask.navAsset.getOrElse(fail("the ask names no bond"))
+  def pricedBond(ask: StdAsk): StdBond = {
+    val asset = ask.pricedAsset.getOrElse(fail("the ask names no bond"))
     decoded(nodeApi.unspentByTokenId(asset.toString)).flatMap(protocol.asBond).find(_.asset == asset)
       .getOrElse(fail(s"bond $asset is not live: a NAV ask sells only while its bond is"))
   }
@@ -63,10 +65,20 @@ trait StandardAsks extends AppBase { self: StandardApp =>
    * so it is priced a few blocks ahead to survive the mempool; overpaying reaches the seller.
    */
   def askPrice(ask: StdAsk, units: Long): (Long, Option[StdBond]) =
-    if (!ask.nav) (ask.fixedPrice(units).toLong, None)
+    if (!ask.priced) (ask.fixedPrice(units).toLong, None)
     else {
-      val bond = navBond(ask)
-      val owed = navOwed(ask, bond, units, height.toLong + 3L).max(ask.fixedPrice(units))
+      val bond = pricedBond(ask)
+      protocol.pricingOf(ask) // Refuse unknown policies rather than applying an unrelated formula.
+      val at = height.toLong + 3L
+      val raw = if (!protocol.yieldAsk(ask)) navOwed(ask, bond, units, at) else {
+        if (ask.terms.size < 7 || ask.terms(6) <= -10000L || ask.terms(6) > 1000000L || ask.terms(4) < 0L || bond.maturity <= at || at < bond.start || ask.wholeUnits < 1L || ask.wholeUnits > 1000000000L)
+          fail("invalid yield pricing terms or no blocks left to maturity")
+        val num = BigInt(bond.repayment) * units * 2628000000L * (10000L + ask.terms(6))
+        val den = BigInt(ask.wholeUnits) * (BigInt(2628000000L) + BigInt(ask.terms(4)) * (bond.maturity - at)) * 10000L
+        (num + den - 1) / den
+      }
+      val owed = raw.max(ask.fixedPrice(units))
+      if (!owed.isValidLong || owed <= 0) fail("the ask price is outside the supported amount range")
       (owed.toLong, Some(bond))
     }
 
@@ -95,14 +107,17 @@ trait StandardAsks extends AppBase { self: StandardApp =>
       if (g.maxAge < 1L || g.maxAge > 100000L) fail("the sale guard's oracle age must be 1 to 100000 blocks")
     }
     // A NAV ask over a standard bond: plain accrued-value pricing, or with a sale guard the guarded expression,
-    // whose R5(6) and R5(7) hold the guard's minimum cover and oracle age.
-    def navAsk(num: Long, den: Long, margin: Long): (Contract, Seq[ErgoValue[_]]) = {
+    // with NAV guards at R5(6..7), or yield margin at R5(6) and guards at R5(7..8).
+    def pricedAsk(num: Long, den: Long, margin: Long, yieldBased: Boolean = false, priceMargin: Long = 0L): (Contract, Seq[ErgoValue[_]]) = {
+      if (num <= 0L || den <= 0L) fail("the price floor must be positive")
       val (asset, whole) = bondOf(token).getOrElse(fail(s"$tokenId is not a standard bond unit or its shares"))
       val bondMarket = assetMarket(asset).getOrElse(fail(s"bond $asset was not minted by a standard order"))
       if (bondMarket != market) fail(s"a NAV ask or a guarded ask is paid in its bond's asset: use --market $bondMarket")
-      val pricing = if (guard.isDefined) protocol.market(market).guardedPricing else protocol.market(market).pricing
-      (protocol.market(market).navAsk,
-        Seq(seller, longsValue(Seq(num, den, minFill, expiry, margin, whole) ++ guard.toSeq.flatMap(g => Seq(g.minBps, g.maxAge)): _*),
+      val c = protocol.market(market)
+      val pricing = if (yieldBased) { if (guard.isDefined) c.guardedYieldPricing else c.yieldPricing }
+        else if (guard.isDefined) c.guardedPricing else c.pricing
+      (protocol.market(market).pricedAsk,
+        Seq(seller, longsValue(Seq(num, den, minFill, expiry, margin, whole) ++ (if (yieldBased) Seq(priceMargin) else Seq.empty) ++ guard.toSeq.flatMap(g => Seq(g.minBps, g.maxAge)): _*),
           bytesValue(pricing.hashedValueBytes), bytesValue(asset.getBytes)))
     }
     val (script, regs, note) = price match {
@@ -113,15 +128,22 @@ trait StandardAsks extends AppBase { self: StandardApp =>
       case FixedPrice(total) =>
         if (total <= 0L) fail("the price must be positive")
         // A guarded fixed price: a NAV ask at -99.99%, so its floor, the fixed price, is what a buyer pays.
-        val (script, regs) = navAsk(total, amount, GuardedFixedMargin)
+        val (script, regs) = pricedAsk(total, amount, GuardedFixedMargin)
         (script, regs, s"price: ${Units.amount(total, market)} for all $amount units (a NAV ask whose floor is the price)")
       case NavPrice(margin, floor) =>
         if (margin <= -10000L || margin > 1000000L) fail("the margin must be above -100% and at most 10000%")
         val (num, den) = floor.fold((1L, 1000000000000L))(t => (t, amount))
-        val (script, regs) = navAsk(num, den, margin)
+        val (script, regs) = pricedAsk(num, den, margin)
         val whole = bondOf(token).fold(1L)(_._2)
         (script, regs, s"price: the bond's accrued value ${if (margin >= 0) "plus" else "minus"} ${Units.percent(margin.abs)}, per " +
           s"$whole unit(s) of a whole bond" + floor.fold("")(f => s", never under ${Units.amount(f, market)} for all"))
+      case YieldPrice(rate, floor, margin) =>
+        if (rate < 0L) fail("the yield cannot be negative")
+        val (num, den) = floor.fold((1L, 1000000000000L))(t => (t, amount))
+        if (margin <= -10000L || margin > 1000000L) fail("the margin must be above -100% and at most 10000%")
+        val (script, regs) = pricedAsk(num, den, rate, yieldBased = true, priceMargin = margin)
+        (script, regs, s"price: ${Units.percent(rate)} reference simple buyer yield per 262800 blocks, price margin ${Units.percent(margin)}, excluding fees" +
+          floor.fold("")(f => s", never under ${Units.amount(f, market)} for all"))
     }
     val guardNote = guard.map(g => s"sale guard: it sells only while the bond's collateral is worth at least " +
       s"${Units.percent(g.minBps)} of its repayment at an oracle price at most ${g.maxAge} blocks old; below that, " +
@@ -191,7 +213,7 @@ trait StandardAsks extends AppBase { self: StandardApp =>
   /** The ask's context vars: 0 the payout, 1 the continuation, and for a NAV ask 2 its expression, 3 the state. */
   private[standard] def askInput(ask: StdAsk, payoutIndex: Int, restIndex: Option[Int]): InputUTXO = {
     val base = restIndex.foldLeft(ask.box.withCtxVar(0.toByte, intValue(payoutIndex)))((b, i) => b.withCtxVar(1.toByte, intValue(i)))
-    if (!ask.nav) base
+    if (!ask.priced) base
     else base.withCtxVar(2.toByte, bytesValue(protocol.pricingOf(ask).valueBytes)).withCtxVar(3.toByte, intValue(0))
   }
 

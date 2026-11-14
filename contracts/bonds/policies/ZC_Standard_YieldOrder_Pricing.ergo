@@ -1,0 +1,20 @@
+{
+    // PricedOrder var 2. R9 = (reference simple yield bps per 262800 blocks, signed price margin bps).
+    // Minimum principal = ceil(R * B * (10000+margin) / ((B + yield * D)*10000)), B=10000*262800, D=M-HEIGHT.
+    // The shell additionally enforces the borrower's fixed principal floor and actual payment record.
+    // Uses remaining blocks, not calendar time, market rates or compounding. Fees are not included.
+    val payload = SELF.R9[Coll[Long]].get
+    if (payload.size != 2) {
+        sigmaProp(false)
+    } else {
+        val bond = OUTPUTS(1)
+        val borrower = bond.R6[Coll[Long]].get
+        val remaining = bond.R9[Coll[Long]].get(2) - HEIGHT.toLong
+        val principal = if (CONST_REPAYMENT_TOKEN == SELF.id.slice(0, 0)) borrower(1)
+            else bond.R7[Coll[(Coll[Byte], Long)]].get(0)._2
+        val scale = 2628000000L.toBigInt
+        sigmaProp(payload(0) >= 0L && payload(1) > -10000L && payload(1) <= 1000000L && remaining > 0L && principal > 0L && borrower(0) > 0L &&
+            principal.toBigInt * (scale + payload(0).toBigInt * remaining.toBigInt) * 10000L.toBigInt >=
+                borrower(0).toBigInt * scale * (10000L + payload(1)).toBigInt)
+    }
+}

@@ -162,7 +162,7 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
 
       w.run(l, w.app(l).sell(bond.asset.toString, 1L, Market.Erg, FixedPrice(erg("5.5")), Some(1L), w.h + 100L, erg("0.002")))
       val ask = w.app(e).asks().loneElement
-      ask.nav shouldBe false
+      ask.priced shouldBe false
       w.app(e).askPrice(ask, 1L)._1 shouldBe erg("5.5")
       val l0 = w.nano(l)
       w.run(e, w.app(e).buy(ask.box.id.toString, None))
@@ -177,9 +177,9 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
         include("use --market ERG")
       w.run(e, w.app(e).sell(shareId.toString, 60L, Market.Erg, NavPrice(0L, None), Some(1L), w.h + 100L, erg("0.002")))
       val nav = w.app(l).asks().loneElement
-      nav.nav shouldBe true
+      nav.priced shouldBe true
       nav.wholeUnits shouldBe 100L
-      nav.navAsset shouldBe Some(bond.asset)
+      nav.pricedAsset shouldBe Some(bond.asset)
       w.run(l, w.app(l).buy(nav.box.id.toString, Some(40L)))
       w.tokens(l).get(shareId) shouldBe Some(40L)
       val rest = w.app(l).asks().loneElement

@@ -436,10 +436,10 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
       val bond = w.app(e).bonds().loneElement
 
       // At NAV with a 160% guard: an offer buys it at 166%.
-      val navAsk = w.app(l).sell(bond.asset.toString, 1L, Market.Erg, NavPrice(0L, None), Some(1L), w.h + 100L,
+      val pricedAsk = w.app(l).sell(bond.asset.toString, 1L, Market.Erg, NavPrice(0L, None), Some(1L), w.h + 100L,
         erg("0.002"), Some(SaleGuard(16000L, 30L)))
-      navAsk.notes.exists(_.startsWith("sale guard: it sells only while the bond's collateral is worth at least 160%")) shouldBe true
-      w.run(l, navAsk)
+      pricedAsk.notes.exists(_.startsWith("sale guard: it sells only while the bond's collateral is worth at least 160%")) shouldBe true
+      w.run(l, pricedAsk)
       val nav = w.app(e).asks().loneElement
       protocol.saleGuard(nav) shouldBe Some(16000L -> 30L)
       w.run(o, w.app(o).createOffer(offerSpec(w)))

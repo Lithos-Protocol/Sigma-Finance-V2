@@ -1,6 +1,6 @@
 {
     // Standard SigmaFi V2 zero-coupon bond.
-    // Use only with ZC_Standard_Order and ZC_Standard_BondVault. One script serves ERG and token repayment: the
+    // Use only with ZC_Standard_Order / ZC_Standard_PricedOrder and ZC_Standard_BondVault. One script serves ERG and token repayment: the
     // repayment asset is a constant, so each repayment asset has its own bond address and all of
     // them share one template. An indexed node lists one market by ErgoTree and every bond by
     // template hash; a consuming contract pins the tree hash of the asset it expects.
@@ -20,12 +20,12 @@
     // REGISTERS (all pinned by ZC_Standard_Order)
     // R4: Coll[Byte] - originating order id, which is also the bond asset id
     // R5: Coll[Byte] - blake2b256 of the borrower script
-    // R6: Coll[Long] - exact copy of the order's borrower values (7..64 Longs):
+    // R6: Coll[Long] - borrower values (7..64 Longs), with actual principal resolved by PricedOrder:
     //   0 repayment amount; 1 principal nanoERG; 2 repayment ERG floor excluding fee refund;
     //   3 requested maturity height or on-close duration; 4 order expiry height (historical);
     //   5 expiry fee (already refunded); 6 maturity mode; 7.. liquidation payload
     // R7: Coll[(Coll[Byte], Long)] - agreed principal tokens
-    // ZC_Standard_Order lends only in this bond's repayment asset, so for a bond it created the
+    // Both accepted issuing orders lend only in this bond's repayment asset, so for a bond it created the
     // principal P is R6(1) for ERG (R7 empty) and R7(0)._2 for a token (R7 exactly that token),
     // in the same unit as the repayment R6(0). R6(2) never binds for ERG and is at most 1000000
     // for a token, so R6(0) is the whole repayment. This script does not re-check any of it.
@@ -71,7 +71,7 @@
     // cannot move again in time. The box id changes; the asset does not.
     //
     // ASSUMPTIONS
-    // A hand-made box with this script proves nothing: authenticate the asset's order (ZC_Standard_Order).
+    // A hand-made box with this script proves nothing: authenticate the asset's issuer (Order or PricedOrder).
     // The liquidation expression controls the vault's contents; both parties must inspect it.
     // Anyone may repay in full. Liquidation may run before maturity if the expression allows it.
     // An anyone-can-spend borrower script lets anyone recollateralize or repay from collateral.

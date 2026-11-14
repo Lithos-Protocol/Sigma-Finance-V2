@@ -7,7 +7,7 @@ import work.lithos.mutations.{Contract, InputUTXO, Token, UTXO}
 
 /**
  * The guards: ZC_Standard_ERG_SigUSD_FillGuard, which ZC_Standard_Order runs on a fill when its R8 names
- * it, and ZC_Standard_ERG_SigUSD_GuardedNav_Pricing, which ZC_Standard_NavAsk runs on a sale. Each lets
+ * it, and ZC_Standard_ERG_SigUSD_GuardedNav_Pricing, which ZC_Standard_PricedAsk runs on a sale. Each lets
  * its owner, the borrower or the seller, set a collateral ratio below which the box does not trade.
  *
  * Covers used throughout: an ERG bond holds 10 ERG against a 7 ERG repayment, 142.857% whatever the
@@ -149,7 +149,7 @@ class ZcStandardFillGuardSpec extends AnyPropSpec with ZcStandardSpecBase {
   private def guardedAsk(l: Live, minBps: Long, margin: Long = 0L, floor: (Long, Long) = (1L, 1000000000L),
                          maxAge: Long = 30L): UTXO = {
     val ctx = l.f.ctx
-    UTXO(marketOf(ctx, l.f.kind).navAsk, minBox, Seq(Token(l.f.asset, 1L)),
+    UTXO(marketOf(ctx, l.f.kind).pricedAsk, minBox, Seq(Token(l.f.asset, 1L)),
       Seq(bytesValue(hashOf(otherTree(ctx))),
         longsValue(floor._1, floor._2, 1L, l.f.maturity + 100L, margin, 1L, minBps, maxAge),
         bytesValue(marketOf(ctx, l.f.kind).guardedPricing.hashedValueBytes), bytesValue(l.f.asset.getBytes)))
@@ -194,6 +194,31 @@ class ZcStandardFillGuardSpec extends AnyPropSpec with ZcStandardSpecBase {
       accepts(executor(ctx), saleTx(l, ask, 500L))
       rejectsAtSigning(executor(ctx), saleTx(l, ask, 499L))
       rejectsAtSigning(executor(ctx), saleTx(l, ask, 500L, price = 800000000L))
+    }
+  }
+
+  property("guarded yield: payment cannot bypass cover, oracle freshness or the pinned pricing expression") {
+    withCtx { ctx =>
+      val l = live(ctx, TokenBond)
+      val expression = ZcStandardSpecBase.compiled(ctx).market(ksingh.sigmabonds.standard.Market.SigUsd).guardedYieldPricing
+      // Zero yield asks for the full repayment, so the boundary is independently known.
+      val original = guardedAsk(l, 20000L).withRegNum(6, bytesValue(expression.hashedValueBytes))
+      val ask = original.withRegNum(5, longsValue(original.parseCollReg[Long](1).toSeq.patch(6, Seq(0L), 0): _*))
+      val paid = l.f.data(0)
+      accepts(executor(ctx), saleTx(l, ask, paid, expression = expression))
+      rejectsAtSigning(executor(ctx), saleTx(l, ask, paid - 1L, expression = expression))
+      rejectsAtSigning(executor(ctx), saleTx(l, ask, paid * 2L, price = 800000000L, expression = expression))
+      rejectsAtSigning(executor(ctx), saleTx(l, ask, paid, data = Seq.empty, expression = expression))
+      rejectsAtSigning(executor(ctx), saleTx(l, ask, paid,
+        data = Seq(oracleBox(l.f, created = l.height - 31)), expression = expression))
+      rejectsAtSigning(executor(ctx), saleTx(l, ask, paid, expression = alwaysTrue(ctx)))
+      Seq(-200L, 200L).foreach { margin =>
+        val withMargin = ask.withRegNum(5, longsValue(ask.parseCollReg[Long](1).toSeq.updated(6, margin): _*))
+        val amount = paid * (10000L + margin) / 10000L
+        accepts(executor(ctx), saleTx(l, withMargin, amount, expression = expression))
+        rejectsAtSigning(executor(ctx), saleTx(l, withMargin, amount - 1L, expression = expression))
+        rejectsAtSigning(executor(ctx), saleTx(l, withMargin, amount * 2L, price = 800000000L, expression = expression))
+      }
     }
   }
 

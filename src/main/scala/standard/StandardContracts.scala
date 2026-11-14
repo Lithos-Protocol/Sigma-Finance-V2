@@ -34,9 +34,11 @@ object Market {
 
 /** The contracts and expressions compiled for one market. */
 case class MarketContracts(bond: Contract, order: Contract, offer: Contract, saleOrder: Contract,
-                           navAsk: Contract, dutchMint: Contract,
+                           pricedAsk: Contract, dutchMint: Contract,
                            oracleRule: Contract, policy: Contract, pricing: Contract,
-                           fillGuard: Contract, guardedPricing: Contract)
+                           fillGuard: Contract, guardedPricing: Contract,
+                           pricedOrder: Contract, navOrderPricing: Contract, yieldOrderPricing: Contract,
+                           yieldPricing: Contract, guardedYieldPricing: Contract)
 
 /**
  * The whole ZC Standard set. Expressions that run through `executeFromVar` are held as Contracts as
@@ -56,9 +58,12 @@ case class StandardContracts(vault: Contract, fractionalVault: Contract, fractio
       Market.all.flatMap { m =>
         val c = market(m)
         Seq("Bond" -> c.bond, "Order" -> c.order, "LendOffer" -> c.offer, "SaleOrder" -> c.saleOrder,
-          "NavAsk" -> c.navAsk, "DutchAuctionMint" -> c.dutchMint, "ERG_SigUSD_Liquidation" -> c.oracleRule,
+          "PricedAsk" -> c.pricedAsk, "DutchAuctionMint" -> c.dutchMint, "ERG_SigUSD_Liquidation" -> c.oracleRule,
           "ERG_SigUSD_CollateralPolicy" -> c.policy, "AccruedValue_Pricing" -> c.pricing,
-          "ERG_SigUSD_FillGuard" -> c.fillGuard, "ERG_SigUSD_GuardedNav_Pricing" -> c.guardedPricing)
+          "ERG_SigUSD_FillGuard" -> c.fillGuard, "ERG_SigUSD_GuardedNav_Pricing" -> c.guardedPricing,
+          "PricedOrder" -> c.pricedOrder, "NavOrder_Pricing" -> c.navOrderPricing,
+          "YieldOrder_Pricing" -> c.yieldOrderPricing, "YieldAsk_Pricing" -> c.yieldPricing,
+          "ERG_SigUSD_GuardedYield_Pricing" -> c.guardedYieldPricing)
           .map { case (name, contract) => Entry(name, Some(m), contract) }
       }
   }
@@ -75,7 +80,8 @@ object StandardContracts {
   /** Entries run through `executeFromVar`: a box commits to their expression bytes, not their tree. */
   val Expressions: Set[String] =
     Set("MaturityLiquidation", "ERG_SigUSD_Liquidation", "ERG_SigUSD_CollateralPolicy", "AccruedValue_Pricing",
-      "ERG_SigUSD_FillGuard", "ERG_SigUSD_GuardedNav_Pricing")
+      "ERG_SigUSD_FillGuard", "ERG_SigUSD_GuardedNav_Pricing", "NavOrder_Pricing", "YieldOrder_Pricing",
+      "YieldAsk_Pricing", "ERG_SigUSD_GuardedYield_Pricing")
 
   private var cache: Option[StandardContracts] = None
 
@@ -105,6 +111,7 @@ object StandardContracts {
         val bond = build("bonds/core/ZC_Standard_Bond", "CONST_VAULT_HASH" -> hash(vault), "CONST_REPAYMENT_TOKEN" -> asset)
         // The order compiles in the same repayment token as its bond, for the one-asset rule.
         val order = build("bonds/P2P/ZC_Standard_Order", "CONST_BOND_HASH" -> hash(bond), "CONST_REPAYMENT_TOKEN" -> asset)
+        val pricedOrder = build("bonds/P2P/ZC_Standard_PricedOrder", "CONST_BOND_HASH" -> hash(bond), "CONST_REPAYMENT_TOKEN" -> asset)
         // The oracle rule measures the repayment, so it is compiled per repayment asset like the bond.
         val oracle = build("bonds/liquidations/ZC_Standard_ERG_SigUSD_Liquidation", "CONST_REPAYMENT_TOKEN" -> asset)
         val dutchMint = build("bonds/lender-scripts/ZC_Standard_DutchAuctionMint",
@@ -113,10 +120,11 @@ object StandardContracts {
           bond = bond,
           order = order,
           offer = build("bonds/P2P/ZC_Standard_LendOffer",
-            "CONST_REPAYMENT_TOKEN" -> asset, "CONST_ORDER_HASH" -> hash(order), "CONST_BOND_HASH" -> hash(bond),
+            "CONST_REPAYMENT_TOKEN" -> asset, "CONST_ORDER_HASH" -> hash(order),
+            "CONST_PRICED_ORDER_HASH" -> hash(pricedOrder), "CONST_BOND_HASH" -> hash(bond),
             "CONST_FRACTIONAL_MINT_HASH" -> hash(fractionalMint), "CONST_DUTCH_MINT_HASH" -> hash(dutchMint)),
           saleOrder = build("bonds/P2P/ZC_Standard_SaleOrder", "CONST_PAYMENT_TOKEN" -> asset),
-          navAsk = build("bonds/P2P/ZC_Standard_NavAsk", "CONST_PAYMENT_TOKEN" -> asset),
+          pricedAsk = build("bonds/P2P/ZC_Standard_PricedAsk", "CONST_PAYMENT_TOKEN" -> asset),
           dutchMint = dutchMint,
           oracleRule = oracle,
           policy = build("bonds/policies/ZC_Standard_ERG_SigUSD_CollateralPolicy",
@@ -126,6 +134,13 @@ object StandardContracts {
           // The borrower's fill guard and the seller's guarded pricing measure as the oracle rule does.
           fillGuard = build("bonds/policies/ZC_Standard_ERG_SigUSD_FillGuard", "CONST_REPAYMENT_TOKEN" -> asset),
           guardedPricing = build("bonds/policies/ZC_Standard_ERG_SigUSD_GuardedNav_Pricing",
+            "CONST_REPAYMENT_TOKEN" -> asset, "CONST_BOND_HASH" -> hash(bond)),
+          pricedOrder = pricedOrder,
+          navOrderPricing = build("bonds/policies/ZC_Standard_NavOrder_Pricing", "CONST_REPAYMENT_TOKEN" -> asset),
+          yieldOrderPricing = build("bonds/policies/ZC_Standard_YieldOrder_Pricing", "CONST_REPAYMENT_TOKEN" -> asset),
+          yieldPricing = build("bonds/policies/ZC_Standard_YieldAsk_Pricing",
+            "CONST_REPAYMENT_TOKEN" -> asset, "CONST_BOND_HASH" -> hash(bond)),
+          guardedYieldPricing = build("bonds/policies/ZC_Standard_ERG_SigUSD_GuardedYield_Pricing",
             "CONST_REPAYMENT_TOKEN" -> asset, "CONST_BOND_HASH" -> hash(bond)))
       }.toMap
 
@@ -144,9 +159,11 @@ object StandardContracts {
       get("DutchAuctionVault", None), get("MaturityLiquidation", None),
       Market.all.map { m =>
         def of(name: String) = get(name, Some(m))
-        m -> MarketContracts(of("Bond"), of("Order"), of("LendOffer"), of("SaleOrder"), of("NavAsk"),
+        m -> MarketContracts(of("Bond"), of("Order"), of("LendOffer"), of("SaleOrder"), of("PricedAsk"),
           of("DutchAuctionMint"), of("ERG_SigUSD_Liquidation"), of("ERG_SigUSD_CollateralPolicy"),
-          of("AccruedValue_Pricing"), of("ERG_SigUSD_FillGuard"), of("ERG_SigUSD_GuardedNav_Pricing"))
+          of("AccruedValue_Pricing"), of("ERG_SigUSD_FillGuard"), of("ERG_SigUSD_GuardedNav_Pricing"),
+          of("PricedOrder"), of("NavOrder_Pricing"), of("YieldOrder_Pricing"), of("YieldAsk_Pricing"),
+          of("ERG_SigUSD_GuardedYield_Pricing"))
       }.toMap)
   }
 }

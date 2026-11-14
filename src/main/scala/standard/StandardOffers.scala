@@ -68,7 +68,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
       case Some(id) => UTXO(protocol.market(m).offer, s.fees, Seq(Token(id, s.capital)), regs)
     }
     prepare("Create lend offer", plan(Seq.empty, Seq(offer)), Seq(
-      s"lend up to ${Units.amount(s.capital, m)} at ${Units.percent(s.yieldBps)} a year simple interest or better",
+      s"lend up to ${Units.amount(s.capital, m)} at ${Units.percent(s.yieldBps)} simple yield per 262800 blocks or better",
       s"bonds maturing ${s.minBlocks} to ${s.maxBlocks} blocks after a fill, with the oracle rule at a ratio of at " +
         s"least ${Units.percent(s.floorBps)} and collateral worth that now; minimum price ${Units.amount(s.minPrice, m)}",
       s"batcher fee ${Fmt.erg(s.batcherFee)} per fill; new bonds carry a ${Fmt.erg(s.feeReserve)} fee reserve",
@@ -186,8 +186,9 @@ trait StandardOffers extends AppBase { self: StandardApp =>
    */
   def matchOrder(offerId: String, orderId: String): Prepared = {
     val o = protocol.asOffer(unspent(offerId)).getOrElse(fail(s"$offerId is not a ZC Standard lend offer"))
-    val order = protocol.asOrder(unspent(orderId)).getOrElse(fail(s"$orderId is not a ZC Standard order"))
-    checkOrder(order)
+    val original = protocol.asOrder(unspent(orderId)).getOrElse(fail(s"$orderId is not a ZC Standard order"))
+    checkOrder(original)
+    val order = resolveOrder(original, height.toLong)
     val start = height.toLong
     val maturity = if (order.onClose) addAmount(start, order.terms(3)) else order.terms(3)
     val asset = order.box.id

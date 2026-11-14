@@ -2,13 +2,14 @@
     // Standard lend offer (a yield bid).
     // Holds a lender's capital and buys standard bonds that clear a minimum simple-interest yield:
     // new ones, by filling a ZC_Standard_Order, and existing ones, from any ask that follows the ask
-    // convention below (ZC_Standard_SaleOrder, ZC_Standard_NavAsk, or a later one). The lender is never assumed to
+    // convention below (ZC_Standard_SaleOrder, ZC_Standard_PricedAsk, or a later one). The lender is never assumed to
     // be online after posting: any batcher matches the offer, for the fee the offer itself sets,
     // and the bond unit is delivered to the lender or into a fractional request.
     //
     // CONSTANTS (one offer address per repayment asset, under one shared template)
     // CONST_REPAYMENT_TOKEN: Coll[Byte] - the asset lent and repaid; EMPTY for ERG
     // CONST_ORDER_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Order tree for that asset
+    // CONST_PRICED_ORDER_HASH: Coll[Byte] - accepted expression-priced issuing order tree hash
     // CONST_BOND_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Bond tree for that asset
     // CONST_FRACTIONAL_MINT_HASH: Coll[Byte] - blake2b256 of ZC_Standard_FractionalMint. Used only to
     //   verify shares being BOUGHT; where a delivery goes is the lender's choice in R9.
@@ -81,7 +82,7 @@
     // worse than its terms, but it relies on asks keeping the convention for anything better.
     //
     // NEW BOND (var 2 absent)
-    // INPUTS(0) is a ZC_Standard_Order with CONST_ORDER_HASH, whose own script validates the bond at
+    // INPUTS(0) is an accepted Order or PricedOrder, whose own script validates the bond at
     // OUTPUTS(1) and pays the borrower at OUTPUTS(2). OUTPUTS(0) is the delivery. That order only
     // lends in the repayment asset alone (a token loan carries at most 1000000 nanoERG beside it),
     // so the principal is the price with no further check.
@@ -89,7 +90,7 @@
     // EXISTING BOND (var 2 present)
     // The ask sells one unit of asset X and is paid through its payout.
     // Origin: var 4 hashes to X, so it is the box whose spending minted X, and its script is the
-    //   standard order. That proves X was minted by the order's rules: supply 3, 2 locked.
+    //   accepted issuing order. That proves X was minted by the order's rules: supply 3, 2 locked.
     // State: the data input holds 2 units of X under CONST_BOND_HASH, so it is the live bond and its
     //   registers are the terms. A settled bond (the vault holds the 2 units) is not bought here.
     //
@@ -211,7 +212,8 @@
             val sourceValid = if (primary) {
                 // The order lends in the repayment asset alone, so its principal is the price.
                 val order = INPUTS(0)
-                blake2b256(order.propositionBytes) == CONST_ORDER_HASH &&
+                (blake2b256(order.propositionBytes) == CONST_ORDER_HASH ||
+                 blake2b256(order.propositionBytes) == CONST_PRICED_ORDER_HASH) &&
                 asset == order.id && traded == asset && units == 1L &&
                 lender(0) == terms(4)
             } else {
@@ -247,7 +249,8 @@
                 payoutIndex != nextIndex && payoutIndex != getVar[Int](5).get &&
                 tokenValid &&
                 blake2b256(originBytes) == asset &&
-                blake2b256(origin.propositionBytes) == CONST_ORDER_HASH &&
+                (blake2b256(origin.propositionBytes) == CONST_ORDER_HASH ||
+                 blake2b256(origin.propositionBytes) == CONST_PRICED_ORDER_HASH) &&
                 blake2b256(bond.propositionBytes) == CONST_BOND_HASH &&
                 bond.tokens(0)._2 == 2L
             }
