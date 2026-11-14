@@ -143,6 +143,108 @@ Other reserve/box funding is not included in this yield test. Do not label it a 
 return. Equal rate limits may fail to match; short durations or small share fills may have so little
 interest that the batcher fee exceeds it, even with a lender yield floor of zero.
 
+## Choosing pricing and maturity
+
+APR can be an input calculator as well as an on-chain pricing policy. Given principal P, a
+simple APR y expressed as a decimal, and D remaining blocks, a borrower-facing form can calculate:
+
+```text
+R = P * (1 + y * D / 262800)
+```
+
+The form rounds repayment up to the repayment asset's raw unit and displays the resulting quote.
+For `YieldOrder_Pricing`, the contract reads that committed repayment and validates the minimum
+principal in the reverse direction. Repayment is fixed when the order is posted, not recomputed
+at each future fill. The actual principal paid at fill is recorded in the issued bond.
+
+A rate-driven form should therefore calculate repayment from the chosen principal, APR and
+effective maturity rather than expose all four as independent inputs. Recalculate before posting
+when the asset, amount, APR, term or grid-snapped maturity changes. With a fixed maturity, time
+passing after posting changes the principal quote; it must not rewrite the committed repayment.
+Price margins, principal floors, raw-unit rounding, inclusion buffers and fees can make the actual
+quoted APR differ from the reference APR. A zero price margin is not a zero APR.
+
+### Borrow-order combinations
+
+The table describes minimum quotes for interest-bearing loans at zero price margin, before a
+binding floor, atomic rounding, inclusion buffers or fees. Fixed means an absolute maturity
+height; term from funding means a validated fill start plus a fixed duration.
+
+| Loan timing | Pricing | Effect of waiting for funding | UI interpretation |
+|---|---|---|---|
+| Term from funding | Fixed principal | Principal, repayment and full duration stay constant, so APR stays constant. | Natural simple borrowing; an APR calculator can derive the fixed repayment. |
+| Term from funding | Simple APR / Yield | The remaining duration used by the pricing convention stays constant, so the principal quote stays constant. | Largely equivalent to fixed principal when calibrated to the same terms; this adds little useful timing behavior. |
+| Term from funding | NAV | The creation-height anchor stays fixed while maturity moves with the fill. Principal rises and APR falls even though the borrower retains the full loan duration. | Valid but unusual; expose as an explicit advanced choice. |
+| Fixed maturity height | Fixed principal | Principal and repayment stay constant while remaining time shrinks, so borrowing APR rises. | Contract-valid, but exclude from the borrower creation UI to avoid unexpectedly expensive late funding. |
+| Fixed maturity height | Simple APR / Yield | Principal rises as remaining time shrinks, approximately preserving the reference APR at the minimum quote. | Useful rate-driven fixed-maturity borrowing. Calculate repayment at creation and display it as derived. |
+| Fixed maturity height | NAV | Principal follows straight-line accrual toward fixed repayment. At zero margin the quoted APR generally drifts slightly downward. | Useful accrued-value pricing; it can be close to Yield pricing for short, low-interest terms. |
+
+These are interface choices, not new contract restrictions. The contracts continue to support
+all six combinations. A UI may offer Fixed or NAV for term-from-funding requests, and Yield or
+NAV for fixed-maturity requests. The APR calculator on a fixed-principal request does not imply
+that the request uses `YieldOrder_Pricing`. NAV forms may still choose repayment explicitly.
+
+With a fixed maturity, principal, repayment and APR cannot all remain constant as funding time
+changes. Fixed pricing preserves principal; Yield pricing adjusts principal to the fixed debt.
+Keeping principal and APR fixed instead would require repayment to change, which these posted
+orders do not permit.
+
+For illustration, a bond starts at 100 with repayment 110 after 262800 blocks. Halfway to that
+maturity, ignoring floors, fees, expiry, buffers and raw-unit rounding:
+
+| Pricing | Minimum principal / ask price | Gross simple APR at entry |
+|---|---:|---:|
+| Fixed | 100 | 20% |
+| Yield at 10% | 104.761904... | 10% |
+| NAV | 105 | 9.523809...% |
+
+Grid and exact maturity choose the height; they are not different pricing policies. Identical
+effective heights produce identical pricing behavior. A fixed maturity entered as "blocks from
+now" still loses remaining time while the order waits. A term from funding preserves its full
+duration and does not promise a grid-aligned maturity.
+
+### Resale asks and lender offers
+
+An existing bond already has fixed repayment and maturity, including one originally issued from
+a term-from-funding order. A resale ask cannot restart the duration or change the debt. Its seller
+may independently choose Fixed, Yield or NAV, regardless of the issuing order's pricing choice.
+Whole bonds and shares use the same proportional pricing mathematics; share rounding and per-fill
+fees can materially change small-lot returns.
+
+A lend offer supplies a minimum acceptable APR and a remaining-maturity window. It can match
+Fixed, Yield or NAV sources that satisfy all its other terms. Fixed/NAV are not alternative
+lend-offer pricing modes. A borrower/seller Yield reference is an upper limit on gross buyer yield
+at zero margin before floors and fees; the lender's minimum is a lower limit. Rate overlap alone
+does not establish an executable match. Waiting does not automatically close a Yield-vs-Yield
+rate gap, although maturity windows, budgets, collateral, fees and rounding can change eligibility.
+
+Floors can hide dynamic pricing: while the policy quote is below a principal or ask floor, the
+floor determines the price. A zero Yield at zero margin prices at repayment value regardless of
+the remaining term. NAV is flat when reference principal equals repayment. These are valid
+degenerate cases, not independent sources of return.
+
+### Delivery, guards and client presets
+
+The UI default for lend offers is whole-bond delivery; already-fractional sources retain their
+existing shares. Optional fractionalization belongs in a separate off-chain queue after purchase.
+The queued job chooses standard or Dutch recovery from the purchased collateral, then creates a
+separately reviewed mint request. It is not part of the offer fill, does not alter the committed
+offer registers and does not reserve the wallet's unit or mint fees merely by being queued.
+The underlying offer contract still supports explicit in-transaction fractional delivery; the
+client workflow simply does not select it. The current mock queue is a simulation, not a deployed
+production service.
+
+Simple Exchange starts with Yield pricing at zero price margin. Sale protection follows the same
+choices as fill protection: match the supported oracle liquidation trigger, choose a higher minimum
+coverage, or explicitly turn it off. The trigger-matched option is the starting preset. Simple
+Exchange and the supported oracle-policy lend offers exclude maturity-only positions; Advanced
+direct workflows remain available for those positions without inventing an oracle trigger.
+
+Auction-share purchases start with a minimum floor of 100% of repayment and a maximum duration
+of 720 blocks. These purchase bounds are separate from the terms used to create a new Dutch vault.
+For a later Dutch conversion, the auction opening remains an explicit user choice. A 100% floor
+does not guarantee a buyer or full repayment recovery: an unsold auction ends with in-kind claims.
+
 ## Building, matching and examples
 
 The CLI accepts an explicit pricing choice; fixed orders remain the default. `--principal` is still
