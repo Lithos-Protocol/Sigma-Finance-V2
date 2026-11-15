@@ -117,9 +117,9 @@ class ZcStandardFillGuardSpec extends AnyPropSpec with ZcStandardSpecBase {
             longsValue(0L, 1L, 100000L, batchingFee, f.fee, 13000L, ctx.getHeight + 5000L, 1L, 30L, 0L, 1000000L),
             bytesValue(m.policy.hashedValueBytes), longsValue(), textsValue(), bytesValue(Array.empty[Byte])))
         val offerIn = inputAt(offer, ctx, 1).withCtxVar(0.toByte, ErgoValue.of(3)).withCtxVar(1.toByte, liqVar(m.policy))
-        val next = offer.setValue(offer.value - (batchingFee + minBox + f.fee + f.data(1)))
+        val next = offerSuccessor(offer.setValue(offer.value - (batchingFee + minBox + f.fee + f.data(1))), offerIn.id)
         buildAt(ctx, f.height, Seq(f.orderIn.withCtxVar(1.toByte, liqVar(guardOf(ctx, ErgBond))), offerIn),
-          Seq(f.unit, f.bond, f.principal, next), executor(ctx).getAddress, dataInputs = Seq(oracleBox(f)))
+          Seq(offerDelivery(f.unit, offerIn.id), f.bond, f.principal, next), executor(ctx).getAddress, dataInputs = Seq(oracleBox(f)))
       }
       accepts(executor(ctx), offerFill(guarded(ctx, ErgBond, 14000L, 14285L)))
       rejectsAtSigning(executor(ctx), offerFill(guarded(ctx, ErgBond, 14000L, 14286L)))

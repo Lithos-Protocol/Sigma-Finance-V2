@@ -97,6 +97,20 @@ trait ZcStandardSpecBase extends BondSpecBase {
   /** The smallest x with x * den >= num, for positive den. */
   protected def ceilDiv(num: BigInt, den: BigInt): Long = ((num + den - 1) / den).toLong
 
+  /** Preserve EIP-4 registers while adding an offer's delivery tag; explicit existing tags stay testable. */
+  protected def offerDelivery(box: UTXO, id: ErgoId, fractional: Boolean = false): UTXO = {
+    if (fractional && box.registers.size >= 4) {
+      val owner = box.parseCollReg[Byte](3)
+      if (owner.length == 64) box else box.withRegNum(7, bytesValue(owner ++ id.getBytes))
+    } else if (box.registers.size >= 4) box else {
+      val front = box.registers ++ Seq.fill(3 - box.registers.size)(bytesValue(Array.emptyByteArray))
+      box.setRegs((front :+ bytesValue(id.getBytes)): _*)
+    }
+  }
+
+  protected def offerSuccessor(box: UTXO, id: ErgoId): UTXO =
+    box.withRegNum(6, bytesValue(box.parseCollReg[Byte](2).take(32) ++ id.getBytes))
+
   /**
    * `fixedMaturity` overrides a fixed-height order's maturity. `extra` is the borrower payload from
    * index 7: the oracle rule reads its ratio and maximum age there, and a fill guard its minimum at 9.
@@ -134,10 +148,11 @@ trait ZcStandardSpecBase extends BondSpecBase {
     val bond = UTXO(bondOf(ctx, kind), collateralValue + fee, Token(input.id, 2L) +: collateral,
       Seq(bytesValue(input.id.getBytes), borrowerHash, longsValue(data: _*),
         Protocol.tokensValue(principalTokens), liqHash, longsValue(fee, height.toLong, maturity)), Some(height))
+    val principal = UTXO(borrowerTree(ctx), principalERG + expiryFee, principalTokens, Seq(bytesValue(input.id.getBytes)))
     Flow(ctx, kind, style, order, input,
       funding(ctx, lender(ctx), 1, principalERG + fee + slack, principalTokens),
       UTXO(lenderTree(ctx), minBox, Seq(Token(input.id, 1L)), eip4()),
-      bond, UTXO(borrowerTree(ctx), principalERG + expiryFee, principalTokens), data,
+      bond, principal, data,
       height, height.toLong, maturity, deadline, collateralValue, expiryFee, fee, expression,
       borrower(ctx), lender(ctx))
   }

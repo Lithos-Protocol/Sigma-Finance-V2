@@ -34,6 +34,8 @@ and maturity checks. The resulting bond records the **actual principal**, not th
 - ERG: bond R6(1) equals borrower payout nanoERG minus the refunded expiry fee; bond R7 is empty.
 - Token: bond R7 is exactly the repayment token and actual principal amount; payout tokens match it
   exactly. The nanoERG principal component remains the committed box funding, at most 1000000.
+- Both issuing orders require payout R4 `Coll[Byte]` to equal the issuing order's box id. This prevents
+  a refund, collateral return or sale payout owed by another input from also counting as principal.
 - Bond R6(0), R6(2..) and the liquidation expression are unchanged. Repayment never reprices.
 - The quoted principal is always a floor. Paying above the expression's minimum is permitted only
   when the actual principal is recorded consistently. This gives a buyer room for block inclusion
@@ -138,7 +140,9 @@ R8 second hash and existing `ERG_SigUSD_FillGuard` expression.
 With zero price margin, borrower/seller yield y is an upper limit on the gross yield they offer a buyer (a minimum price).
 Lender yield is a lower limit on the return it accepts (a maximum cost). Ignoring fees and rounding,
 an ask offering 10% can cross a bid requiring 8%; one offering 6% cannot. For an ERG offer its cost
-includes the batcher fee: `cost = price + batcherFee`. A token offer pays fees separately in ERG.
+includes the batcher fee: `cost = price + batcherFee`. A token offer pays fees separately in ERG,
+with a reward proportional to original capital filled, a proportional total ERG spending cap, and a
+minimum 1% fill of original capital. See [the fee-budget rules](./AUDIT_REVIEW_2026-11-14.md#token-rewards-and-total-erg-protection).
 Other reserve/box funding is not included in this yield test. Do not label it a fully fee-adjusted
 return. Equal rate limits may fail to match; short durations or small share fills may have so little
 interest that the batcher fee exceeds it, even with a lender yield floor of zero.

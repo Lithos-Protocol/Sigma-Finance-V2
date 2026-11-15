@@ -78,7 +78,8 @@ class ZcStandardAskSpec extends AnyPropSpec with ZcStandardSpecBase {
     val askIn = inputAt(ask, ctx, 0)
     val left = ask.tokens.head.amount - sold
     val payOut = if (pay == null) payout(ctx, kind, askIn.id, sold, if (paid < 0L) owed(kind, sold) else paid) else pay
-    val nextOut = if (next != null) next else if (left > 0L) ask.setTokens(Token(forSale, left)) else null
+    val nextOut = if (next != null) next else if (left > 0L) ask.setTokens(Token(forSale, left))
+      .withRegNum(6, bytesValue(askIn.id.getBytes)) else null
     val in = if (nextOut == null) askIn.withCtxVar(0.toByte, ErgoValue.of(0))
       else askIn.withCtxVar(0.toByte, ErgoValue.of(0)).withCtxVar(1.toByte, ErgoValue.of(1))
     askFillTx(ctx, kind, in, if (nextOut == null) Seq(payOut) else Seq(payOut, nextOut),
@@ -129,7 +130,7 @@ class ZcStandardAskSpec extends AnyPropSpec with ZcStandardSpecBase {
       val last = saleBox(ctx, kind, amount = 2L, minFill = 3L)
       accepts(executor(ctx), saleTx(ctx, kind, last, 2L))
 
-      val next = ask.setTokens(Token(forSale, 7L))
+      val next = ask.setTokens(Token(forSale, 7L)).withRegNum(6, bytesValue(inputAt(ask, ctx, 0).id.getBytes))
       Seq(next.subValue(1L), next.setContract(otherTree(ctx)), next.withRegNum(4, bytesValue(originOrderId)),
         next.withRegNum(5, longsValue(1000003L, 2L, 1L, ctx.getHeight + 100L))).foreach { bad =>
         rejectsAtSigning(executor(ctx), saleTx(ctx, kind, ask, 3L, next = bad))
@@ -178,7 +179,8 @@ class ZcStandardAskSpec extends AnyPropSpec with ZcStandardSpecBase {
     val kind = n.f.kind
     val askIn = inputAt(ask, ctx, 0)
     val left = ask.tokens.head.amount - sold
-    val nextOut = if (next != null) next else if (left > 0L) ask.setTokens(Token(ask.tokens.head.id, left)) else null
+    val nextOut = if (next != null) next else if (left > 0L) ask.setTokens(Token(ask.tokens.head.id, left))
+      .withRegNum(8, bytesValue(askIn.id.getBytes)) else null
     val base = askIn.withCtxVar(0.toByte, ErgoValue.of(0))
       .withCtxVar(2.toByte, liqVar(if (expression == null) marketOf(ctx, kind).pricing else expression))
       .withCtxVar(3.toByte, ErgoValue.of(0))
@@ -241,7 +243,7 @@ class ZcStandardAskSpec extends AnyPropSpec with ZcStandardSpecBase {
 
       val ask = navBox(n, forSale, 1000L, 1000L, 0L)
       rejectsAtSigning(executor(ctx), navTx(n, ask, 7L, price, expression = alwaysTrue(ctx)))
-      val next = ask.setTokens(Token(forSale, 993L))
+      val next = ask.setTokens(Token(forSale, 993L)).withRegNum(8, bytesValue(inputAt(ask, ctx, 0).id.getBytes))
       accepts(executor(ctx), navTx(n, ask, 7L, price, next = next))
       Seq(next.withRegNum(6, bytesValue(alwaysTrue(ctx).hashedValueBytes)),
         next.withRegNum(7, bytesValue(otherBondAsset.getBytes)),

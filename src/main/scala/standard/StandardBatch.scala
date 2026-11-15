@@ -201,23 +201,23 @@ trait StandardBatch extends AppBase { self: StandardApp =>
         a.box.id.toString)
     }
 
-    // Matches. Offers go by batcher fee, highest first, then box id; each takes the order or ask that gives it
+    // Matches. Offers go by maximum remaining batcher reward, highest first, then box id; each takes the order or ask that gives it
     // the highest yield, then the lower box id. A source goes to one offer per scan.
     val orderSources = openOrders.filter(order => next < order.expiry && Try(checkOrder(order)).isSuccess &&
       served(order.borrowerHash, order.box, "order", "borrower"))
     val askSources = openAsks.filter(a => next < a.expiry && served(a.sellerHash, a.box, "ask", "seller"))
     val taken = mutable.Set.empty[String]
-    allOffers.filter(o => next < o.expiry && alone(o.batcherFee) && served(o.ownerHash, o.box, "lend offer", "owner"))
-      .sortBy(o => (-o.batcherFee, o.box.id.toString)).foreach { o =>
+    allOffers.filter(o => next < o.expiry && alone(o.fillFee(o.capital)) && served(o.ownerHash, o.box, "lend offer", "owner"))
+      .sortBy(o => (-o.fillFee(o.capital), o.box.id.toString)).foreach { o =>
         val fromOrders = orderSources.filter(x => x.market == o.market && !taken(x.box.id.toString)).flatMap { original =>
           val order = resolveOrder(original, height.toLong)
           val maturity = if (order.onClose) height.toLong + order.terms(3) else order.terms(3)
           val bond = prospective(order, height.toLong, maturity, o.feeReserve)
-          if (offerRefusal(o, bond, order.principal, 1L, 1L, usableOracle).nonEmpty ||
+          if (!alone(o.fillFee(order.principal)) || offerRefusal(o, bond, order.principal, 1L, 1L, usableOracle, primary = true).nonEmpty ||
             guardRefusal(order, bond, usableOracle).nonEmpty) None
           else Some((impliedYield(o, order.repayment, order.principal, 1L, 1L, maturity), order.box.id.toString,
             Work(s"fill order ${order.box.id} from offer ${o.box.id}", s"match-offer ${o.box.id} --order ${order.box.id}",
-              o.batcherFee, Set(o.box.id.toString, order.box.id.toString))))
+              o.fillFee(order.principal), Set(o.box.id.toString, order.box.id.toString))))
         }
         val fromAsks = askSources.filter(a => a.market == o.market && !taken(a.box.id.toString)).flatMap { a =>
           Try[Option[(BigInt, String, Work)]] {
@@ -226,12 +226,12 @@ trait StandardBatch extends AppBase { self: StandardApp =>
             val bond = liveBonds.find(_.asset == asset).get
             val price = if (o.market.token.isEmpty) math.max(askPrice(a, units)._1, MinBox) else askPrice(a, units)._1
             if (units < a.minFill && units != a.token.amount) None
-            else if (offerRefusal(o, bond, price, units, whole, usableOracle).nonEmpty ||
+            else if (!alone(o.fillFee(price)) || offerRefusal(o, bond, price, units, whole, usableOracle, shares = a.token.id != asset).nonEmpty ||
               saleGuardRefusal(a, bond, usableOracle).nonEmpty) None
             else Some((impliedYield(o, bond.repayment, price, units, whole, bond.maturity), a.box.id.toString,
               Work(s"buy $units of ${a.token.id} from ask ${a.box.id} with offer ${o.box.id}",
                 s"match-offer ${o.box.id} --ask ${a.box.id}" + (if (units != a.token.amount) s" --amount $units" else ""),
-                o.batcherFee, Set(o.box.id.toString, a.box.id.toString))))
+                o.fillFee(price), Set(o.box.id.toString, a.box.id.toString))))
           }.toOption.flatten.toSeq
         }
         (fromOrders ++ fromAsks).sortBy { case (y, id, _) => (-y, id) }.headOption.foreach { case (_, id, w) =>
@@ -248,7 +248,7 @@ trait StandardBatch extends AppBase { self: StandardApp =>
    */
   private[standard] def impliedYield(o: StdOffer, repayment: Long, price: Long, units: Long, whole: Long,
                                      maturity: Long): BigInt = {
-    val cost = (if (o.market.token.isEmpty) BigInt(price) + o.batcherFee else BigInt(price)) * whole
+    val cost = (if (o.market.token.isEmpty) BigInt(price) + o.fillFee(price) else BigInt(price)) * whole
     val left = math.max(maturity - (height.toLong + 1L), 1L)
     (BigInt(repayment) * units - cost) * BigInt(2628000000L) * 1000000 / (cost * left)
   }

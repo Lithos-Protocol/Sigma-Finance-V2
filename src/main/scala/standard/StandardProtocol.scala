@@ -130,12 +130,21 @@ case class StdAsk(box: InputUTXO, market: Market, priced: Boolean, sellerHash: A
 /**
  * A lend offer. R5 terms: 0 yield bps, 1 min and 2 max blocks to maturity, 3 batcher fee, 4 new-bond fee
  * reserve, 5 collateral floor bps, 6 expiry, 7 minimum price, 8 oracle age, 9 min auction floor, 10 max
- * auction length. R7, R8, R9: a fractional delivery's terms, metadata and mint script hash, or empty.
+ * auction length. Token offers append 11 original capital, 12 total ERG spend budget, 13 minimum fill
+ * bps of original capital, 14 batcher reward budget. R7, R8, R9: fractional terms, metadata, mint hash.
  */
 case class StdOffer(box: InputUTXO, market: Market, ownerHash: Array[Byte], terms: Seq[Long],
                     policyHash: Array[Byte], fractional: Seq[Long], metadata: Seq[Array[Byte]], mintHash: Array[Byte]) {
   def yieldBps: Long = terms(0)
   def batcherFee: Long = terms(3)
+  def originalCapital: Long = if (market.token.isEmpty) box.value else terms(11)
+  def spendBudget: Long = if (market.token.isEmpty) 0L else terms(12)
+  def minFillBps: Long = if (market.token.isEmpty) 0L else terms(13)
+  def batcherBudget: Long = if (market.token.isEmpty) 0L else terms(14)
+  /** The ERG reward for this fill; token rewards round down and never acquire a minimum top-up. */
+  def fillFee(price: Long): Long = if (market.token.isEmpty) batcherFee
+    else if (originalCapital <= 0L || batcherBudget <= 0L || price <= 0L || price > originalCapital) 0L
+    else (BigInt(batcherBudget) * price / originalCapital).toLong
   def feeReserve: Long = terms(4)
   def floorBps: Long = terms(5)
   def expiry: Long = terms(6)
@@ -255,7 +264,8 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
     for {
       _ <- if (dutch.isDefined || sameTree(tree, contracts.fractionalMint.ergoTree)) Some(()) else None
       if box.tokens.size == 1 && box.tokens.head.amount == 1L
-      owner <- bytesReg(box, 7) if owner.length == 32
+      ownerRecord <- bytesReg(box, 7) if ownerRecord.length == 32 || ownerRecord.length == 64
+      owner = ownerRecord.take(32)
       terms <- longsReg(box, 8) if terms.length == (if (dutch.isDefined) 6 else 3)
       metadata <- bytesListReg(box, 9) if metadata.size == 3
     } yield StdShareRequest(box, dutch, owner, terms.toSeq, metadata)
@@ -293,8 +303,9 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
   def asOffer(box: InputUTXO): Option[StdOffer] = for {
     m <- marketWhere(box.input.getErgoTree, _.offer)
     owner <- bytesReg(box, 4) if owner.length == 32
-    terms <- longsReg(box, 5) if terms.length == 11
-    policy <- bytesReg(box, 6)
+    terms <- longsReg(box, 5) if terms.length == (if (m.token.isEmpty) 11 else 15)
+    policyRecord <- bytesReg(box, 6) if policyRecord.length == 32 || policyRecord.length == 64
+    policy = policyRecord.take(32)
     fractional <- longsReg(box, 7)
     metadata <- bytesListReg(box, 8)
     mint <- bytesReg(box, 9)

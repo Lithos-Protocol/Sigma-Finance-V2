@@ -130,6 +130,7 @@ object SigmaFiCli {
       |  offers [--mine]
       |  create-offer --capital <amount> --yield <percent per 262800 blocks> --collateral-floor <percent>
       |               [--market ERG|SigUSD] [--min-blocks <n>] [--max-blocks <n>] [--min-price <amount>]
+      |               [--batcher-budget <ERG>] [--min-fill-percent <percent>] [--refund-fee <ERG>] (token offers)
       |               [--batcher-fee <ERG>] [--fee-reserve <ERG>] [--oracle-age <blocks>] [--expires-in <blocks>]
       |               [--fees <ERG>] [--min-auction-floor <percent> --max-auction-length <blocks>]
       |               [--deliver-shares [share and --dutch options as for fractionalize]]
@@ -137,6 +138,8 @@ object SigmaFiCli {
       |      ERG a SigUSD offer carries for fees and box minimums (default 0.5). --deliver-shares has a batcher
       |      mint each bond unit into shares for you; their zcs1 name leaves the bond out (ZCS-Bond-Shares),
       |      since the offer cannot know it yet.
+      |      Token rewards are proportional to original capital: --batcher-budget defaults to 0.2 ERG at
+      |      the default 1% --min-fill-percent. --fees also funds box/reserve costs and the expiry refund.
       |  cancel-offer <offer box id>
       |  refund-offer <offer box id>        anyone, after expiry; keeps the batcher fee
       |  match-offer <offer box id> (--order <order box id> | --ask <ask box id> [--amount <n>])
@@ -369,7 +372,7 @@ object Args {
     "shares", "share-name", "share-description", "decimals", "pull-fee", "mint-fee",
     "auction-opening", "auction-floor", "auction-length", "amount",
     "price", "margin", "min-fill", "refund-fee",
-    "capital", "fees", "yield", "min-blocks", "max-blocks", "batcher-fee", "collateral-floor", "min-price",
+    "capital", "fees", "yield", "min-blocks", "max-blocks", "batcher-fee", "batcher-budget", "min-fill-percent", "collateral-floor", "min-price",
     "min-auction-floor", "max-auction-length", "order", "ask")
 
   /** Splits a shell line on whitespace, keeping "double" or 'single' quoted text together. */

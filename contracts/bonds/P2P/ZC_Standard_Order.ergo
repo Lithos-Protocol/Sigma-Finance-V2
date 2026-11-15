@@ -61,7 +61,8 @@
     //   offer, ZC_Standard_FractionalMint...). R4/R5: EIP-4 name/description; R6: UTF-8 "0".
     // OUTPUTS(1): the bond. tokens(0) = (asset, 2), then SELF.tokens unchanged. Value = collateral
     //   nanoERG + lender fee reserve bond R9(0), funded by the lender above the collateral.
-    // OUTPUTS(2): principal + expiry-fee refund, at the borrower script.
+    // OUTPUTS(2): principal + expiry-fee refund, at the borrower script, R4 = SELF.id. The tag
+    //   prevents another input's refund, collateral return or sale payout from paying this claim.
     //
     // START AND MATURITY
     // Bond R9(1), the start height, must lie in [HEIGHT - 8, HEIGHT]: a script cannot pin HEIGHT
@@ -169,7 +170,8 @@
                 val principalPaid =
                     blake2b256(principal.propositionBytes) == borrowerHash &&
                     principal.value >= expiryFee && principal.value - expiryFee >= borrower(1) &&
-                    principal.tokens == principalTokens
+                    principal.tokens == principalTokens &&
+                    principal.R4[Coll[Byte]].get == SELF.id
 
                 val core = borrowerValid && mintValid && bondValid && startValid && maturityValid && principalPaid
 

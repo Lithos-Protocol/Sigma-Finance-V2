@@ -31,7 +31,8 @@ class ZcStandardPricedOrderSpec extends AnyPropSpec with ZcStandardSpecBase {
       bond = base.bond.setTokens(Token(in.id, 2L) +: base.collateral: _*)
         .withRegNum(4, bytesValue(in.id.getBytes)).withRegNum(6, longsValue(data: _*))
         .withRegNum(7, Protocol.tokensValue(tokens)),
-      principal = base.principal.setValue(data(1) + base.expiryFee).setTokens(tokens: _*),
+      principal = base.principal.setValue(data(1) + base.expiryFee).setTokens(tokens: _*)
+        .withRegNum(4, bytesValue(in.id.getBytes)),
       fund = funding(base.ctx, base.holder, 1, data(1) + base.fee + slack, tokens))
   }
 

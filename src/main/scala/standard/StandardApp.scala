@@ -50,7 +50,8 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
   override protected def namedScripts(outputs: Seq[UTXO]): Seq[Array[Byte]] =
     outputs.flatMap { o =>
       protocol.namedScriptRegister(o.contract.ergoTree).flatMap(r => o.registers.lift(r - 4))
-        .flatMap(v => Try(v.getValue.asInstanceOf[sigma.Coll[Byte]].toArray).toOption).filter(_.length == 32)
+        .flatMap(v => Try(v.getValue.asInstanceOf[sigma.Coll[Byte]].toArray).toOption)
+        .filter(b => b.length == 32 || (protocol.isShareMint(o.contract.ergoTree) && b.length == 64)).map(_.take(32))
     }
 
   // ═══ LOOKING AROUND ═══════════════════════════════════════════════════════
@@ -116,8 +117,8 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
 
   /**
    * How a bond unit's metadata departs from zcs1: the fill's OUTPUTS(0) is the issuing box and OUTPUTS(1) the
-   * first bond, so one lookup of the fill rebuilds the expected bytes. Also flags R7 to R9 set on an issuing
-   * box that is not a share mint request. Empty when it matches.
+   * first bond, so one lookup of the fill rebuilds the expected bytes. A wallet delivery may additionally
+   * tag R7 with an input id; other extra registers are flagged. Empty when it matches.
    */
   def bondMetadataIssues(asset: ErgoId): Seq[String] = {
     val fill = node.boxById(asset.toString).flatMap(NodeJson.spentBy).flatMap(node.transactionById)
@@ -126,8 +127,12 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
     (outputs.lift(0), outputs.lift(1).flatMap(protocol.asBond)) match {
       case (Some(issuing), Some(first)) =>
         val expected = StandardMetadata.bond(StandardMetadata.BondFacts.of(first, protocol.ruleOf(first.liqHash)))
+        val inputIds = fill.toSeq.flatMap(_.hcursor.downField("inputs").focus.flatMap(_.asArray).getOrElse(Vector.empty))
+          .flatMap(_.hcursor.downField("boxId").as[String].toOption).toSet
+        val taggedDelivery = issuing.registers.size == 4 && bytesReg(issuing, 7)
+          .exists(tag => tag.length == 32 && inputIds.contains(Base16.encode(tag)))
         metadataIssues(issuing, expected, Seq(expected)) ++
-          (if (!protocol.isShareMint(issuing.input.getErgoTree) && issuing.registers.size > 3)
+          (if (!protocol.isShareMint(issuing.input.getErgoTree) && issuing.registers.size > 3 && !taggedDelivery)
             Seq("its issuing box sets R7 to R9, which zcs1 leaves empty") else Seq.empty)
       case _ => Seq("cannot read the fill that minted it")
     }
@@ -420,7 +425,8 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
       Seq(bytesValue(asset.getBytes), bytesValue(order.borrowerHash), longsValue(order.terms: _*),
         tokensValue(order.principalTokens), bytesValue(order.liqHash), longsValue(feeReserve, start, maturity)),
       Some(start.toInt))
-    val principal = UTXO(Contract(borrower), addAmount(order.expiryFee, order.principalErg), order.principalTokens)
+    val principal = UTXO(Contract(borrower), addAmount(order.expiryFee, order.principalErg), order.principalTokens,
+      Seq(bytesValue(order.box.id.getBytes)))
 
     val notes = Seq(
       s"lend: ${Units.amount(order.principal, m)}; repaid ${Units.amount(order.repayment, m)} by height $maturity " +

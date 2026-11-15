@@ -125,6 +125,10 @@ object ExchangeCommands {
 
   private def offerSpec(app: StandardApp, a: Args): OfferSpec = {
     val m = market(a)
+    if (m.token.isDefined && a.opt("batcher-fee").isDefined)
+      throw CliError("token offers use --batcher-budget for proportional rewards; --refund-fee sets their expiry refund fee")
+    if (m.token.isEmpty && Seq("batcher-budget", "min-fill-percent").exists(a.opt(_).isDefined))
+      throw CliError("--batcher-budget and --min-fill-percent apply only to token offers")
     if (a.positional.nonEmpty)
       throw CliError(s"create-offer takes no arguments, but was given ${a.positional.mkString(" ")}; " +
         "--deliver-shares is a flag, and --shares <N> sets the count")
@@ -137,7 +141,7 @@ object ExchangeCommands {
       yieldBps = needPercent(a, "yield"),
       minBlocks = a.opt("min-blocks").map(parseLong(_, "--min-blocks")).getOrElse(1L),
       maxBlocks = a.opt("max-blocks").map(parseLong(_, "--max-blocks")).getOrElse(DefaultMaxBlocks),
-      batcherFee = parseErg(a.opt("batcher-fee").getOrElse(DefaultBatcherFee)),
+      batcherFee = parseErg(a.opt(if (m.token.isDefined) "refund-fee" else "batcher-fee").getOrElse(DefaultBatcherFee)),
       feeReserve = reserve(a, "fee-reserve"),
       floorBps = needPercent(a, "collateral-floor"),
       maxAge = a.opt("oracle-age").map(parseLong(_, "--oracle-age")).getOrElse(DefaultOfferOracleAge),
@@ -145,7 +149,9 @@ object ExchangeCommands {
       minPrice = a.opt("min-price").map(Units.parse(_, m, "--min-price")).getOrElse(1L),
       auctionFloorBps = percent(a, "min-auction-floor").getOrElse(0L),
       auctionLength = a.opt("max-auction-length").map(parseLong(_, "--max-auction-length")).getOrElse(0L),
-      delivery = delivery)
+      delivery = delivery,
+      minFillBps = percent(a, "min-fill-percent").getOrElse(100L),
+      batcherBudget = a.opt("batcher-budget").map(parseErg))
   }
 
   // ═══ LISTINGS ═════════════════════════════════════════════════════════════
@@ -224,7 +230,10 @@ object ExchangeCommands {
       println(s"  capital ${Units.amount(o.capital, m)} at ${Units.percent(o.yieldBps)} per 262800 blocks or better; " +
         s"bonds maturing in ${o.terms(1)} to ${o.terms(2)} blocks; minimum price ${Units.amount(o.minPrice, m)}")
       println(s"  oracle-rule bonds at a ratio of at least ${Units.percent(o.floorBps)}, oracle at most ${o.maxAge} blocks old")
-      println(s"  batcher fee ${Fmt.erg(o.batcherFee)}; new-bond fee reserve ${Fmt.erg(o.feeReserve)}" +
+      println((if (m.token.isEmpty) s"  batcher fee ${Fmt.erg(o.batcherFee)}"
+        else s"  batcher budget ${Fmt.erg(o.batcherBudget)}; total ERG spend budget ${Fmt.erg(o.spendBudget)}; " +
+          s"minimum fill ${Units.percent(o.minFillBps)} of original ${Units.amount(o.originalCapital, m)}; " +
+          s"expiry refund fee ${Fmt.erg(o.batcherFee)}") + s"; new-bond fee reserve ${Fmt.erg(o.feeReserve)}" +
         (if (o.terms(10) > 0L) s"; Dutch shares with a floor of at least ${Units.percent(o.terms(9))} and at most ${o.terms(10)} blocks" else ""))
       if (o.delivers) {
         println(s"  delivers bond units into ${o.fractional.headOption.getOrElse(0L)} shares" +

@@ -34,7 +34,7 @@ Four principles:
 | Share count | 1 ≤ N ≤ 1,000,000,000 | N and decimals: **share count** below |
 | Fees | 0.002 ERG floors on batching fees (asks have none) | Amounts above the floors; the miner fee |
 | Heights | Expiries, maturity at least one block away, start within 8 blocks, oracle age at most 100,000 | Expiry lengths, the maturity grid, oracle-age defaults |
-| Matching | An offer never does worse than its terms; one offer per transaction | Which order or ask each offer takes, in what order, and what is packed together |
+| Matching | Each offer requires its own tagged delivery and continuation, across updated deployments | Which order or ask each offer takes, matching order and transaction packing |
 | Display | Nothing | Units, rates, dates, prices of shares |
 
 ## Expression-priced orders and asks
@@ -116,7 +116,7 @@ omitted by rule, so any two clients write the same bytes for the same token.
 
 | Box | Registers | Written by | Form |
 |---|---|---|---|
-| A fill's `OUTPUTS(0)`, the unit going to a wallet | R4, R5 bond metadata; R6 "0"; R7 to R9 empty | Whoever builds the fill: the lender's client, or a batcher matching an offer | Bond |
+| A fill's `OUTPUTS(0)`, the unit going to a wallet | R4, R5 bond metadata; R6 "0"; optional R7 offer input id, R8-R9 empty | Whoever builds the fill: the lender's client, or a batcher matching an offer | Bond |
 | A fill's `OUTPUTS(0)`, the unit going into a mint request | R4, R5 bond metadata; R6 "0"; R7 to R9 the request's data | The same | Bond |
 | Lend offer that delivers shares | R8 share metadata | The lender | Shares, without the bond |
 | Mint request from `fractionalize` | R9 share metadata; R4 to R6 a copy of it (registers are dense) | The owner | Shares, with the bond |
@@ -213,9 +213,9 @@ expected bytes.
   bond a misleading name while matching an offer.
 - Shares must match the template with or without the bond, computed from their own bond and mint
   terms.
-- R7 to R9 on an issuing box that goes to a wallet, or on a share issuing box, are ignored and
-  flagged. Whoever builds a fill or a mint can set them, for example to an EIP-4 asset type with a
-  link, and a wallet might display that.
+- A bond issuing box may carry the matching offer's input id in R7; its EIP-4 data stays in R4-R6.
+  Other extra registers on that box, or any R7-R9 on a share issuing box, are ignored and flagged.
+  Whoever builds a fill or mint can set extra registers, and a wallet might display them.
 
 Metadata is display only. A mismatch never changes what verification says about a token.
 
@@ -348,7 +348,10 @@ A batcher following this profile:
   own context variables, so expiry refunds of orders, offers and asks and liquidations share one
   transaction, one miner fee and one change box (the CLI's `pack`, at most 20 boxes; specced). Pulls
   probably can too, but are not packed yet. Share mints and new-order fills cannot: each mints the id
-  of `INPUTS(0)`, and a transaction mints only one token. Two lend offers never share a transaction.
+  of `INPUTS(0)`, and a transaction mints only one token. Independent existing-bond/share matches can
+  share a transaction: each offer's delivery and continuation, and each ask continuation, carry its
+  own input id. Updated deployments can coexist in those batches. Wallet funding and unrelated spends
+  are allowed. The CLI currently executes match commands individually, chaining continuations.
 - **Counts fees per transaction.** Work is worth running when the fees it collects exceed the miner
   fee. Then a 0.002 ERG fee is worth collecting as part of a packed transaction even though it barely
   covers a transaction of its own. A pack that fails is retried piece by piece, for the pieces that
@@ -369,7 +372,7 @@ A batcher following this profile:
   transaction lands at h + 1 or later. A path open only before height X needs h + 1 < X; a path open
   from X on (an expiry refund, a maturity liquidation, the end of a wait) needs h ≥ X. Planning the
   latter for h + 1 makes the signer refuse at X − 1 (seen live, on every kind of refund).
-- **Uses a fixed matching order.** Offers are taken by batcher fee, highest first. Each takes the order
+- **Uses a fixed matching order.** Offers are taken by maximum remaining batcher reward, highest first. Each takes the order
   or ask that gives it the highest yield, `(R / P − 1) × 262800 / D`. Ties go to the lower box id. No
   contract enforces this, but every batcher following the profile behaves the same way.
 - **Prices ahead.** A transaction lands at the next height or later. A purchase from a NAV ask pays
@@ -399,12 +402,19 @@ when the order's oracle age is at least the offer's. The values are the CLI's cu
 | Oracle age on an offer | 30 blocks | at most the bond's |
 | Offer maturity window | 1 to 262,800 blocks | — |
 | Offer and ask expiry | 5,040 blocks | — |
-| Offer batcher fee | 0.005 ERG | 0.002 ERG |
+| ERG offer batcher fee; token offer expiry refund fee | 0.005 ERG | 0.002 ERG |
+| Token offer minimum fill, percentage of original capital | 1% | 1% |
+| Token offer batcher reward budget | 0.2 ERG at a 1% minimum fill | Calculated reward per fill must reach 0.002 ERG |
 | Liquidation fee reserve | 0.05 ERG (also the CLI's minimum) | 0 |
 | Share mint fee, pull fee | 0.005 ERG each | 0.002 ERG |
 | Ask refund fee | 0.002 ERG | none |
 | ERG carried by a SigUSD offer for fees | 0.5 ERG | — |
 | Ask minimum fill, offer minimum price | 1 raw unit | — |
+
+Token offers also enforce a proportional total ERG budget covering rewards, box funding and reserves.
+The original capital and both budgets survive every continuation. A 1% minimum therefore permits at
+most 100 fills, while splitting cannot increase total batcher reward. Fixed box/reserve costs may require
+a larger fill. See [the review's formulas and CLI options](./AUDIT_REVIEW_2026-11-14.md#token-rewards-and-total-erg-protection).
 | NAV pricing margin | 0% | above −100% |
 | Fill guard on an oracle order | on, at the order's own liquidation ratio | at least that ratio |
 | Sale guard | off; its oracle age 30 blocks when set | 1 to 100,000 blocks |

@@ -73,12 +73,14 @@ class StandardPricedAppSpec extends AnyPropSpec with StandardSpecSupport with Lo
         order.principal shouldBe request.principal
         val quote = w.app(l).orderPrincipal(order, w.h + 3L, w.h.toLong)
         quote should be > request.principal
-        if (viaOffer) {
+        val issuance = if (viaOffer) {
           w.run(l, w.app(l).createOffer(offer(w, m)))
           val bid = w.app(e).offers().loneElement
           w.app(e).batchScan().work.exists(_.command == s"match-offer ${bid.box.id} --order ${order.box.id}") shouldBe true
           w.run(e, w.app(e).matchOrder(bid.box.id.toString, order.box.id.toString))
         } else w.run(l, w.app(l).fillOrder(order.box.id.toString, reserve))
+        work.lithos.mutations.InputUTXO(issuance.getOutputsToSpend.get(2))
+          .parseCollReg[Byte](0) shouldBe order.box.id.getBytes
         val bond = w.app(e).bonds().loneElement
         bond.principal shouldBe quote
         bond.repayment shouldBe request.repayment

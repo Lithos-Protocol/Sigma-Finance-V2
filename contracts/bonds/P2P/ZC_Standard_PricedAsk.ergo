@@ -35,7 +35,7 @@
     // Payout (the ask convention, shared with ZC_Standard_SaleOrder): at the seller script, R4 = SELF.id,
     //   R5: Long = the raw units this payout pays for. For a token price the payment token is the
     //   payout's tokens(0), and the buyer funds the box's nanoERG.
-    // Continuation: this script, R4 to R7 unchanged, value not lower, tokens(0) = what is left.
+    // Continuation: this script, R4 to R7 unchanged, R8 = SELF.id, value not lower, tokens(0) = what is left.
     // The expression runs with this box as SELF. It re-reads vars 0 and 1 and must itself require
     // the payout to hold its price: this script only enforces the floor.
     //

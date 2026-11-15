@@ -15,7 +15,8 @@
     //
     // REGISTERS
     // R4-R6: free. When this box is an order's OUTPUTS(0) they hold the bond asset's EIP-4 data.
-    // R7: Coll[Byte] - blake2b256 of the owner script: receives the shares, may cancel
+    // R7: Coll[Byte] - 32-byte owner script hash, optionally followed by the 32-byte offer delivery tag.
+    //   The owner receives the shares and may cancel. The suffix only attributes an offer's delivery.
     // R8: Coll[Long] - (N, pull fee, mint fee):
     //   0 N, the number of shares, 1 <= N <= 1000000000
     //   1 pull batching fee, >= 2000000 nanoERG. It moves into the fractional vault and pays whoever
@@ -57,7 +58,8 @@
         })
     }
 
-    val ownerHash = SELF.R7[Coll[Byte]].get
+    val ownerRecord = SELF.R7[Coll[Byte]].get
+    val ownerHash = ownerRecord.slice(0, 32)
     val minted = numTokenInOutputs(SELF.id)
 
     if (minted > 0L) {
@@ -74,6 +76,7 @@
             val bondUnit = SELF.tokens(0)
 
             val termsValid =
+                (ownerRecord.size == 32 || ownerRecord.size == 64) &&
                 shares >= 1L && shares <= 1000000000L &&
                 pullFee >= 2000000L && mintFee >= 2000000L &&
                 pullFee <= SELF.value && mintFee <= SELF.value - pullFee

@@ -24,10 +24,10 @@
     //
     // REGISTERS (R4 to R9, all present; all copied unchanged to the continuation)
     // R4: Coll[Byte] - blake2b256 of the owner script: may cancel, receives the bond unit or shares
-    // R5: Coll[Long] - terms, exactly 11:
+    // R5: Coll[Long] - terms, 11 for ERG, 15 for a token offer:
     //   0 minimum yield, basis points of simple interest per 262800 blocks (one year of 2-minute blocks)
     //   1 minimum and 2 maximum blocks left to maturity
-    //   3 batcher fee per fill, and for the expiry refund, nanoERG. A fill needs at least 2000000
+    //   3 ERG batcher fee per fill, and expiry refund fee for either market, nanoERG. A fill needs at least 2000000
     //     (0.002 ERG), the floor every standard batching fee shares; an offer below it never fills,
     //     and its owner cancels it or anyone refunds it after expiry.
     //   4 lender liquidation fee reserve to put in a NEW bond, nanoERG, exact
@@ -38,7 +38,17 @@
     //   9 minimum auction floor, basis points of the repayment, and 10 maximum auction length,
     //     blocks: the worst auction terms on ZC_Standard_DutchAuctionMint shares this offer will buy.
     //     A maximum length of 0 buys none. Bond units and standard shares ignore both.
-    // R6: Coll[Byte] - blake2b256 of the serialized collateral policy expression. The policy is the
+    //   Token offers additionally commit (unchanged through every continuation):
+    //   11 original capital, raw token units, positive
+    //   12 original total ERG spending budget, excluding 1000000 plus the expiry refund fee
+    //   13 minimum fill, basis points of ORIGINAL capital, 100..10000 (at least 1%)
+    //   14 original batcher reward budget, positive and below the total spending budget
+    //   A token fill pays floor(R5(14) * price / R5(11)), never rounded up to the fee floor.
+    //   Smaller calculated fees reject the fill. Total ERG outflow, including box funding and
+    //   new-bond reserve, is at most floor(R5(12) * price / R5(11)). Splitting cannot increase
+    //   either allowance. The continuation retains 1000000 plus the expiry refund fee.
+    // R6: Coll[Byte] - policy hash (32 bytes), optionally followed by the predecessor offer id
+    //   (32 bytes). Every fill's continuation must set that suffix to SELF.id. The policy is the
     //   whole risk decision: it names the liquidation rule a bond must carry, requires that rule to
     //   fire at or above the lender's floor, and checks the collateral is worth the floor now.
     // R7: Coll[Long] - fractional delivery: (N, pull fee, mint fee), then whatever else the chosen
@@ -64,7 +74,7 @@
     // Buying from an ask also needs: 2 Int ask input index; 3 Int data-input index of the bond's
     // state box; 4 Coll[Byte] the serialized order box that minted the bond asset; 5 Int delivery
     // output index; 7 Int the seller's payout output index. The absence of var 2 selects a
-    // new-bond fill.
+    // new-bond fill, which also requires var 3 absent so a policy cannot select an unrelated state.
     // Buying fractional shares adds: 6 Coll[Byte] the serialized mint request box that minted the
     // shares, under ZC_Standard_FractionalMint or ZC_Standard_DutchAuctionMint.
     //
@@ -112,15 +122,17 @@
     // Shares go straight to the owner script; R7 and R8 are not used.
     //
     // DELIVERY
-    // Unit itself: a box at the owner script holding (X, 1) and at least 1000000 nanoERG.
-    // Fractional: a box at the script named by R9 holding (X, 1) with R7 = owner, R8 = this R7,
+    // Unit itself: a box at the owner script holding (X, 1), at least 1000000 nanoERG, R7 = SELF.id.
+    // R4-R6 remain available for EIP-4 metadata. Existing shares use the same R7 delivery tag.
+    // Fractional: a box at the script named by R9 holding (X, 1) with R7 = owner ++ SELF.id, R8 = this R7,
     //   R9 = this R8, funded with 2000000 nanoERG plus both fees. Any batcher then mints the shares.
     //
     // WHAT MAY LEAVE THE BOX
     // The price, the batcher fee, the delivery funding, a new bond's fee reserve, and at most
     // 1000000 nanoERG of box minimum on a token offer. Everything else stays in the continuation.
-    // Only one input with this script is allowed per fill, so one bond cannot be charged to two
-    // offers.
+    // The delivery and continuation are tagged with SELF.id, so independent offers may fill in
+    // one transaction, including different deployments following this convention. Neither output
+    // can satisfy another offer. Additional inputs and independent matches are allowed.
     //
     // EXPIRY REFUND (anyone, once HEIGHT >= R5(6))
     // Var 0 names the refund: at the owner script, R4 = this box's id, every token of this box, and
@@ -152,10 +164,13 @@
     } else {
         val terms = SELF.R5[Coll[Long]].get
         val fractional = SELF.R7[Coll[Long]].get
+        val policyRecord = SELF.R6[Coll[Byte]].get
+        val policyHash = policyRecord.slice(0, 32)
         val nextIndex = getVar[Int](0).get
-        val offers = INPUTS.filter { (b: Box) => b.propositionBytes == SELF.propositionBytes }
+        // Taken from the box so the compiler cannot fold the constant into the template.
+        val lendsERG = CONST_REPAYMENT_TOKEN == SELF.id.slice(0, 0)
 
-        if (terms.size != 11 || nextIndex < 0 || nextIndex >= OUTPUTS.size) {
+        if ((if (lendsERG) terms.size != 11 else terms.size != 15) || nextIndex < 0 || nextIndex >= OUTPUTS.size) {
             sigmaProp(false)
         } else if (HEIGHT.toLong >= terms(6)) {
             // Expiry refund, by anyone: everything goes back to the owner, less the batcher fee.
@@ -166,17 +181,13 @@
                 refund.tokens == SELF.tokens &&
                 refund.value >= SELF.value - terms(3)
             )
-        } else if (offers.size != 1 ||
+        } else if ((policyRecord.size != 32 && policyRecord.size != 64) ||
             (fractional.size != 0 && (fractional.size < 3 || fractional.size > 16))) {
             sigmaProp(false)
         } else {
             val next = OUTPUTS(nextIndex)
             val saleIndex = getVar[Int](2)
             val primary = !saleIndex.isDefined
-            // Taken from the box so the compiler cannot fold the constant into the template.
-            val noToken = SELF.id.slice(0, 0)
-            val lendsERG = CONST_REPAYMENT_TOKEN == noToken
-            val batcherFee = terms(3)
 
             val bond = if (primary) OUTPUTS(1) else CONTEXT.dataInputs(getVar[Int](3).get)
             val unit = if (primary) OUTPUTS(0) else OUTPUTS(getVar[Int](5).get)
@@ -209,9 +220,15 @@
                 } else 0L
             }
 
+            val batcherFee = if (lendsERG) terms(3)
+                else if (terms(11) > 0L && terms(14) > 0L && price > 0L && price <= terms(11)) {
+                    (terms(14).toBigInt * price.toBigInt / terms(11).toBigInt).toLong
+                } else 0L
+
             val sourceValid = if (primary) {
                 // The order lends in the repayment asset alone, so its principal is the price.
                 val order = INPUTS(0)
+                !(getVar[Int](3).isDefined) &&
                 (blake2b256(order.propositionBytes) == CONST_ORDER_HASH ||
                  blake2b256(order.propositionBytes) == CONST_PRICED_ORDER_HASH) &&
                 asset == order.id && traded == asset && units == 1L &&
@@ -274,10 +291,11 @@
             val delivered =
                 unit.tokens.size == 1 &&
                 unit.value >= deliveryFunding && (
-                    if (plain) blake2b256(unit.propositionBytes) == ownerHash
+                    if (plain) blake2b256(unit.propositionBytes) == ownerHash &&
+                        unit.R7[Coll[Byte]].get == SELF.id
                     else {
                         blake2b256(unit.propositionBytes) == SELF.R9[Coll[Byte]].get &&
-                        unit.R7[Coll[Byte]].get == ownerHash &&
+                        unit.R7[Coll[Byte]].get == ownerHash ++ SELF.id &&
                         unit.R8[Coll[Long]].get == fractional &&
                         unit.R9[Coll[Coll[Byte]]].get == SELF.R8[Coll[Coll[Byte]]].get
                     }
@@ -296,23 +314,32 @@
                     SELF.tokens(0)._2
                 } else 0L
                 val left = have - price
+                val original = terms(11)
+                val budget = terms(12)
+                val minPercent = terms(13)
+                original > 0L && have <= original && budget > 0L &&
+                terms(3) >= 2000000L && terms(14) > 0L && terms(14) < budget &&
+                minPercent >= 100L && minPercent <= 10000L &&
+                price.toBigInt * 10000L.toBigInt >= original.toBigInt * minPercent.toBigInt &&
+                (SELF.value.toBigInt - next.value.toBigInt) * original.toBigInt <= budget.toBigInt * price.toBigInt &&
+                next.value.toBigInt >= 1000000L.toBigInt + terms(3).toBigInt &&
                 left >= 0L &&
                 next.value >= SELF.value - ergOut &&
                 (if (left == 0L) next.tokens.size == 0
                  else next.tokens.size == 1 && next.tokens(0)._1 == CONST_REPAYMENT_TOKEN &&
-                      next.tokens(0)._2 >= left)
+                      next.tokens(0)._2 == left)
             }
 
             val continued =
                 next.propositionBytes == SELF.propositionBytes &&
                 next.R4[Coll[Byte]].get == ownerHash &&
                 next.R5[Coll[Long]].get == terms &&
-                next.R6[Coll[Byte]].get == SELF.R6[Coll[Byte]].get &&
+                next.R6[Coll[Byte]].get == policyHash ++ SELF.id &&
                 next.R7[Coll[Long]].get == fractional &&
                 next.R8[Coll[Coll[Byte]]].get == SELF.R8[Coll[Coll[Byte]]].get &&
                 next.R9[Coll[Byte]].get == SELF.R9[Coll[Byte]].get
 
-            val policyAgreed = blake2b256(getVar[Coll[Byte]](1).get) == SELF.R6[Coll[Byte]].get
+            val policyAgreed = blake2b256(getVar[Coll[Byte]](1).get) == policyHash
 
             sigmaProp(
                 sourceValid && termsValid && delivered && capitalKept &&

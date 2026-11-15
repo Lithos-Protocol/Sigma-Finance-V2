@@ -207,7 +207,8 @@ trait StandardAsks extends AppBase { self: StandardApp =>
   private[standard] def askRest(ask: StdAsk, units: Long): Option[UTXO] = {
     val left = ask.token.amount - units
     if (left <= 0L) None
-    else Some(UTXO(Contract(ask.box.input.getErgoTree), ask.box.value, Seq(Token(ask.token.id, left)), ask.box.registers))
+    else Some(UTXO(Contract(ask.box.input.getErgoTree), ask.box.value, Seq(Token(ask.token.id, left)), ask.box.registers)
+      .withRegNum(if (ask.priced) 8 else 6, bytesValue(ask.box.id.getBytes)))
   }
 
   /** The ask's context vars: 0 the payout, 1 the continuation, and for a NAV ask 2 its expression, 3 the state. */

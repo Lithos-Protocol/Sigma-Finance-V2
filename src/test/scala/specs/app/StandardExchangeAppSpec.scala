@@ -24,6 +24,78 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
   private val oracleLoan = (w: World, tokens: Long) =>
     loan(collateral = Seq(Token(collateralToken, tokens)), rule = OracleChoice(15000L, 60L))(w)
 
+  property("token offer CLI: proportional budgets and percentage floors parse without reusing the fixed fee option") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val o = other(ctx)
+      w.fund(o, erg("5"), Token(SigUsd, 1000L))
+      var captured: Option[Prepared] = None
+      val app = new StandardApp(ctx, new FakeNode(w.chain, o), AppSettings(), _ => (), protocol) {
+        override def submit(p: Prepared): Option[String] = { captured = Some(p); None }
+      }
+      val base = "create-offer --market SigUSD --capital 10 --yield 0 --collateral-floor 130"
+      def command(extra: String): Prepared = {
+        captured = None
+        ExchangeCommands.dispatch(app, Args.parse(Args.tokenize(base + extra)), _ => false)
+        captured.get
+      }
+      refused(command(" --batcher-fee 0.005")) should include("--batcher-budget")
+      refused(command(" --min-fill-percent 0.4")) should include("1% to 100%")
+      w.run(o, command(" --fees 0.5 --batcher-budget 0.12 --min-fill-percent 2 --refund-fee 0.003"))
+      val bid = w.app(o).offers().loneElement
+      bid.minFillBps shouldBe 200L
+      bid.batcherBudget shouldBe erg("0.12")
+      bid.batcherFee shouldBe erg("0.003")
+      bid.spendBudget shouldBe erg("0.496")
+    }
+  }
+
+  property("token offers: original budgets survive matching; unaffordable fills reject and wallet top-ups work") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, e, o) = (borrower(ctx), executor(ctx), other(ctx))
+      w.fund(b, erg("60"))
+      w.fund(e, erg("1"))
+      w.fund(o, erg("5"), Token(SigUsd, 3000L))
+      w.oracle(500000000L, w.h)
+      val spec = offerSpec(w).copy(market = Market.SigUsd, capital = 1000L, fees = erg("0.5"), yieldBps = 0L)
+      refused(w.app(o).createOffer(spec.copy(minFillBps = 99L))) should include("1% to 100%")
+      refused(w.app(o).createOffer(spec.copy(batcherBudget = Some(erg("0.5"))))) should include("ERG funding")
+      w.run(o, w.app(o).createOffer(spec))
+      val bid = w.app(e).offers().loneElement
+      bid.originalCapital shouldBe 1000L
+      bid.minFillBps shouldBe 100L
+      bid.batcherBudget shouldBe erg("0.2")
+      bid.spendBudget shouldBe erg("0.494")
+      bid.fillFee(10L) shouldBe erg("0.002")
+      bid.fillFee(600L) shouldBe erg("0.12")
+      def request(amount: Long) = loan(Market.SigUsd, principal = amount, repayment = amount + 100L,
+        collateral = Seq.empty, rule = OracleChoice(15000L, 60L))(w)
+      w.run(b, w.app(b).createOrder(request(600L)))
+      val order = w.app(e).orders().loneElement
+      val toppedUp = w.app(e, AppSettings(fee = erg("0.2"))).matchOrder(bid.box.id.toString, order.box.id.toString)
+      toppedUp.tx.getInputs.size should be > 2
+      accepts(e, toppedUp.tx)
+      val matchTx = w.app(e).matchOrder(bid.box.id.toString, order.box.id.toString)
+      matchTx.tx.getInputs.size shouldBe 2
+      w.run(e, matchTx)
+      val rest = w.app(e).offers().loneElement
+      rest.capital shouldBe 400L
+      rest.terms.drop(11) shouldBe bid.terms.drop(11)
+      rest.fillFee(10L) shouldBe erg("0.002")
+      // A 0.9% new loan pays too little capital; a 1% loan cannot fund its new bond's reserve.
+      w.run(b, w.app(b).createOrder(request(9L)))
+      val tiny = w.app(e).orders().loneElement
+      refused(w.app(e).matchOrder(rest.box.id.toString, tiny.box.id.toString)) should include("original capital")
+      w.run(b, w.app(b).createOrder(request(10L)))
+      val small = w.app(e).orders().find(_.principal == 10L).get
+      refused(w.app(e).matchOrder(rest.box.id.toString, small.box.id.toString)) should include("proportional ERG budget")
+      w.run(o, w.app(o).cancelOffer(rest.box.id.toString))
+      w.app(e).offers() shouldBe empty
+      w.tokens(o).get(SigUsd) shouldBe Some(2400L)
+    }
+  }
+
   // ═══ SHARES ═══════════════════════════════════════════════════════════════
 
   property("fractional shares: deposited, minted by a batcher, pulled after repayment, then claimed in part and in full") {

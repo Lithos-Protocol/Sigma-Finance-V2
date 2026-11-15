@@ -15,6 +15,7 @@
     // OUTPUTS(0) unit, OUTPUTS(1) bond, OUTPUTS(2) borrower payout. The bond records the actual
     //   principal: R6(1) for ERG, R7(0)._2 for a token. Payout ERG less expiry refund equals R6(1),
     //   and payout tokens equal bond R7 exactly. Token loans keep the original nanoERG beside them.
+    //   Payout R4 = SELF.id, so another input's payment cannot also count as this principal.
     // Price expressions add a minimum payment; they cannot change repayment, maturity rules,
     //   collateral, borrower, liquidation expression, fees or mint supply. Overpayment is allowed
     //   only when the resolved principal records it. No future accrued value starts from a stale P.
@@ -116,7 +117,8 @@
                 val principalPaid =
                     blake2b256(principal.propositionBytes) == borrowerHash &&
                     principal.value >= expiryFee && principal.value - expiryFee == resolved(1) &&
-                    principal.tokens == principalTokens
+                    principal.tokens == principalTokens &&
+                    principal.R4[Coll[Byte]].get == SELF.id
 
                 val core = borrowerValid && mintValid && bondValid && startValid && maturityValid && principalPaid
 

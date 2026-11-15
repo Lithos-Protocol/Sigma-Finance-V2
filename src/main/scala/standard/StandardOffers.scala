@@ -18,7 +18,8 @@ case class OfferDelivery(terms: ShareTerms)
  */
 case class OfferSpec(market: Market, capital: Long, fees: Long, yieldBps: Long, minBlocks: Long, maxBlocks: Long,
                      batcherFee: Long, feeReserve: Long, floorBps: Long, maxAge: Long, expiry: Long, minPrice: Long,
-                     auctionFloorBps: Long, auctionLength: Long, delivery: Option[OfferDelivery])
+                     auctionFloorBps: Long, auctionLength: Long, delivery: Option[OfferDelivery],
+                     minFillBps: Long = 100L, batcherBudget: Option[Long] = None)
 
 /**
  * Lend offers: ZC_Standard_LendOffer with ZC_Standard_ERG_SigUSD_CollateralPolicy. Creating, cancelling and
@@ -48,6 +49,8 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     if (s.maxAge < 1L || s.maxAge > 100000L) fail("the oracle age must be 1 to 100000 blocks")
     if (s.expiry <= height.toLong + 1L) fail("the offer's expiry must be above the current height")
     if (s.minPrice < 1L) fail("the minimum price must be at least 1")
+    if (m.token.isDefined && (s.minFillBps < 100L || s.minFillBps > 10000L))
+      fail("the minimum fill must be 1% to 100% of the original capital")
     if (s.auctionFloorBps < 0L || s.auctionLength < 0L) fail("the auction bounds cannot be negative")
     // An offer is posted before it knows which bond it buys, so zcs1 metadata here leaves the bond out.
     val standard = s.delivery.map(d => StandardMetadata.shares(m, d.terms.auction, None))
@@ -59,8 +62,15 @@ trait StandardOffers extends AppBase { self: StandardApp =>
         (t.longs, textsValue(t.metadata(standard.get): _*),
           if (t.auction.isDefined) protocol.market(m).dutchMint.hashedPropBytes else protocol.contracts.fractionalMint.hashedPropBytes)
     }
+    val budgetTerms = if (m.token.isEmpty) Seq.empty else {
+      val spend = BigInt(s.fees) - MinBox - s.batcherFee
+      val reward = s.batcherBudget.getOrElse(((BigInt(MinBatchingFee) * 10000L + s.minFillBps - 1L) / s.minFillBps).toLong)
+      if (reward <= 0L || spend <= reward || !spend.isValidLong)
+        fail("token offer ERG funding must cover the batcher budget, additional box/reserve costs, and the expiry refund")
+      Seq(s.capital, spend.toLong, s.minFillBps, reward)
+    }
     val terms = Seq(s.yieldBps, s.minBlocks, s.maxBlocks, s.batcherFee, s.feeReserve, s.floorBps, s.expiry,
-      s.minPrice, s.maxAge, s.auctionFloorBps, s.auctionLength)
+      s.minPrice, s.maxAge, s.auctionFloorBps, s.auctionLength) ++ budgetTerms
     val regs = Seq(bytesValue(hashOf(myTree)), longsValue(terms: _*),
       bytesValue(protocol.market(m).policy.hashedValueBytes), longsValue(fractional: _*), metadata, bytesValue(mint))
     val offer = m.token match {
@@ -71,7 +81,10 @@ trait StandardOffers extends AppBase { self: StandardApp =>
       s"lend up to ${Units.amount(s.capital, m)} at ${Units.percent(s.yieldBps)} simple yield per 262800 blocks or better",
       s"bonds maturing ${s.minBlocks} to ${s.maxBlocks} blocks after a fill, with the oracle rule at a ratio of at " +
         s"least ${Units.percent(s.floorBps)} and collateral worth that now; minimum price ${Units.amount(s.minPrice, m)}",
-      s"batcher fee ${Fmt.erg(s.batcherFee)} per fill; new bonds carry a ${Fmt.erg(s.feeReserve)} fee reserve",
+      (if (m.token.isEmpty) s"batcher fee ${Fmt.erg(s.batcherFee)} per fill"
+       else s"batcher reward budget ${Fmt.erg(budgetTerms(3))}, proportional to the filled capital; " +
+         s"minimum fill ${Units.percent(s.minFillBps)} of original capital; total ERG spend budget ${Fmt.erg(budgetTerms(1))}") +
+        s"; new bonds carry a ${Fmt.erg(s.feeReserve)} fee reserve",
       if (s.auctionLength == 0L) "buys no Dutch auction shares"
       else s"buys Dutch auction shares with a floor of at least ${Units.percent(s.auctionFloorBps)} and at most ${s.auctionLength} blocks",
       s.delivery.fold("bond units come to this wallet")(d => s"bond units are delivered into ${d.terms.shares} shares" +
@@ -112,10 +125,14 @@ trait StandardOffers extends AppBase { self: StandardApp =>
    * oracle's price. A refusal here saves a failed transaction; the contract has the last word.
    */
   def offerRefusal(o: StdOffer, bond: StdBond, price: Long, units: Long, whole: Long,
-                   oracle: Option[OracleState]): Option[String] = {
+                   oracle: Option[OracleState], primary: Boolean = false, shares: Boolean = false): Option[String] = {
     val at = height.toLong + 1L
     val remaining = bond.maturity - at
-    val cost = if (o.market.token.isEmpty) BigInt(price) + o.batcherFee else BigInt(price)
+    val fee = o.fillFee(price)
+    val cost = if (o.market.token.isEmpty) BigInt(price) + fee else BigInt(price)
+    val delivery = if (!o.delivers || shares) BigInt(MinBox) else BigInt(2L * MinBox) + o.fractional(1) + o.fractional(2)
+    val ergOut = BigInt(fee) + delivery + (if (primary) o.feeReserve else 0L) +
+      (if (primary) bond.terms(1) else MinBox)
     val rule = protocol.market(o.market).oracleRule.hashedValueBytes
     lazy val cover = oracle.flatMap(p => protocol.cover(bond, p.price))
     if (at >= o.expiry) Some(s"the offer expired at height ${o.expiry}")
@@ -126,6 +143,17 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     else if (BigInt(bond.repayment) * units * Year < cost * whole * (Year + BigInt(o.yieldBps) * remaining))
       Some(s"${Units.amount(price, o.market)} for $units of $whole is under the offer's ${Units.percent(o.yieldBps)} yield")
     else if (o.capital < price) Some(s"the offer holds only ${Units.amount(o.capital, o.market)}")
+    else if (o.market.token.isDefined && (o.originalCapital <= 0L || o.capital > o.originalCapital ||
+      o.spendBudget <= 0L || o.batcherBudget <= 0L || o.batcherBudget >= o.spendBudget ||
+      o.minFillBps < 100L || o.minFillBps > 10000L || o.batcherFee < MinBatchingFee))
+      Some("the token offer has invalid original capital or fee-budget terms")
+    else if (o.market.token.isDefined && BigInt(price) * 10000L < BigInt(o.originalCapital) * o.minFillBps)
+      Some(s"the fill is under ${Units.percent(o.minFillBps)} of the offer's original capital")
+    else if (fee < MinBatchingFee) Some("the calculated batcher reward is below 0.002 ERG")
+    else if (o.market.token.isDefined && ergOut * o.originalCapital > BigInt(o.spendBudget) * price)
+      Some("the fill's fees, box funding and reserve exceed its proportional ERG budget")
+    else if (o.market.token.isDefined && BigInt(o.box.value) - ergOut < BigInt(MinBox) + o.batcherFee)
+      Some("the fill would spend the token offer's expiry refund reserve")
     else if (!bond.liqHash.sameElements(rule)) Some("the bond's liquidation rule is not the oracle rule the offer's policy requires")
     else if (bond.payload.size < 2 || bond.payload(0) < o.floorBps || bond.payload(1) < o.maxAge || bond.payload(1) > 100000L)
       Some(s"the bond's own ratio or oracle age is under the offer's ${Units.percent(o.floorBps)} and ${o.maxAge} blocks")
@@ -154,12 +182,15 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     val value = o.box.value - ergOut
     if (value < MinBox) fail(s"the offer's ${Fmt.erg(o.box.value)} cannot cover ${Fmt.erg(ergOut)} of fees and box minimums")
     UTXO(Contract(o.box.input.getErgoTree), value, tokens, o.box.registers)
+      .withRegNum(6, bytesValue(o.policyHash ++ o.box.id.getBytes))
   }
 
   /** Where the offer sends a bond unit: to its owner, or into the share mint request it names. */
   private def unitDelivery(o: StdOffer, asset: ErgoId, eip4: Seq[org.ergoplatform.appkit.ErgoValue[_]]): (UTXO, Long) = {
     val owner = ownerTree(o.ownerHash, o.box, "offer owner")
-    if (!o.delivers) (UTXO(Contract(owner), MinBox, Seq(Token(asset, 1L)), eip4), MinBox)
+    val front = if (eip4.nonEmpty) eip4 else Seq.fill(3)(bytesValue(Array.emptyByteArray))
+    if (!o.delivers) (UTXO(Contract(owner), MinBox, Seq(Token(asset, 1L)),
+      front :+ bytesValue(o.box.id.getBytes)), MinBox)
     else {
       val mint = if (o.mintHash.sameElements(protocol.contracts.fractionalMint.hashedPropBytes)) protocol.contracts.fractionalMint
         else protocol.market(o.market).dutchMint
@@ -169,7 +200,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
       // unit bought from an ask has none, so the shares' own metadata stands in.
       val front = if (eip4.nonEmpty) eip4 else o.metadata.map(bytesValue)
       (UTXO(mint, funding, Seq(Token(asset, 1L)),
-        front ++ Seq(bytesValue(o.ownerHash), longsValue(o.fractional: _*), bytesListValue(o.metadata))), funding)
+        front ++ Seq(bytesValue(o.ownerHash ++ o.box.id.getBytes), longsValue(o.fractional: _*), bytesListValue(o.metadata))), funding)
     }
   }
 
@@ -194,7 +225,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     val asset = order.box.id
     val bond = prospective(order, start, maturity, o.feeReserve)
     val oracle = Try(self.oracle()).toOption.flatten
-    offerRefusal(o, bond, order.principal, 1L, 1L, oracle).foreach(r => fail(s"the offer refuses this order: $r"))
+    offerRefusal(o, bond, order.principal, 1L, 1L, oracle, primary = true).foreach(r => fail(s"the offer refuses this order: $r"))
     guardRefusal(order, bond, oracle).foreach(r => fail(s"the order's fill guard refuses this fill: $r"))
     oracle.foreach(readableOracle)
 
@@ -206,14 +237,15 @@ trait StandardOffers extends AppBase { self: StandardApp =>
         tokensValue(order.principalTokens), bytesValue(order.liqHash), longsValue(o.feeReserve, start, maturity)),
       Some(start.toInt))
     val principal = UTXO(Contract(borrowerTree(order.borrowerHash, order.box)),
-      addAmount(order.expiryFee, order.principalErg), order.principalTokens)
-    val ergOut = o.batcherFee + funding + o.feeReserve + (if (o.market.token.isEmpty) order.principal else order.principalErg)
+      addAmount(order.expiryFee, order.principalErg), order.principalTokens, Seq(bytesValue(order.box.id.getBytes)))
+    val fee = o.fillFee(order.principal)
+    val ergOut = fee + funding + o.feeReserve + (if (o.market.token.isEmpty) order.principal else order.principalErg)
     val rest = offerRest(o, order.principal, ergOut)
     prepare(s"Match offer $offerId with order $orderId",
       plan(Seq(orderInput(order), offerInput(o, 3)), Seq(delivery, bondOut, principal, rest), minted = Some(asset),
         dataInputs = oracle.map(_.box).toSeq),
       Seq(s"the offer lends ${Units.amount(order.principal, o.market)} for ${Units.amount(order.repayment, o.market)} " +
-        s"at height $maturity", s"you keep the offer's ${Fmt.erg(o.batcherFee)} batcher fee, less the miner fee"))
+        s"at height $maturity", s"you keep the offer's ${Fmt.erg(fee)} batcher fee, less the miner fee"))
   }
 
   /**
@@ -237,7 +269,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     // The offer judges a purchase at the payout's whole value, so an ERG price under the box minimum is that minimum.
     val price = if (o.market.token.isEmpty) math.max(askPrice(ask, n)._1, MinBox) else askPrice(ask, n)._1
     val oracle = Try(self.oracle()).toOption.flatten
-    offerRefusal(o, bond, price, n, whole, oracle).foreach(r => fail(s"the offer refuses this ask: $r"))
+    offerRefusal(o, bond, price, n, whole, oracle, shares = shares.isDefined).foreach(r => fail(s"the offer refuses this ask: $r"))
     saleGuardRefusal(ask, bond, oracle).foreach(r => fail(s"the ask's sale guard refuses this sale: $r"))
     oracle.foreach(readableOracle)
 
@@ -256,9 +288,11 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     }
     val rest = askRest(ask, n)
     val (delivery, funding) =
-      if (shares.isDefined) (UTXO(Contract(ownerTree(o.ownerHash, o.box, "offer owner")), MinBox, Seq(Token(token, n))), MinBox)
+      if (shares.isDefined) (UTXO(Contract(ownerTree(o.ownerHash, o.box, "offer owner")), MinBox, Seq(Token(token, n)),
+        Seq.fill(3)(bytesValue(Array.emptyByteArray)) :+ bytesValue(o.box.id.getBytes)), MinBox)
       else unitDelivery(o, asset, Seq.empty)
-    val ergOut = o.batcherFee + funding + (if (o.market.token.isEmpty) price else MinBox)
+    val fee = o.fillFee(price)
+    val ergOut = fee + funding + (if (o.market.token.isEmpty) price else MinBox)
     val offerIn = requestBytes.foldLeft(offerInput(o, 2).withCtxVar(2.toByte, intValue(0)).withCtxVar(3.toByte, intValue(0))
       .withCtxVar(4.toByte, bytesValue(originBytes)).withCtxVar(5.toByte, intValue(1)))((b, bytes) => b.withCtxVar(6.toByte, bytesValue(bytes)))
       .withCtxVar(7.toByte, intValue(0))
@@ -267,6 +301,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
         Seq(askPayout(ask, n, price), delivery, offerRest(o, price, ergOut)) ++ rest,
         dataInputs = bond.box +: oracle.map(_.box).toSeq),
       Seq(s"the offer pays ${Units.amount(price, o.market)} for $n of $token" + shares.fold("")(v => s" (shares of bond ${v.bondAsset})"),
-        s"you keep the offer's ${Fmt.erg(o.batcherFee)} batcher fee, less the miner fee"))
+        s"you keep the offer's ${Fmt.erg(fee)} batcher fee, less the miner fee"))
   }
+
 }

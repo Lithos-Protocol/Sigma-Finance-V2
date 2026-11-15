@@ -18,7 +18,7 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
   private val kinds: Seq[Kind] = Seq(ErgBond, TokenBond)
   private val year: BigInt = BigInt(2628000000L)
   private val ergCapital: Long = 20L * Parameters.OneErg
-  private val tokenCapital: Long = 100000L
+  private val tokenCapital: Long = 1000L
   private val pullFee: Long = 2000000L
   private val mintFee: Long = 2000000L
   private val metadata: Seq[String] = Seq("Bond shares", "Shares of one bond", "2")
@@ -27,14 +27,17 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
   private case class Terms(yieldBps: Long = 0L, minBlocks: Long = 1L, maxBlocks: Long = 100000L,
                            batcherFee: Long = batchingFee, reserve: Long = batchingFee, floorBps: Long = 13000L,
                            expiry: Long = -1L, minFill: Long = 1L, maxAge: Long = 30L,
-                           auctionFloor: Long = 0L, auctionLength: Long = 1000000L)
+                           auctionFloor: Long = 0L, auctionLength: Long = 1000000L,
+                           minFillBps: Long = 100L, rewardBudget: Long = 200000000L)
 
   private def offerBox(ctx: BlockchainContext, kind: Kind, t: Terms = Terms(), policy: Contract = null,
                        fractional: Seq[Long] = Seq.empty, mint: Array[Byte] = Array.empty[Byte]): UTXO = {
     val expiry = if (t.expiry < 0L) ctx.getHeight + 5000L else t.expiry
-    val regs = Seq(bytesValue(hashOf(lenderTree(ctx))),
-      longsValue(t.yieldBps, t.minBlocks, t.maxBlocks, t.batcherFee, t.reserve, t.floorBps, expiry, t.minFill,
-        t.maxAge, t.auctionFloor, t.auctionLength),
+    val budget = if (kind == ErgBond) Seq.empty else
+      Seq(tokenCapital, Parameters.OneErg - minBox - t.batcherFee, t.minFillBps, t.rewardBudget)
+    val terms = Seq(t.yieldBps, t.minBlocks, t.maxBlocks, t.batcherFee, t.reserve, t.floorBps, expiry, t.minFill,
+      t.maxAge, t.auctionFloor, t.auctionLength) ++ budget
+    val regs = Seq(bytesValue(hashOf(lenderTree(ctx))), longsValue(terms: _*),
       bytesValue((if (policy == null) alwaysTrue(ctx) else policy).hashedValueBytes),
       longsValue(fractional: _*), if (fractional.isEmpty) textsValue() else textsValue(metadata: _*), bytesValue(mint))
     if (kind == ErgBond) UTXO(marketOf(ctx, kind).offer, ergCapital, Seq.empty[Token], regs)
@@ -45,8 +48,8 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
   private def policyOf(ctx: BlockchainContext, policy: Contract): Contract = if (policy == null) alwaysTrue(ctx) else policy
 
   /** What a fill leaves: `ergOut` nanoERG and `price` raw repayment units out of the box. */
-  private def continuation(kind: Kind, offer: UTXO, ergOut: Long, price: Long): UTXO = {
-    val next = offer.setValue(offer.value - ergOut)
+  private def continuation(ctx: BlockchainContext, kind: Kind, offer: UTXO, ergOut: Long, price: Long): UTXO = {
+    val next = offerSuccessor(offer.setValue(offer.value - ergOut), inputAt(offer, ctx, 1).id)
     if (kind == ErgBond) next
     else {
       val left = offer.tokens.head.amount - price
@@ -55,8 +58,11 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
   }
 
   /** Fee, delivery funding, reserve, and the ERG price or the nanoERG beside a token principal. */
+  private def feeOf(kind: Kind, offer: UTXO, price: Long): Long =
+    if (kind == ErgBond) termsOf(offer)(3) else (BigInt(termsOf(offer)(14)) * price / termsOf(offer)(11)).toLong
+
   private def ergOut(kind: Kind, offer: UTXO, delivery: Long, reserve: Long, price: Long, beside: Long): Long =
-    termsOf(offer)(3) + delivery + reserve + (if (kind == ErgBond) price else beside)
+    feeOf(kind, offer, price) + delivery + reserve + (if (kind == ErgBond) price else beside)
 
   // ═══ NEW BOND ═════════════════════════════════════════════════════════════
 
@@ -69,10 +75,11 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
     val ctx = f.ctx
     val in = if (offerIn != null) offerIn else inputAt(offer, ctx, 1)
       .withCtxVar(0.toByte, ErgoValue.of(3)).withCtxVar(1.toByte, liqVar(policyOf(ctx, policy)))
-    val deliveryOut = if (delivery == null) f.unit else delivery
+    val deliveryOut = offerDelivery(if (delivery == null) f.unit else delivery, in.id,
+      fractional = offer.parseCollReg[Long](3).nonEmpty)
     val funded = if (termsOf(offer).isEmpty || offer.parseCollReg[Long](3).isEmpty) minBox
       else 2L * minBox + pullFee + mintFee
-    val nextOut = if (next != null) next else continuation(f.kind, offer,
+    val nextOut = if (next != null) next else continuation(ctx, f.kind, offer,
       ergOut(f.kind, offer, funded, f.fee, priceOf(f), f.data(1)), priceOf(f))
     buildAt(ctx, if (height < 0) f.height else height, Seq(f.orderIn, in) ++ extra,
       Seq(deliveryOut, if (bond == null) f.bond else bond, f.principal, nextOut), executor(ctx).getAddress,
@@ -133,7 +140,7 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
       kinds.foreach { kind =>
         val f = flow(ctx, kind)
         val offer = offerBox(ctx, kind)
-        val next = continuation(kind, offer, ergOut(kind, offer, minBox, f.fee, priceOf(f), f.data(1)), priceOf(f))
+        val next = continuation(ctx, kind, offer, ergOut(kind, offer, minBox, f.fee, priceOf(f), f.data(1)), priceOf(f))
         accepts(executor(ctx), newBondTx(f, offer, next = next))
         val keptTokens = if (kind == TokenBond) Seq(next.setTokens(Token(SigUSD, tokenCapital - priceOf(f) - 1L))) else Nil
         (Seq(next.subValue(1L), next.setContract(otherTree(ctx)), next.withRegNum(4, bytesValue(hashOf(otherTree(ctx)))),
@@ -264,13 +271,15 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
                     origin: Array[Byte] = null, state: InputUTXO = null, delivery: UTXO = null,
                     payout: UTXO = null, askNext: UTXO = null, policy: Contract = null,
                     data: Seq[InputUTXO] = Seq.empty, height: Int = -1,
-                    askVars: Seq[(Byte, ErgoValue[_])] = Seq.empty): UnsignedTransaction = {
+                    askVars: Seq[(Byte, ErgoValue[_])] = Seq.empty, offerNext: UTXO = null): UnsignedTransaction = {
     val ctx = l.f.ctx
     val kind = l.f.kind
     val askIn = inputAt(ask, ctx, 2)
     val token = ask.tokens.head.id
     val left = ask.tokens.head.amount - units
-    val nextAsk = if (askNext != null) askNext else if (left > 0L) ask.setTokens(Token(token, left)) else null
+    val nextAsk = if (askNext != null) askNext else if (left > 0L) ask.setTokens(Token(token, left))
+      .withRegNum(if (ask.contract.ergoTree == marketOf(ctx, kind).pricedAsk.ergoTree) 8 else 6,
+        bytesValue(askIn.id.getBytes)) else null
     val askBase = askVars.foldLeft(askIn.withCtxVar(0.toByte, ErgoValue.of(0))) { case (in, (k, v)) => in.withCtxVar(k, v) }
     val askWithVars = if (nextAsk == null) askBase else askBase.withCtxVar(1.toByte, ErgoValue.of(3))
     val base = inputAt(offer, ctx, 1)
@@ -280,8 +289,11 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
       .withCtxVar(5.toByte, ErgoValue.of(1)).withCtxVar(7.toByte, ErgoValue.of(0))
     val offerIn = if (request == null) base else base.withCtxVar(6.toByte, bytesValue(request.bytes))
     val pay = if (payout == null) payoutBox(ctx, kind, askIn.id, units, paid) else payout
-    val deliver = if (delivery == null) UTXO(lenderTree(ctx), minBox, Seq(Token(token, units))) else delivery
-    val next = continuation(kind, offer, ergOut(kind, offer, minBox, 0L, paid, minBox), paid)
+    val rawDelivery = if (delivery == null) UTXO(lenderTree(ctx), minBox, Seq(Token(token, units))) else delivery
+    val deliver = offerDelivery(rawDelivery, offerIn.id,
+      fractional = request == null && offer.parseCollReg[Long](3).nonEmpty)
+    val next = if (offerNext != null) offerNext else
+      continuation(ctx, kind, offer, ergOut(kind, offer, minBox, 0L, paid, minBox), paid)
     buildAt(ctx, if (height < 0) l.height else height, Seq(askWithVars, offerIn),
       Seq(pay, deliver, next) ++ Option(nextAsk).toSeq, executor(ctx).getAddress,
       dataInputs = Seq(if (state == null) l.state else state) ++ data)
@@ -368,6 +380,66 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
     val give = if (delivered < 0L) units else delivered
     buyTx(w.l, offer, ask, units, paid, request = w.request,
       delivery = UTXO(lenderTree(ctx), minBox, Seq(Token(w.shareId, give))))
+  }
+
+  property("token budgets: minimum fill uses original capital, with an enforced 1% floor") {
+    withCtx { ctx =>
+      val w = wrapped(ctx, TokenBond, scripts(ctx).fractionalMint, Seq(1000L, pullFee, mintFee))
+      // The larger reward budget makes a 0.9% fill pay over 0.002 ERG, isolating the size check.
+      val o = offerBox(ctx, TokenBond, Terms(rewardBudget = 300000000L))
+      accepts(executor(ctx), shareBuy(w, o, 15L, 10L))
+      rejectsAtSigning(executor(ctx), shareBuy(w, o, 14L, 9L))
+      rejectsAtSigning(executor(ctx), shareBuy(w, offerBox(ctx, TokenBond, Terms(minFillBps = 99L)), 30L, 20L))
+      rejectsAtSigning(executor(ctx), shareBuy(w, offerBox(ctx, TokenBond, Terms(minFillBps = 10001L)), 30L, 20L))
+      val first = accepts(executor(ctx), shareBuy(w, o, 750L, 500L, askAmount = 1000L))
+      val rest = spendOutput(first, 2).toUTXO
+      val second = accepts(executor(ctx), shareBuy(w, rest, 15L, 10L))
+      val last = spendOutput(second, 2)
+      termsOf(rest).drop(11) shouldBe termsOf(o).drop(11)
+      last.parseCollReg[Long](1).toSeq shouldBe termsOf(o)
+      // The 1% fill still pays 1% of the original reward budget, after half the capital was spent.
+      rest.value - last.value shouldBe 3000000L + 2L * minBox
+      rejectsAtSigning(executor(ctx), shareBuy(w, rest, 14L, 9L))
+    }
+  }
+
+  property("token budgets: all ERG outflow fits the exact pro rata cap, and budget terms cannot change") {
+    withCtx { ctx =>
+      val w = wrapped(ctx, TokenBond, scripts(ctx).fractionalMint, Seq(1000L, pullFee, mintFee))
+      val base = offerBox(ctx, TokenBond)
+      // A 1% fill releases 0.002 reward + two 0.001 box allowances = exactly 1% of 0.4 ERG.
+      val terms = termsOf(base).updated(12, 400000000L)
+      val o = base.withRegNum(5, longsValue(terms: _*))
+      val tx = accepts(executor(ctx), shareBuy(w, o, 15L, 10L))
+      val next = spendOutput(tx, 2).toUTXO
+      o.value - next.value shouldBe 4000000L
+      rejectsAtSigning(executor(ctx), shareBuy(w,
+        o.withRegNum(5, longsValue(terms.updated(12, 399999999L): _*)), 15L, 10L))
+      val ask = saleBox(ctx, TokenBond, w.shareId, 100L, 1L, per = 1000L)
+      (11 to 14).foreach { i =>
+        // The new fields, like every other offer term, are immutable through its continuation.
+        val changed = next.withRegNum(5, longsValue(terms.updated(i, terms(i) + 1L): _*))
+        rejectsAtSigning(executor(ctx), buyTx(w.l, o, ask, 15L, 10L, request = w.request, offerNext = changed))
+      }
+    }
+  }
+
+  property("token rewards: undersized calculated fees reject instead of rounding up; splitting earns no extra reward") {
+    withCtx { ctx =>
+      val w = wrapped(ctx, TokenBond, scripts(ctx).fractionalMint, Seq(1000L, pullFee, mintFee))
+      val small = offerBox(ctx, TokenBond, Terms(rewardBudget = 100000000L))
+      rejectsAtSigning(executor(ctx), shareBuy(w, small, 15L, 10L))
+      accepts(executor(ctx), shareBuy(w, small, 30L, 20L))
+      val o = offerBox(ctx, TokenBond, Terms(rewardBudget = 200000099L))
+      val whole = accepts(executor(ctx), shareBuy(w, o, 50L, 30L))
+      val first = accepts(executor(ctx), shareBuy(w, o, 20L, 11L))
+      val rest = spendOutput(first, 2).toUTXO
+      val second = accepts(executor(ctx), shareBuy(w, rest, 30L, 19L))
+      val wholeFee = o.value - spendOutput(whole, 2).value - 2L * minBox
+      val splitFee = o.value - spendOutput(second, 2).value - 4L * minBox
+      splitFee should be <= wholeFee
+      splitFee shouldBe feeOf(TokenBond, o, 11L) + feeOf(TokenBond, o, 19L)
+    }
   }
 
   for (kind <- kinds) {

@@ -47,6 +47,7 @@ class StandardAppSpec extends AnyPropSpec with StandardSpecSupport with LoneElem
       bond.collateralErg shouldBe erg("10")
       w.app(l).originVerified(bond) shouldBe true
       filled.getOutputsToSpend.get(0).getTokens.get(0).getValue.longValue shouldBe 1L
+      InputUTXO(filled.getOutputsToSpend.get(2)).parseCollReg[Byte](0) shouldBe order.box.id.getBytes
       // The borrower got the principal and the unused expiry fee back.
       w.nano(b) shouldBe erg("20") - erg("10") - erg("0.005") - Parameters.MinFee + erg("5") + erg("0.005")
 
