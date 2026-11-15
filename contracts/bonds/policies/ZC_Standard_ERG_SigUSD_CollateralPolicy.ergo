@@ -46,8 +46,8 @@
     // pass iff C * 10000 >= L * floor. Products are widened to BigInt before multiplying.
 
     val terms = SELF.R5[Coll[Long]].get
-    val stateIndex = getVar[Int](3)
-    val bond = if (stateIndex.isDefined) CONTEXT.dataInputs(stateIndex.get) else OUTPUTS(1)
+    // Select exactly as the offer does: var 2 (the ask index) present means an existing bond.
+    val bond = if (getVar[Int](2).isDefined) CONTEXT.dataInputs(getVar[Int](3).get) else OUTPUTS(1)
     val borrower = bond.R6[Coll[Long]].get
     val lender = bond.R9[Coll[Long]].get
     val floorBps = terms(5)

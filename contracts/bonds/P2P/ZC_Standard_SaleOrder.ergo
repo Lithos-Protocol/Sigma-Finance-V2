@@ -84,6 +84,8 @@
                     false
                 } else {
                     val next = OUTPUTS(index)
+                    // Each input requires its own continuation, including identical asks in a batch.
+                    next.R6[Coll[Byte]].get == SELF.id &&
                     next.propositionBytes == SELF.propositionBytes &&
                     next.value >= SELF.value &&
                     next.tokens.size == 1 &&

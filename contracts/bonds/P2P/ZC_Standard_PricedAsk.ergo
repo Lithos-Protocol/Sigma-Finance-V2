@@ -94,6 +94,8 @@
                     false
                 } else {
                     val next = OUTPUTS(index)
+                    // R4-R7 retain the terms; R8 binds this continuation to one input.
+                    next.R8[Coll[Byte]].get == SELF.id &&
                     next.propositionBytes == SELF.propositionBytes &&
                     next.value >= SELF.value &&
                     next.tokens.size == 1 &&
