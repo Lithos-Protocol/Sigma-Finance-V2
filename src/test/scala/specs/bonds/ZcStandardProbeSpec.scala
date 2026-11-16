@@ -47,6 +47,7 @@ class ZcStandardProbeSpec extends AnyPropSpec with ContractSpecBase {
         c.tpe == SByteArray && c.value.asInstanceOf[Coll[Byte]].toArray.sameElements(hash)
       }
       pins(s.fractionalMint, s.fractionalVault.hashedPropBytes) shouldBe true
+      pins(s.wrapMint, s.wrapVault.hashedPropBytes) shouldBe true
       Market.all.foreach { m =>
         withClue(s"$m: ") {
           val c = s.market(m)
@@ -63,7 +64,7 @@ class ZcStandardProbeSpec extends AnyPropSpec with ContractSpecBase {
           m.token.foreach { id =>
             Seq(c.bond, c.order, c.offer, c.saleOrder, c.pricedAsk, c.dutchMint, c.oracleRule, c.policy, c.lotAuction,
               c.fillGuard, c.pricedOrder, c.yieldOrderPricing,
-              c.yieldPricing, c.guardedYieldPricing)
+              c.yieldPricing, c.guardedYieldPricing, c.curveOrderPricing)
               .foreach(t => pins(t, id.getBytes) shouldBe true)
           }
         }

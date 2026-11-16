@@ -99,6 +99,9 @@ trait StandardSpecSupport extends ContractSpecBase with Assertions {
         case Seq("refund-ask", id) => a.refundAsk(id)
         case Seq("liquidate", id) => a.liquidate(Seq(id))
         case Seq("match-offer", offer, "--order", order) => a.matchOrder(offer, order)
+        case Seq("match-offer", offer, "--order", order, "--maturity", m) => a.matchOrder(offer, order, Some(m.toLong))
+        case Seq("mint-wrap", id) => a.mintWrap(id)
+        case "refresh" +: ids => a.refresh(ids)
         case Seq("match-offer", offer, "--ask", ask) => a.matchAsk(offer, ask, None)
         case Seq("match-offer", offer, "--ask", ask, "--amount", n) => a.matchAsk(offer, ask, Some(n.toLong))
       })).isSuccess

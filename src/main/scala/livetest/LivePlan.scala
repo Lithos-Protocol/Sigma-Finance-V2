@@ -113,6 +113,7 @@ case class Step(id: String, track: String, title: String, kind: Kind, command: S
  *    Dutch shares; two bonds liquidated at maturity together; the Dutch auction pulled, its lot bought, the shares claimed
  *  - K: expiry refunds and cancels of orders, offers and asks, and a SigUSD-market order and ask
  *  - L: a lot auction of test tokens bought by this wallet, and one refunded after its expiry
+ *  - W: a test token wrapped, its receipt minted and unwrapped, a refresh refused as too early, a wrap cancelled
  *  - G: a batch run filling an order from an offer that delivers Selective shares, and minting them; the final
  *    claim before the pull returns the unit, which claims the repaid bond
  *
@@ -366,6 +367,21 @@ object LivePlan {
       "--opening 1 --floor 0.5", after = Seq("S1"), binds = Seq(out("lot3", 0))),
     tx("L7", "L lots", "Cancel the lot", "cancel-lot {lot3}", after = Seq("L6")),
 
+    // ─── W: custody wraps and the paid refresh ────────────────────────────────
+    tx("W1", "W wraps", "Wrap 1 test token: a request a batcher mints into a receipt and a vault",
+      "wrap {token} --amount 1 --refresh-reserve 0.01", after = Seq("S1"), binds = Seq(out("wrapReq1", 0))),
+    tx("W2", "W wraps", "Mint the wrap's receipt, with the request as the transaction's only input", "mint-wrap {wrapReq1}",
+      after = Seq("W1"), binds = Seq(out("wrapVault1", 1))),
+    read("W3", "W wraps", "The wrap lists with its receipt and vault", "wraps --mine", Seq("{wrapReq1}", "unwrap"),
+      after = Seq("W2")),
+    refusal("W3x", "W wraps", "A refresh is refused: the vault is not two years old", "refresh {wrapVault1}",
+      "can be refreshed from height", after = Seq("W2")),
+    tx("W4", "W wraps", "Unwrap: burn the receipt with the vault's two and take the token back", "unwrap {wrapReq1}",
+      after = Seq("W3", "W3x"), check = Check.TokenGone("wrapReq1")),
+    tx("W5", "W wraps", "Wrap 1 more test token, cancelled before it is minted",
+      "wrap {token} --amount 1 --refresh-reserve 0", after = Seq("S1"), binds = Seq(out("wrapReq2", 0))),
+    tx("W6", "W wraps", "Cancel the wrap request", "cancel-wrap {wrapReq2}", after = Seq("W5")),
+
     tx("C6", "C oracle", "One transaction: liquidate bond C by the oracle and refund expired order K2",
       "pack {bondC} {orderK2}", after = Seq("C2", "C3", "K2"), gate = Expired(BoxKind.Order, "orderK2")),
     read("C7", "C oracle", "Bond C lists as claimable", "claims", Seq("{orderC}"), after = Seq("C6", "C5")),
@@ -560,6 +576,18 @@ object LivePlan {
     "L5" -> "Refunds the expired lot to its seller. Anyone may, keeping the lot's refund fee.",
     "L6" -> "A lot priced far above its worth, set up to be cancelled.",
     "L7" -> "Cancels the lot, returning the tokens. Shows the seller can withdraw a lot at any time.",
+
+    // W: custody wraps
+    "W1" -> ("Puts one test token in a wrap request, funding 0.01 ERG for the vault's refreshes. Shows how a capability " +
+      "token, such as a LithosDex position's owner NFT, is wrapped before it goes into an order."),
+    "W2" -> ("Mints the receipt: one unit to this wallet, two and the token into the vault. The request is the " +
+      "transaction's only input, so the wrapped token is never spent beside anything else."),
+    "W3" -> "Lists the wrap: the receipt, the vault and what it holds, and when it can first be refreshed.",
+    "W3x" -> ("Asks to refresh the new vault, which the CLI refuses: a paid refresh opens only after 525600 blocks, about " +
+      "two years. Shows the refresh command without waiting two years."),
+    "W4" -> "Burns the receipt with the vault's two units and takes the token back, so all three units are gone.",
+    "W5" -> "A second wrap request, without a refresh reserve, set up to be cancelled.",
+    "W6" -> "Cancels the wrap request before a batcher mints it, returning the token.",
 
     // G: a batch run
     "G1" -> ("An on-close order priced at a 50000% yield, repaying 0.12 after 60 blocks: on a 60-block loan that " +

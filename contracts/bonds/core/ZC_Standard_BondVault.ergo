@@ -13,18 +13,26 @@
     // R4: Coll[Byte] - id of the bond box this settles
     // R5: Byte - settlement path: 0 repaid, 1 liquidated
     //
-    // SPENDING
+    // CLAIM (context var 9 absent)
     // More of the asset than this box's reserve must be spent, and none may survive: the circulating
     // unit is presented and all 3 units are burned. Outputs are otherwise unconstrained, so a holder
     // may sweep any number of settled bonds in one transaction, and a consuming contract such as
     // ZC_Standard_FractionalVault can direct the proceeds into itself.
+    //
+    // REFRESH (anyone, once the box is more than 525600 blocks, about two years, old)
+    // Context var 9: Int successor index. Storage rent lets anyone take a four-year-old box whose
+    // value does not cover the rent, tokens included, which would free the 2-unit reserve. So anyone
+    // may re-create this box unchanged to reset its age, keeping up to 10000000 nanoERG (0.01 ERG) as
+    // a bounty, never taking it below 1000000 (a box at or under that is renewed for nothing). The
+    // successor has this script, the same tokens, R4 and R5 and no more registers, and a creation
+    // height within 1000 blocks of HEIGHT. The window and bounty match ZC_Standard_Bond's refresh.
     //
     // ASSUMPTIONS
     // - The asset came from a verified ZC_Standard_Order mint: supply 3, reserve 2. For any other token the
     //   rule still only releases a box to someone who burns more of tokens(0) than the box holds.
     // - Value sent here outside a bond settlement is a gift to that asset's holder.
     // - A lost circulating unit strands the proceeds. No timeout or sweep authority exists.
-    // - Storage-rent collection is outside script evaluation and is not modelled.
+    // - A refresh relies on someone sending it within the two years before rent is due.
 
     def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
         OUTPUTS.fold(0L, { (a: Long, b: Box) =>
@@ -46,5 +54,30 @@
 
     val asset = SELF.tokens(0)._1
     val reserve = SELF.tokens(0)._2
-    sigmaProp(numTokenInInputs(asset) > reserve && numTokenInOutputs(asset) == 0L)
+    val refreshIndex = getVar[Int](9)
+
+    if (refreshIndex.isDefined) {
+        // Refresh: re-create the box unchanged to reset its age, paying the refresher.
+        val index = refreshIndex.get
+        if (index < 0 || index >= OUTPUTS.size) {
+            sigmaProp(false)
+        } else {
+            val next = OUTPUTS(index)
+            val stamped = next.creationInfo._1
+            val kept = if (SELF.value < 1000000L) SELF.value else 1000000L
+            val least = if (SELF.value - 10000000L > kept) SELF.value - 10000000L else kept
+            sigmaProp(
+                SELF.creationInfo._1 < HEIGHT - 525600 &&
+                stamped > HEIGHT - 1000 && stamped <= HEIGHT &&
+                next.propositionBytes == SELF.propositionBytes &&
+                next.value >= least &&
+                next.tokens == SELF.tokens &&
+                next.R4[Coll[Byte]].get == SELF.R4[Coll[Byte]].get &&
+                next.R5[Byte].get == SELF.R5[Byte].get &&
+                next.R6[Coll[Byte]].isDefined == false
+            )
+        }
+    } else {
+        sigmaProp(numTokenInInputs(asset) > reserve && numTokenInOutputs(asset) == 0L)
+    }
 }

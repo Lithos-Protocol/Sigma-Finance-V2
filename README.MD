@@ -6,10 +6,12 @@ Sigma Finance V2 is an open standard for decentralized P2P contracts on Ergo.
 
 [SigmaBonds.MD](./SigmaBonds.MD) describes the ZC Standard: P2P zero-coupon bonds on any collateral,
 with a tradeable bond asset, pluggable liquidation, fractional shares with a Selective or Dutch auction
-for liquidated collateral, a lot auction for selling collateral paid in kind, and an exchange where a
-lender's yield-curve bid buys new and existing bonds. It is not deployed. Every contract has offline
-specs, and the CLI below builds all of it: the bond lifecycle, Selective and Dutch shares, asks, lots
-and lend offers, plus a batch scan for the work that pays whoever runs it. [docs/ZC_STANDARD_OFFCHAIN.md](./docs/ZC_STANDARD_OFFCHAIN.md) sets the off-chain rules
+for liquidated collateral, a lot auction for selling collateral paid in kind, an exchange where a
+lender's yield-curve bid buys new and existing bonds, window orders whose lender picks the maturity,
+custody wraps for capability tokens, and a paid refresh against storage rent. It is not deployed. Every
+contract has offline specs, and the CLI below builds all of it: the bond lifecycle, Selective and Dutch
+shares, asks, lots, lend offers, wraps and refreshes, plus a batch scan for the work that pays whoever
+runs it. [docs/ZC_STANDARD_OFFCHAIN.md](./docs/ZC_STANDARD_OFFCHAIN.md) sets the off-chain rules
 that clients and batchers follow: script disclosure, token names and descriptions, share count, the
 maturity grid, batching and defaults.
 
@@ -18,8 +20,9 @@ maturity grid, batching and defaults.
 | `core/` | `Bond`, `BondVault`: the bond and the vault its settlement pays |
 | `P2P/` | `Order`, `PricedOrder`, `LendOffer`, `SaleOrder`, `PricedAsk`, `LotAuction`: borrowing, lending and trading |
 | `lender-scripts/` | `FractionalMint`, `FractionalVault`, `DutchAuctionMint`, `DutchAuctionVault` (Selective or Dutch): shares |
+| `wrappers/` | `WrapMint`, `WrapVault`: custody for capability tokens such as a LithosDex position's owner NFT |
 | `liquidations/` | `MaturityLiquidation`, `ERG_SigUSD_Liquidation`: when a bond may be liquidated |
-| `policies/` | `ERG_SigUSD_CollateralPolicy`, two-point yield pricing and collateral guards: risk and price policies |
+| `policies/` | `ERG_SigUSD_CollateralPolicy`, two-point yield and window-curve pricing, and collateral guards: risk and price policies |
 
 How it works, in brief:
 
@@ -30,7 +33,8 @@ How it works, in brief:
 - Each market (ERG, SigUSD, ...) has one address per contract, and all markets share one template
   hash, so the Ergo indexed node lists them directly.
 - Nobody has to come back online: mints, pulls, liquidations and expiry refunds are run by anyone for
-  a fee the user committed when posting.
+  a fee the user committed when posting, and anyone refreshes a bond or vault older than two years for
+  a 0.01 ERG bounty, before storage rent could take it.
 
 ## First generation (`contracts/old/`)
 
@@ -74,12 +78,19 @@ sbt "runMain ksingh.sigmabonds.app.SigmaFiCli help"
   principal at a simple yield, moving in a straight line to `--end-yield` by the order's expiry, while
   keeping repayment fixed (both fixed and on-close maturity); an oracle order
   carries a fill guard that its contract enforces, at `--ratio` or `--fill-ratio`, unless
-  `--no-fill-guard`), `cancel-order`, `repay [--from-collateral]`, `recollateralize`
-- Lender: `fill-order [--fee-reserve <ERG>]` (CLI minimum and default 0.05 ERG), `claim`. A fill or
-  purchase that would leave a bond under its own oracle ratio is refused unless `--allow-liquidatable`
+  `--no-fill-guard`; `--window <min>:<max> --yield <cap> [--curve ...]` makes a window order, whose
+  lender picks the maturity and pays the principal the borrower's curve prices there),
+  `cancel-order`, `repay [--from-collateral]`, `recollateralize`
+- Lender: `fill-order [--fee-reserve <ERG>] [--maturity <height>]` (CLI minimum and default 0.05 ERG;
+  a window order's maturity defaults to the earliest grid height in it), `claim`. A fill or purchase
+  that would leave a bond under its own oracle ratio is refused unless `--allow-liquidatable`
 - Anyone: `liquidate`, which keeps the bonds' fee reserves, `refund-order`, which returns an expired
-  order to its borrower for its expiry fee, and `pack`, which refunds expired orders, offers, asks and
-  lots and liquidates bonds in one transaction with one miner fee
+  order to its borrower for its expiry fee, `refresh`, which re-creates bonds and vaults more than two
+  years old for up to 0.01 ERG each, and `pack`, which refunds expired orders, offers, asks and lots,
+  liquidates bonds and refreshes old ones in one transaction with one miner fee
+- Wraps: `wraps`, `wrap <token id>` (a capability token, such as a LithosDex position's owner NFT, goes
+  into a vault for a receipt; put the receipt, never the raw token, into orders and asks), `mint-wrap`
+  (anyone, for the mint fee), `cancel-wrap`, `unwrap`
 - Shares: `shares`, `fractionalize` (Selective by default: a liquidated bond's collateral is auctioned
   only if some item is too thin to split, under 100 raw units; `--vault dutch` always auctions; the
   auction's `--auction-opening` and `--auction-floor` are yours to set, and it holds at the floor until
@@ -97,7 +108,7 @@ sbt "runMain ksingh.sigmabonds.app.SigmaFiCli help"
   `match-offer --order | --ask`, which anyone runs for the offer's batcher fee. An offer's policy buys
   only bonds with the oracle liquidation rule, since it measures their collateral at the oracle price,
   and buys shares only from Selective or Dutch vaults.
-- `batch` lists every mint, pull, expiry refund, liquidation and offer match that pays its runner, and
+- `batch` lists every mint, pull, expiry refund, liquidation, refresh and offer match that pays its runner, and
   any box it passes over because it does not disclose a script it names; `batch --run` does the work
   in rounds, packing refunds and liquidations, matching each offer to its best-yield source, and
   scanning again with mempool lookups so fills chain through an offer's continuation. `--send` submits.
@@ -106,8 +117,10 @@ Pricing formulas, register layouts, fees, block inclusion and examples are in
 [docs/ZC_STANDARD_PRICING.md](./docs/ZC_STANDARD_PRICING.md). Pricing is fixed or yield: NAV pricing
 and price margins were removed on 2026-11-16. `PricedAsk` is the generic name of the former `NavAsk`:
 renaming it does not change its tree. `PricedOrder` is an additional issuing type; fixed `Order` and
-`SaleOrder` remain. The bond and settlement scripts are unchanged. Lend offers accept both issuing
-types; existing offer boxes keep their original scripts.
+`SaleOrder` remain. Lend offers accept both issuing types; existing offer boxes keep their original
+scripts. On 2026-11-16 the bond and its vaults gained the paid refresh, `PricedOrder` the window mode,
+and the Dutch vault an excess auction for thin items when the floor is already held, so every pinned
+hash downstream of them changed.
 
 Every transaction follows the zcs1 off-chain rules in
 [docs/ZC_STANDARD_OFFCHAIN.md](./docs/ZC_STANDARD_OFFCHAIN.md). It discloses each script its boxes name
@@ -159,7 +172,9 @@ step.
 
 The pricing paths include fixed-maturity and on-close yield orders, rising and falling, a curve lend
 offer, yield-priced unit resale, partial share sales at a rising yield and guarded yield-priced Dutch
-shares; track L sells lots. Priced-fill checks compare the actual borrower payment (less the expiry
+shares; track L sells lots; track W wraps a test token, mints and unwraps its receipt, cancels a second
+wrap, and shows a refresh refused as too early (a refresh opens after two years, and window orders and
+Dutch excess auctions are covered offline only). Priced-fill checks compare the actual borrower payment (less the expiry
 refund) with the bond's recorded principal; ask checks verify the committed yield points. Each check
 reads the step's own historical outputs even after later steps spend them. The loans last tens of
 blocks, so the yields that leave room for batcher fees run to thousands of percent.

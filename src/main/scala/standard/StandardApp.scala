@@ -23,6 +23,11 @@ sealed trait OrderPrice
  * a rising or falling order. `endBps` defaults to `startBps` (one fixed yield), `endHeight` to the order's expiry.
  */
 case class YieldOrderPrice(startBps: Long, endBps: Option[Long] = None, endHeight: Option[Long] = None) extends OrderPrice
+/**
+ * A window order's curve: the most simple yield the borrower pays at each number of blocks to maturity, `maxBps`
+ * at most and with no points everywhere. The lender picks the maturity and pays the principal the curve prices there.
+ */
+case class CurveOrderPrice(maxBps: Long, points: Seq[(Long, Long)] = Seq.empty) extends OrderPrice
 
 /**
  * A borrower's terms for a standard order. A standard loan is lent and repaid in one asset, the market's:
@@ -43,7 +48,7 @@ case class StdLoan(market: Market, principal: Long, repayment: Long, collateralE
 class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, out: String => Unit = println,
                   val protocol: StandardProtocol = new StandardProtocol(), scripts: ScriptBook = new ScriptBook)
   extends AppBase(ctx, node, settings, out, scripts)
-    with StandardShares with StandardAsks with StandardOffers with StandardBatch {
+    with StandardShares with StandardAsks with StandardOffers with StandardBatch with StandardWraps {
 
   import StandardProtocol._
 
@@ -158,14 +163,50 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
     ErgoValue.of(sigma.Colls.fromArray(items.map(i => sigma.Colls.fromArray(i)).toArray)(sigma.collRType(sigma.ByteType)),
       org.ergoplatform.appkit.ErgoType.collType(org.ergoplatform.appkit.scalaapi.scalaByteType))
 
+  /**
+   * The maturity a fill at `start` gives the bond: the fixed height, the start plus an on-close duration, or for a
+   * window order `chosen` (by default zcs1's choice), which must lie in the window.
+   */
+  def orderMaturity(order: StdOrder, start: Long, chosen: Option[Long] = None): Long =
+    if (order.window) {
+      val (lo, hi) = protocol.orderWindow(order).getOrElse(fail("the window order has no maximum duration in R9(0)"))
+      val m = chosen.getOrElse(defaultWindowMaturity(order, start))
+      if (m - start < lo || m - start > hi)
+        fail(s"maturity $m is outside the order's window: $lo to $hi blocks after a fill at $start, so heights " +
+          s"${start + lo} to ${start + hi}")
+      m
+    } else {
+      val fixed = if (order.onClose) addAmount(start, order.terms(3)) else order.terms(3)
+      chosen.filter(_ != fixed).foreach(m => fail(s"only a window order lets the lender choose its maturity; this one matures at $fixed, not $m"))
+      fixed
+    }
+
+  /**
+   * zcs1's maturity for a window order when the lender names none: the earliest grid height (a multiple of 21,600)
+   * in the window, so bonds gather on series maturities, else the window's shortest maturity.
+   */
+  def defaultWindowMaturity(order: StdOrder, start: Long): Long = {
+    val (lo, hi) = protocol.orderWindow(order).getOrElse(fail("the window order has no maximum duration in R9(0)"))
+    windowGrid(start + lo, start + hi).headOption.getOrElse(start + lo)
+  }
+
+  /** The grid heights from `from` to `to`, inclusive. */
+  private[standard] def windowGrid(from: Long, to: Long): Seq[Long] = {
+    val first = Math.floorDiv(from + MaturityGrid - 1L, MaturityGrid) * MaturityGrid
+    Iterator.iterate(first)(_ + MaturityGrid).takeWhile(_ <= to).take(64).toSeq
+  }
+
   /** Minimum principal at an inclusion height, without fees or the refunded expiry fee. */
-  def orderPrincipal(order: StdOrder, at: Long, start: Long): Long = {
+  def orderPrincipal(order: StdOrder, at: Long, start: Long, chosen: Option[Long] = None): Long = {
     if (!order.priced) return order.principal
     protocol.orderPricingOf(order) // Refuse unknown policies rather than applying an unrelated formula.
-    val maturity = if (order.onClose) addAmount(start, order.terms(3)) else order.terms(3)
-    val line = protocol.orderYieldLine(order).filter(_.valid).getOrElse(fail("invalid yield pricing terms"))
+    val maturity = orderMaturity(order, start, chosen)
     if (maturity <= at) fail("no blocks left to maturity")
-    val result = line.price(order.repayment, 1L, 1L, maturity - at, at).max(BigInt(order.principal))
+    val price = if (protocol.curveOrder(order))
+      protocol.orderBorrowCurve(order).filter(_.valid).getOrElse(fail("invalid curve pricing terms")).price(order.repayment, maturity - at)
+    else protocol.orderYieldLine(order).filter(_.valid).getOrElse(fail("invalid yield pricing terms"))
+      .price(order.repayment, 1L, 1L, maturity - at, at)
+    val result = price.max(BigInt(order.principal))
     if (result <= 0 || !result.isValidLong) fail("the priced principal is outside the supported amount range")
     result.toLong
   }
@@ -177,8 +218,8 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
   private[standard] val QuoteBlocks: Long = 3L
 
   /** Quote a few blocks ahead; store exactly what is actually paid in the standard bond. */
-  private[standard] def resolveOrder(order: StdOrder, start: Long): StdOrder = {
-    val amount = (0L to QuoteBlocks).map(d => orderPrincipal(order, height.toLong + d, start)).max
+  private[standard] def resolveOrder(order: StdOrder, start: Long, chosen: Option[Long] = None): StdOrder = {
+    val amount = (0L to QuoteBlocks).map(d => orderPrincipal(order, height.toLong + d, start, chosen)).max
     if (!order.priced) order
     else order.market.token match {
       case None => order.copy(terms = order.terms.updated(1, amount))
@@ -205,6 +246,17 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
       case OnClose(d) =>
         if (d < 30L) fail("an on-close order's duration must be at least 30 blocks")
         (d, 1L)
+      case MaturityWindow(lo, hi) =>
+        if (lo < 30L) fail("a window's minimum duration must be at least 30 blocks")
+        if (hi < lo) fail(s"the window's maximum $hi is under its minimum $lo")
+        if (!loan.price.exists(_.isInstanceOf[CurveOrderPrice]))
+          fail("a window order is priced by a yield curve: give --yield <the most you pay> and optionally --curve")
+        (lo, 2L)
+    }
+    loan.price.foreach {
+      case _: CurveOrderPrice if !loan.schedule.isInstanceOf[MaturityWindow] =>
+        fail("--curve on an order needs --window: a fixed or on-close order has one maturity, so one yield prices it")
+      case _ =>
     }
     val (rule, payload) = loan.rule match {
       case MaturityChoice =>
@@ -233,7 +285,7 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
         if (h - lastFill >= (h - height.toLong) / 2L) Seq.empty
         else Seq(s"WARNING: a fill at height $lastFill leaves only ${h - lastFill} blocks to repay; from maturity on " +
           "anyone may liquidate the bond, sending all the collateral to the lender. An earlier --expires-in leaves more")
-      case OnClose(_) => Seq.empty
+      case OnClose(_) | MaturityWindow(_, _) => Seq.empty
     }
     // One asset: an ERG loan's floor never binds; a token loan carries only box minimums beside its token.
     val (principalErg, floor, principalTokens) = m.token match {
@@ -242,13 +294,24 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
     }
     val terms = Seq(loan.repayment, principalErg, floor, maturityTerm, loan.expiry, loan.expiryFee, mode) ++ payload
     val c = protocol.market(m)
-    val line = loan.price.map { case YieldOrderPrice(startBps, endBps, endHeight) =>
+    val line = loan.price.collect { case YieldOrderPrice(startBps, endBps, endHeight) =>
+      if (loan.schedule.isInstanceOf[MaturityWindow]) fail("a window order is priced by a curve, not a moving yield")
       val l = YieldLine(height.toLong, startBps, endHeight.getOrElse(loan.expiry), endBps.getOrElse(startBps))
       if (l.startBps < 0L || l.endBps < 0L) fail("the yield cannot be negative")
       if (l.end <= l.start) fail(s"the yield's end height ${l.end} is not above the current height $height")
       l
     }
-    val pricing = line.map(l => c.yieldOrderPricing -> l.terms)
+    val borrowCurve = loan.price.collect { case CurveOrderPrice(maxBps, points) =>
+      val curve = BorrowCurve(maxBps, points)
+      if (points.size > MaxCurvePoints) fail(s"a yield curve has at most $MaxCurvePoints points")
+      if (maxBps < 0L || points.exists { case (y, d) => y < 0L || d < 1L })
+        fail("curve yields cannot be negative, and maturities are at least 1 block")
+      if (!curve.ordered) fail("the curve's maturities must strictly increase from point to point")
+      curve
+    }
+    val windowMax = loan.schedule match { case MaturityWindow(_, hi) => Seq(hi); case _ => Seq.empty[Long] }
+    val pricing = line.map(l => c.yieldOrderPricing -> l.terms).orElse(borrowCurve.map(cv =>
+      c.curveOrderPricing -> (windowMax ++ Seq(cv.maxBps) ++ cv.points.flatMap { case (y, d) => Seq(y, d) })))
     val coreRegs = Seq(longsValue(terms: _*), tokensValue(principalTokens), bytesValue(hashOf(myTree)), bytesValue(rule.hashedValueBytes))
     val extraRegs = pricing.fold(loan.fillRatio.map(_ => bytesValue(c.fillGuard.hashedValueBytes)).toSeq) { case (expression, data) =>
       Seq(byteArraysValue(Seq(expression.hashedValueBytes,
@@ -266,6 +329,8 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
           loan.requestedMaturity.filter(_ != h).fold("")(r => s", the zcs1 grid height nearest the $r asked for " +
             "(--exact-maturity keeps an exact height)")
         case OnClose(d) => s"maturity: $d blocks after a lender fills it"
+        case MaturityWindow(lo, hi) => s"maturity: the lender's choice, $lo to $hi blocks after it fills the order " +
+          "(zcs1 batchers prefer grid heights, multiples of 21,600)"
       },
       "liquidation: " + (loan.rule match {
         case MaturityChoice => "from maturity on, all collateral to the lender"
@@ -281,6 +346,13 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
           s"${Units.percent(l.endBps)} at height ${l.end}"
       s"PricedOrder: principal at $rate, never under the principal floor; fees excluded, so quote a little above " +
         "a lend offer's yield to leave room for its batcher fee"
+    } ++ borrowCurve.toSeq.flatMap { cv =>
+      val (lo, hi) = loan.schedule match { case MaturityWindow(a, b) => (a, b); case _ => (0L, 0L) }
+      def quote(d: Long): String = Units.amount(cv.price(loan.repayment, d).max(BigInt(loan.principal)).toLong, m)
+      Seq(s"PricedOrder with CurveOrder_Pricing: you pay at most ${cv.describe} (simple yield per 262800 blocks), " +
+        "never under the principal floor; fees excluded",
+        s"principal you receive: ${quote(lo)} at the shortest maturity ($lo blocks), ${quote(hi)} at the longest ($hi blocks); " +
+          s"you repay ${Units.amount(loan.repayment, m)} either way")
     }
     prepare("Create order", plan(Seq.empty, Seq(order)), notes ++ priceNotes)
   }
@@ -390,11 +462,12 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
    * metadata, and 2 locked in the bond at OUTPUTS(1). The principal and the unused expiry fee go to the
    * borrower at OUTPUTS(2). This wallet funds the principal and the lender's liquidation fee reserve.
    */
-  def fillOrder(orderId: String, feeReserve: Long, allowLiquidatable: Boolean = false): Prepared = {
+  def fillOrder(orderId: String, feeReserve: Long, allowLiquidatable: Boolean = false,
+                chosenMaturity: Option[Long] = None): Prepared = {
     if (feeReserve < 0L) fail("the fee reserve cannot be negative")
     val original = protocol.asOrder(unspent(orderId)).getOrElse(fail(s"$orderId is not a ZC Standard order"))
     checkOrder(original)
-    val order = resolveOrder(original, height.toLong)
+    val order = resolveOrder(original, height.toLong, chosenMaturity)
     val m = order.market
     val rule = protocol.ruleOf(order.liqHash)
       .getOrElse(fail("the order names a liquidation expression this client does not know"))
@@ -405,7 +478,7 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
       case _ =>
     }
     val start = height.toLong
-    val maturity = if (order.onClose) addAmount(start, order.terms(3)) else order.terms(3)
+    val maturity = orderMaturity(order, start, chosenMaturity)
     val prospect = prospective(order, start, maturity, feeReserve)
     // A guarded order's contract reads the confirmed oracle as a data input; refuse here what it would refuse.
     val guardOracle = if (order.guardHash.isEmpty) None else Try(oracle()).toOption.flatten.map(readableOracle)
@@ -426,13 +499,17 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
     val principal = UTXO(Contract(borrower), addAmount(order.expiryFee, order.principalErg), order.principalTokens,
       Seq(bytesValue(order.box.id.getBytes)))
 
+    val windowNote = protocol.orderWindow(order).toSeq.map { case (lo, hi) =>
+      s"window order: you chose maturity $maturity (${maturity - start} blocks) from ${start + lo} to ${start + hi}" +
+        (if (chosenMaturity.isEmpty) "; zcs1's default, the earliest grid height in it, else its shortest (--maturity <height> picks another)" else "")
+    }
     val notes = Seq(
       s"lend: ${Units.amount(order.principal, m)}; repaid ${Units.amount(order.repayment, m)} by height $maturity " +
         s"(${maturity - height} blocks)",
       s"collateral: ${Fmt.contents(order.collateralErg, order.collateral)}; liquidation: ${describeRule(rule, order.payload)}",
       s"You also fund a ${Fmt.erg(feeReserve)} liquidation fee reserve: it pays whoever liquidates, and goes to " +
         "the vault on repayment.",
-      s"Your bond asset is $asset. Claim the bond's payout with `claim $asset`.") ++ coverNotes
+      s"Your bond asset is $asset. Claim the bond's payout with `claim $asset`.") ++ windowNote ++ coverNotes
     prepare(s"Fill order $orderId", plan(Seq(orderInput(order)), Seq(unit, bond, principal), minted = Some(asset),
       dataInputs = guardOracle.map(_.box).toSeq), notes)
   }
@@ -444,6 +521,14 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
 
   /** The fill's own checks, so a lender learns why before the node refuses. */
   private[standard] def checkOrder(o: StdOrder): Unit = {
+    if (o.window) {
+      if (!o.priced || !protocol.curveOrder(o))
+        fail("the window order is not priced by CurveOrder_Pricing, the one expression that prices every maturity in " +
+          "a window, so this client does not fill it")
+      val (lo, hi) = protocol.orderWindow(o).getOrElse(fail("the window order has no maximum duration"))
+      if (lo < 30L || hi < lo) fail(s"the window order's window, $lo to $hi blocks, is malformed: no fill can pass it")
+    } else if (o.priced && protocol.curveOrder(o) && o.pricingTerms.isEmpty)
+      fail("the curve order has no pricing terms")
     if (o.priced) {
       val policies = bytesListReg(o.box, 8).getOrElse(Seq.empty)
       if (policies.size != 2 || policies.head.length != 32 ||
@@ -457,11 +542,12 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
     }
     if (!oneAsset) fail(s"the order does not lend and repay in ${o.market} alone, so it cannot be filled")
     if (o.repayment <= 0L || o.ergFloor <= 0L || o.principalErg < 0L) fail("the order has invalid amounts")
-    if (o.terms(6) != 0L && o.terms(6) != 1L) fail("the order has an unknown maturity mode")
+    if (o.terms(6) != 0L && o.terms(6) != 1L && !(o.terms(6) == 2L && o.priced))
+      fail("the order has an unknown maturity mode")
     if (o.expiryFee < MinBatchingFee || o.expiryFee > o.box.value - MinBox) fail("the order's expiry fee is out of bounds")
     if (height.toLong + 1L >= o.expiry) fail(s"the order expired at height ${o.expiry}")
     if (o.onClose && o.terms(3) < 30L) fail("the order's duration is under the 30-block minimum")
-    if (!o.onClose && o.terms(3) <= height.toLong + 2L) fail(s"the order matures at ${o.terms(3)}, too close to fill")
+    if (o.terms(6) == 0L && o.terms(3) <= height.toLong + 2L) fail(s"the order matures at ${o.terms(3)}, too close to fill")
   }
 
   /** Every vault box holding the asset's reserve, claimed at once with the unit; all of the asset is burned. */
@@ -488,7 +574,7 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
     val bond = liveBond(bondId)
     val m = bond.market
     if (height.toLong + 1L >= bond.maturity) fail(s"the bond matures at height ${bond.maturity}: repayment is closed")
-    val borrower = borrowerTree(bond.borrowerHash, bond.box)
+    val borrower = bondBorrowerTree(bond)
 
     val tag = Seq(bytesValue(bond.box.id.getBytes), ErgoValue.of(0.toByte))
     val settlement = m.token match {
@@ -578,6 +664,20 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
     protocol.asBond(unspent(bondId)).getOrElse(fail(s"$bondId is not a live ZC Standard bond"))
 
   private[standard] def borrowerTree(hash: Array[Byte], box: InputUTXO): ErgoTree = scriptOf(hash, box, "borrower")
+
+  /**
+   * A bond's borrower script: disclosed by the transaction that made the bond box (zcs1), or else found in the fill
+   * that minted the bond asset, which paid the principal to it. A paid refresh is open to anyone, zcs1 client or not,
+   * so a refreshed bond's own creating transaction may disclose nothing; the fill always can.
+   */
+  private[standard] def bondBorrowerTree(b: StdBond): ErgoTree =
+    treeFor(b.borrowerHash, b.box, Seq.empty).orElse {
+      val fill = node.boxById(b.asset.toString).flatMap(NodeJson.spentBy).flatMap(node.transactionById)
+      val found = fill.toSeq.flatMap(NodeJson.transactionTrees).find(t => hashOf(t).sameElements(b.borrowerHash))
+      found.foreach(scripts.add)
+      found
+    }.getOrElse(fail(s"cannot find bond ${b.box.id}'s borrower script: neither the box's creating transaction nor " +
+      s"the fill that minted ${b.asset} carries it"))
 
   private[standard] def ownerTree(hash: Array[Byte], box: InputUTXO, who: String): ErgoTree = scriptOf(hash, box, who)
 

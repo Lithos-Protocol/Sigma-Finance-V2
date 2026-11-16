@@ -207,3 +207,37 @@ refund, cancel, own-currency refusal; curve midpoints, uneven segments, flat end
 ordering and the 20-point limit), which were not committed.
 
 On 2026-11-16 all 488 tests across 26 suites passed. No live-node transactions were broadcast.
+
+## Refresh, window orders, wraps and excess auctions (2026-11-16)
+
+New suites:
+
+- `ZcStandardRefreshSpec`: the paid refresh on the bond (age boundary, the 0.01 ERG bounty and the
+  reserve-plus-0.001 floor, every register, token and the script kept, the 60-to-999-block stamp, no
+  refresh in the 720 blocks before maturity and again from it), and what a refreshed bond still does
+  (recollateralize in the same block, repay, liquidate into a vault naming the refreshed box, be
+  claimed). Bond vaults, fractional vaults (holding: the pull fee kept; pulled: the path byte kept)
+  and Dutch vaults (every register; a refresh midway through an excess auction leaves its price).
+- `ZcStandardWrapSpec`: the receipt mint (3 units, metadata, a bare vault, the request as the only
+  input, the fee floor), a stand-in for LithosDex's "owner NFT in any input" rule that is spent beside
+  the raw token and never beside the vault or a bond holding the receipt, unwrap by burning all three,
+  cancel, and the wrap vault's refresh, alone.
+- `ZcStandardLotAuctionSpec`: the lot auction's falling price to one raw unit before, during and after
+  the fall in both currencies, the payout's seller and tag, own-currency lots refused, term bounds,
+  buys stopping at expiry, tagged refunds, cancels.
+- `StandardWindowRefreshWrapAppSpec`: the CLI and app for window orders (options, the default grid
+  maturity, a chosen maturity, refusals, a batch match at zcs1's maturity), refreshes (a copy of a bond
+  whose borrower is found through its fill, the 60-back stamp, disclosure, a third party's repayment
+  after it, the maturity gap, packed vaults, a wrap vault alone), wraps and Dutch excess auctions.
+  Refresh properties run the app 600,000 blocks after the mocked height; `prepare` adds a preheader when
+  an app's height differs from its context's.
+
+Additions to existing suites: the lend offer's curve (segments exact, breakpoints, flat ends, the
+R5(0) floor, ordering, 20 points, odd payloads) and its purchase of a refreshed bond's unit; window
+orders in `ZcStandardPricedOrderSpec`; the Dutch excess auction (state 4 at the pull, its price to one
+raw unit, no sale at zero, claims at the end of the fall) and the Dutch mint reading a refreshed bond,
+live and settled, in `ZcStandardDutchAuctionSpec`; the wrap and curve-order cross-hashes in
+`ZcStandardProbeSpec`. The throwaway LotAuction and curve probes are replaced by these.
+
+On 2026-11-16 all 521 tests across 30 suites passed. Costs from `SIGMAFI_COST` are in SigmaBonds.MD,
+"Cost and size". No live-node transactions were broadcast.

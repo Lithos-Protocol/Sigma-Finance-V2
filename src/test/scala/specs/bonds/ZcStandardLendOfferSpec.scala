@@ -114,6 +114,42 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
     }
   }
 
+  property("curve: a segment's yield is exact, the ends are flat, and R5(0) is a floor under every point") {
+    withCtx { ctx =>
+      val f = flow(ctx, ErgBond)
+      val d = f.maturity - f.height
+      val y = maxYield(f.data(0), priceOf(f) + batchingFee, d)
+      def fills(t: Terms): Unit = accepts(executor(ctx), newBondTx(f, offerBox(ctx, ErgBond, t)))
+      def refuses(t: Terms): Unit = rejectsAtSigning(executor(ctx), newBondTx(f, offerBox(ctx, ErgBond, t),
+        extra = Seq(funding(ctx, executor(ctx), 9))))
+      // One point is flat everywhere; on a segment the bond sits at its midpoint, exactly y; one bps more refuses.
+      fills(Terms(curve = Seq(y -> 1L)))
+      refuses(Terms(curve = Seq((y + 1L) -> 1L)))
+      fills(Terms(curve = Seq((y - 100L) -> (d - 100L), (y + 100L) -> (d + 100L))))
+      refuses(Terms(curve = Seq((y - 99L) -> (d - 100L), (y + 101L) -> (d + 100L))))
+      // At a breakpoint exactly, that point's yield.
+      fills(Terms(curve = Seq(0L -> (d - 10L), y -> d, (y + 9000L) -> (d + 10L))))
+      refuses(Terms(curve = Seq(0L -> (d - 10L), (y + 1L) -> d, (y + 9000L) -> (d + 10L))))
+      // Below the first point, the first point's yield; above the last, the last's.
+      fills(Terms(curve = Seq(y -> (d + 400L), (y + 9000L) -> (d + 500L))))
+      refuses(Terms(curve = Seq((y + 1L) -> (d + 400L), 0L -> (d + 500L))))
+      fills(Terms(curve = Seq((y + 9000L) -> (d - 500L), y -> (d - 400L))))
+      refuses(Terms(curve = Seq(0L -> (d - 500L), (y + 1L) -> (d - 400L))))
+      // R5(0) is a hard floor: a low curve cannot undercut it.
+      fills(Terms(yieldBps = y, curve = Seq(0L -> 1L)))
+      refuses(Terms(yieldBps = y + 1L, curve = Seq(0L -> 1L, 0L -> (d + 100L))))
+      // Points must strictly increase in blocks left; up to 20 points, in pairs.
+      refuses(Terms(curve = Seq(y -> (d + 100L), y -> (d - 100L))))
+      refuses(Terms(curve = Seq(y -> d, y -> d)))
+      val twenty = (1 to 20).map(i => y -> (i.toLong * 100L))
+      fills(Terms(curve = twenty))
+      refuses(Terms(curve = twenty :+ (y -> 2100L)))
+      val odd = offerBox(ctx, ErgBond, Terms(curve = Seq(y -> 1L)))
+      rejectsAtSigning(executor(ctx), newBondTx(f, odd.withRegNum(5, longsValue(termsOf(odd) :+ 5L: _*)),
+        extra = Seq(funding(ctx, executor(ctx), 9))))
+    }
+  }
+
   property("new bond: maturity window, minimum fill, exact reserve and the order's own checks") {
     withCtx { ctx =>
       val f = flow(ctx, ErgBond)
@@ -314,6 +350,23 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
         val y = maxYield(l.f.data(0), cost, l.blocks)
         accepts(executor(ctx), buyTx(l, offerBox(ctx, kind, Terms(yieldBps = y)), ask, 1L, price))
         rejectsAtSigning(executor(ctx), buyTx(l, offerBox(ctx, kind, Terms(yieldBps = y + 1L)), ask, 1L, price))
+      }
+    }
+  }
+
+  property("existing bond: a refreshed bond is still its asset's state box, so an offer buys its unit as before") {
+    withCtx { ctx =>
+      for (kind <- kinds) {
+        val f = flow(ctx, kind, fixedMaturity = ctx.getHeight.toLong + 700000L)
+        val fill = accepts(f.holder, standardFillTx(f))
+        val bond = spendOutput(fill, 1)
+        val at = f.height + 525601
+        val refreshed = spendOutput(accepts(executor(ctx), buildAt(ctx, at, Seq(bond.withCtxVar(9.toByte, ErgoValue.of(0))),
+          Seq(bond.toUTXO.subValue(10000000L).setCreationHeight(at - 60)), executor(ctx).getAddress)), 0)
+        val l = Live(f, refreshed, at + 5, fill)
+        val price = unitPrice(kind)
+        val ask = saleBox(ctx, kind, f.asset, 1L, price).withRegNum(5, longsValue(price, 1L, 1L, at + 1000L))
+        accepts(executor(ctx), buyTx(l, offerBox(ctx, kind, Terms(expiry = at + 1000L, maxBlocks = 1000000L)), ask, 1L, price))
       }
     }
   }

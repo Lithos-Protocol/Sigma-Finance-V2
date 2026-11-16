@@ -13,8 +13,10 @@
     // The shell additionally enforces the borrower's fixed principal floor and actual payment record.
     // Uses remaining blocks, not calendar time, market rates or compounding. Fees are not included:
     // a borrower quotes a little above a lend offer's yield to leave room for its batcher fee.
+    // Fixed and on-close maturity only. A window order (mode 2) is refused: the shell would read this
+    // payload's start height as the window's maximum duration. Window orders use CurveOrder_Pricing.
     val payload = SELF.R9[Coll[Long]].get
-    if (payload.size != 4) {
+    if (payload.size != 4 || SELF.R4[Coll[Long]].get(6) == 2L) {
         sigmaProp(false)
     } else {
         val bond = OUTPUTS(1)

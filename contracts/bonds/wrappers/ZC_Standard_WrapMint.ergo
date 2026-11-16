@@ -1,0 +1,107 @@
+{
+    // Standard custody wrap request.
+    // Wraps a capability token: one whose mere presence among a transaction's inputs grants authority
+    // somewhere else, such as a LithosDex provision's owner NFT (LD_Provision authorizes Claim and
+    // Resize by "owner NFT in any input"). A batcher mints a receipt and moves the token into a
+    // ZC_Standard_WrapVault, which releases it only to whoever burns the receipt. From then on the
+    // token is never an input except in its unwrap, so a contract that lets third parties spend a box
+    // holding the RECEIPT (an order fill, a liquidation, a vault pull or claim, an ask or lot refund)
+    // lends them no authority. Put the receipt, never the raw token, into those contracts.
+    // The owner is never assumed to be online after creating this box: any batcher runs the mint for
+    // the mint fee.
+    //
+    // CONSTANTS
+    // CONST_WRAP_VAULT_HASH: Coll[Byte] - blake2b256 of ZC_Standard_WrapVault
+    //
+    // TOKENS
+    // tokens(0): (wrapped token, amount) - the only token allowed. Any amount, usually 1 (an NFT).
+    //
+    // REGISTERS
+    // R4: Coll[Byte] - 32-byte owner script hash: receives the receipt, may cancel
+    // R5: Long - mint batching fee, >= 2000000 nanoERG, paid to whoever runs the mint
+    // R6: Coll[Coll[Byte]] - the receipt's EIP-4 (name, description, decimals), exactly 3 items.
+    //   The owner's choice, fixed here so the minter cannot pick it.
+    //
+    // MINT (anyone; no context vars)
+    // This box is the transaction's ONLY input. It holds the wrapped token, so any other input could
+    // be a box the token has authority over (a LithosDex provision), spent in the same transaction.
+    // That also means this box pays for everything: the vault, the receipt output and the mint fee.
+    // INPUTS(0) = SELF: the receipt id is this box's id. Exactly 3 receipts are minted.
+    // OUTPUTS(0): (receipt, 1) at tokens(0), at the owner script, at least 1000000 nanoERG,
+    //   R4, R5, R6 = the three items of R6.
+    // OUTPUTS(1): ZC_Standard_WrapVault with tokens exactly ((receipt, 2), the wrapped token and
+    //   amount), at least 1000000 nanoERG, and no registers. The two outputs together receive at
+    //   least SELF.value minus the mint fee. Value above 1000000 in the vault pays its refreshes
+    //   (0.01 ERG each, about every two years), so a long-lived wrap should be funded for them.
+    //
+    // CANCEL
+    // Nothing is minted, and a co-spent box guarded by the owner script releases this box. Only the
+    // owner can build that transaction, so whatever else it spends is the owner's own doing. An owner
+    // script that third parties can spend would expose the token while it waits here.
+    //
+    // VERIFYING A RECEIPT
+    // Receipt id Y is genuine iff the box with id Y was spent under this exact script and constant
+    // (supply the serialized box and check it hashes to Y, as ZC_Standard_LendOffer does for bonds).
+    // The script then guarantees supply 3 with 2 locked in the vault, so "the box holding 2 units of
+    // Y under ZC_Standard_WrapVault" is the wrap's state box: usable as a data input, and its
+    // tokens(1) is the wrapped token and amount. This script does not check what that token is or
+    // that it carries any authority: whoever values a receipt reads the token behind it. For a
+    // LithosDex position that is the provision box naming the NFT in its R6, under the provision
+    // guard of a pool the reader accepts, and that pool's box.
+
+    def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
+        OUTPUTS.fold(0L, { (a: Long, b: Box) =>
+            val count = b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                if (t._1 == tokenId) z + t._2 else z
+            })
+            a + count
+        })
+    }
+
+    val ownerHash = SELF.R4[Coll[Byte]].get
+    val minted = numTokenInOutputs(SELF.id)
+
+    if (minted > 0L) {
+        val mintFee = SELF.R5[Long].get
+        val metadata = SELF.R6[Coll[Coll[Byte]]].get
+        if (metadata.size != 3 || OUTPUTS.size < 2 || SELF.tokens.size != 1) {
+            sigmaProp(false)
+        } else {
+            val receiptOut = OUTPUTS(0)
+            val vault = OUTPUTS(1)
+            val wrapped = SELF.tokens(0)
+
+            val termsValid =
+                ownerHash.size == 32 &&
+                mintFee >= 2000000L && mintFee <= SELF.value
+
+            val mintValid =
+                INPUTS.size == 1 &&
+                SELF.id == INPUTS(0).id &&
+                minted == 3L
+
+            val receiptPaid =
+                blake2b256(receiptOut.propositionBytes) == ownerHash &&
+                receiptOut.value >= 1000000L &&
+                receiptOut.tokens.size > 0 &&
+                receiptOut.tokens(0)._1 == SELF.id && receiptOut.tokens(0)._2 == 1L &&
+                receiptOut.R4[Coll[Byte]].get == metadata(0) &&
+                receiptOut.R5[Coll[Byte]].get == metadata(1) &&
+                receiptOut.R6[Coll[Byte]].get == metadata(2)
+
+            val vaultValid =
+                blake2b256(vault.propositionBytes) == CONST_WRAP_VAULT_HASH &&
+                vault.value >= 1000000L &&
+                vault.value + receiptOut.value >= SELF.value - mintFee &&
+                vault.tokens == Coll((SELF.id, 2L), wrapped) &&
+                vault.R4[Coll[Byte]].isDefined == false
+
+            sigmaProp(termsValid && mintValid && receiptPaid && vaultValid)
+        }
+    } else {
+        val ownerAuth = INPUTS.exists { (b: Box) =>
+            b.id != SELF.id && blake2b256(b.propositionBytes) == ownerHash
+        }
+        sigmaProp(ownerAuth)
+    }
+}

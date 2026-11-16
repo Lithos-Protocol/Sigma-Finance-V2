@@ -32,6 +32,14 @@
     //   Every outstanding share AND the reserve are burned; the payout takes everything. Before
     //   the pull this returns the bond unit itself: holding all shares un-fractionalizes the bond.
     // Payout outputs carry R4 = SELF.id, so one output cannot serve two vaults.
+    // REFRESH (context var 9 present; anyone, once the box is more than 525600 blocks, about two
+    //   years, old). Var 9: Int successor index. Storage rent lets anyone take a four-year-old box
+    //   whose value does not cover the rent, tokens included, which would free the share reserve and
+    //   the bond unit. So anyone may re-create the box unchanged to reset its age, keeping up to
+    //   10000000 nanoERG (0.01 ERG) as a bounty. It never takes the value below 1000000, plus the pull
+    //   fee while the bond unit is still held; a box at or under that is renewed for nothing. The
+    //   successor has this script, the same tokens and registers and no more, and a creation height
+    //   within 1000 blocks of HEIGHT. The window and bounty match ZC_Standard_Bond's refresh.
     //
     // ASSUMPTIONS AND LIMITS
     // - N is free and unrelated to the proceeds' raw units, so a small claim can round to zero for
@@ -43,7 +51,8 @@
     //   is fixed before the share id exists. A liquidation expression that injects it is unsupported.
     // - Shares lost or burned outside these paths strand their entitlement. No sweep authority.
     // - A hand-made box with this script cannot hold a genuine reserve; see ZC_Standard_FractionalMint for
-    //   share verification. Storage rent, serialization and maximum cost are unverified.
+    //   share verification. A refresh relies on someone sending it within the two years before
+    //   rent is due. Serialization and maximum cost are unverified.
 
     def numTokenInInputs(tokenId: Coll[Byte]): Long = {
         INPUTS.fold(0L, { (a: Long, b: Box) =>
@@ -76,8 +85,36 @@
         sigmaProp(false)
     } else {
         val outstanding = supply(1)
+        val refreshIndex = getVar[Int](9)
 
-        if (burned == 0L) {
+        if (refreshIndex.isDefined) {
+            // Refresh: re-create the box unchanged to reset its age, paying the refresher.
+            val index = refreshIndex.get
+            if (index < 0 || index >= OUTPUTS.size) {
+                sigmaProp(false)
+            } else {
+                val next = OUTPUTS(index)
+                val stamped = next.creationInfo._1
+                // A holding vault keeps its pull fee, so the pull can still pay its batcher.
+                val floor = if (holding) 1000000L + supply(2) else 1000000L
+                val kept = if (SELF.value < floor) SELF.value else floor
+                val least = if (SELF.value - 10000000L > kept) SELF.value - 10000000L else kept
+                // R6 exists only after the pull; the successor keeps it as it is.
+                val pathKept = if (SELF.R6[Byte].isDefined) {
+                    next.R6[Byte].get == SELF.R6[Byte].get && next.R7[Coll[Byte]].isDefined == false
+                } else next.R6[Byte].isDefined == false
+                sigmaProp(
+                    SELF.creationInfo._1 < HEIGHT - 525600 &&
+                    stamped > HEIGHT - 1000 && stamped <= HEIGHT &&
+                    next.propositionBytes == SELF.propositionBytes &&
+                    next.value >= least &&
+                    next.tokens == SELF.tokens &&
+                    next.R4[Coll[Byte]].get == bondAsset &&
+                    next.R5[Coll[Long]].get == supply &&
+                    pathKept
+                )
+            }
+        } else if (burned == 0L) {
             // Pull the settled bond vault into this box
             val nextIndex = getVar[Int](0).get
             val sources = INPUTS.filter { (b: Box) =>

@@ -1,0 +1,67 @@
+{
+    // PricedOrder var 2 for a window order (maturity mode 2): the least principal a lender pays for
+    // the maturity it chose, from the borrower's yield curve over blocks to maturity.
+    // The lend offer's curve read the other way round: there each point is the least yield the lender
+    // accepts, here the most the borrower pays. Both run on blocks left, so a batcher compares the
+    // two point by point.
+    //
+    // R9 (the order's pricing payload):
+    //   0 the window's maximum duration, read by the shell only (the minimum is R4(3))
+    //   1 maximum yield, bps of simple interest per 262800 blocks, >= 0. The yield charged at any
+    //     maturity is never above it. With no points it is the order's one yield at every maturity.
+    //   2.. 0 to 20 points, each two values (yield bps >= 0, blocks left to maturity), blocks left
+    //     strictly increasing. Between two neighbouring points the yield is on the straight line
+    //     joining them; below the first point it is the first point's yield, above the last the last's.
+    // Points out of order or negative yields are refused, so every batcher reads a curve one way.
+    // A badly made curve can only ask too little principal; the shell's principal floor R4(1) still
+    // binds at every maturity.
+    //
+    // THE TEST
+    // D = bond maturity - HEIGHT. On a segment from (y1, D1) to (y2, D2): L = D2 - D1 and
+    // Y = y1 * L + (y2 - y1) * (D - D1), so the yield is Y / L exactly; flat ends and an empty curve
+    // have L = 1. The yield is min(Y, cap * L) / L. With B = 10000 * 262800 and R the repayment:
+    //   principal * (B * L + Y * D) >= R * B * L,  i.e.  principal >= R / (1 + yield * D / 262800).
+    // No division, no rounding. Simple block yield, conditional on repayment, fees not included.
+    // Meant for mode 2. In modes 0 and 1 the shell ignores R9(0) and this prices the one maturity.
+    val payload = SELF.R9[Coll[Long]].get
+
+    if (payload.size < 2 || payload.size > 42 || payload.size % 2 != 0) {
+        sigmaProp(false)
+    } else {
+        val bond = OUTPUTS(1)
+        val borrower = bond.R6[Coll[Long]].get
+        val remaining = bond.R9[Coll[Long]].get(2) - HEIGHT.toLong
+        val principal = if (CONST_REPAYMENT_TOKEN == SELF.id.slice(0, 0)) borrower(1)
+            else bond.R7[Coll[(Coll[Byte], Long)]].get(0)._2
+        val cap = payload(1)
+        val curve = payload.slice(2, payload.size)
+        val points = curve.size / 2
+        // Blocks left strictly increase from point to point (odd positions hold them); yields are not negative.
+        val ordered = curve.indices.forall { (j: Int) => j % 2 == 0 || j < 3 || curve(j) > curve(j - 2) }
+        val positive = curve.indices.forall { (j: Int) => j % 2 == 1 || curve(j) >= 0L }
+        // How many points lie at or below the bond's blocks left: the segment it falls on.
+        val below = curve.indices.filter { (j: Int) => j % 2 == 1 && curve(j) <= remaining }.size
+        val flat = points == 0 || below == 0 || below == points
+        val span = if (flat) 1L.toBigInt else (curve(2 * below + 1) - curve(2 * below - 1)).toBigInt
+        val rate = if (points == 0) {
+            cap.toBigInt
+        } else if (below == 0) {
+            curve(0).toBigInt
+        } else if (below == points) {
+            curve(curve.size - 2).toBigInt
+        } else {
+            val low = 2 * (below - 1)
+            curve(low).toBigInt * span +
+                (curve(low + 2).toBigInt - curve(low).toBigInt) * (remaining - curve(low + 1)).toBigInt
+        }
+        val capRate = cap.toBigInt * span
+        val charged = if (rate > capRate) capRate else rate
+        val scale = 2628000000L.toBigInt
+
+        sigmaProp(
+            cap >= 0L && ordered && positive &&
+            remaining > 0L && principal > 0L && borrower(0) > 0L &&
+            principal.toBigInt * (scale * span + charged * remaining.toBigInt) >=
+                borrower(0).toBigInt * scale * span)
+    }
+}

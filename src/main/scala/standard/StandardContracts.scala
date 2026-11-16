@@ -37,14 +37,16 @@ case class MarketContracts(bond: Contract, order: Contract, offer: Contract, sal
                            pricedAsk: Contract, dutchMint: Contract,
                            oracleRule: Contract, policy: Contract, fillGuard: Contract,
                            pricedOrder: Contract, yieldOrderPricing: Contract,
-                           yieldPricing: Contract, guardedYieldPricing: Contract, lotAuction: Contract)
+                           yieldPricing: Contract, guardedYieldPricing: Contract, lotAuction: Contract,
+                           curveOrderPricing: Contract)
 
 /**
  * The whole ZC Standard set. Expressions that run through `executeFromVar` are held as Contracts as
  * well: their `valueBytes` go in a context variable, and `hashedValueBytes` is what a box commits to.
  */
 case class StandardContracts(vault: Contract, fractionalVault: Contract, fractionalMint: Contract,
-                             dutchVault: Contract, maturity: Contract, markets: Map[Market, MarketContracts]) {
+                             dutchVault: Contract, maturity: Contract, wrapVault: Contract, wrapMint: Contract,
+                             markets: Map[Market, MarketContracts]) {
 
   def market(m: Market): MarketContracts = markets(m)
 
@@ -53,7 +55,8 @@ case class StandardContracts(vault: Contract, fractionalVault: Contract, fractio
     import StandardContracts.Entry
     Seq(Entry("BondVault", None, vault), Entry("FractionalVault", None, fractionalVault),
       Entry("FractionalMint", None, fractionalMint), Entry("DutchAuctionVault", None, dutchVault),
-      Entry("MaturityLiquidation", None, maturity)) ++
+      Entry("MaturityLiquidation", None, maturity), Entry("WrapVault", None, wrapVault),
+      Entry("WrapMint", None, wrapMint)) ++
       Market.all.flatMap { m =>
         val c = market(m)
         Seq("Bond" -> c.bond, "Order" -> c.order, "LendOffer" -> c.offer, "SaleOrder" -> c.saleOrder,
@@ -61,7 +64,7 @@ case class StandardContracts(vault: Contract, fractionalVault: Contract, fractio
           "ERG_SigUSD_CollateralPolicy" -> c.policy, "ERG_SigUSD_FillGuard" -> c.fillGuard,
           "PricedOrder" -> c.pricedOrder, "YieldOrder_Pricing" -> c.yieldOrderPricing,
           "YieldAsk_Pricing" -> c.yieldPricing, "ERG_SigUSD_GuardedYield_Pricing" -> c.guardedYieldPricing,
-          "LotAuction" -> c.lotAuction)
+          "LotAuction" -> c.lotAuction, "CurveOrder_Pricing" -> c.curveOrderPricing)
           .map { case (name, contract) => Entry(name, Some(m), contract) }
       }
   }
@@ -78,7 +81,8 @@ object StandardContracts {
   /** Entries run through `executeFromVar`: a box commits to their expression bytes, not their tree. */
   val Expressions: Set[String] =
     Set("MaturityLiquidation", "ERG_SigUSD_Liquidation", "ERG_SigUSD_CollateralPolicy",
-      "ERG_SigUSD_FillGuard", "YieldOrder_Pricing", "YieldAsk_Pricing", "ERG_SigUSD_GuardedYield_Pricing")
+      "ERG_SigUSD_FillGuard", "YieldOrder_Pricing", "YieldAsk_Pricing", "ERG_SigUSD_GuardedYield_Pricing",
+      "CurveOrder_Pricing")
 
   private var cache: Option[StandardContracts] = None
 
@@ -102,6 +106,8 @@ object StandardContracts {
         "CONST_FRACTIONAL_VAULT_HASH" -> hash(fractionalVault))
       val dutchVault = build("bonds/lender-scripts/ZC_Standard_DutchAuctionVault")
       val maturity = build("bonds/liquidations/ZC_Standard_MaturityLiquidation")
+      val wrapVault = build("bonds/wrappers/ZC_Standard_WrapVault")
+      val wrapMint = build("bonds/wrappers/ZC_Standard_WrapMint", "CONST_WRAP_VAULT_HASH" -> hash(wrapVault))
 
       val markets = Market.all.map { m =>
         val asset = Colls.fromArray(m.tokenBytes)
@@ -134,10 +140,11 @@ object StandardContracts {
             "CONST_REPAYMENT_TOKEN" -> asset, "CONST_BOND_HASH" -> hash(bond)),
           guardedYieldPricing = build("bonds/policies/ZC_Standard_ERG_SigUSD_GuardedYield_Pricing",
             "CONST_REPAYMENT_TOKEN" -> asset, "CONST_BOND_HASH" -> hash(bond)),
-          lotAuction = build("bonds/P2P/ZC_Standard_LotAuction", "CONST_PAYMENT_TOKEN" -> asset))
+          lotAuction = build("bonds/P2P/ZC_Standard_LotAuction", "CONST_PAYMENT_TOKEN" -> asset),
+          curveOrderPricing = build("bonds/policies/ZC_Standard_CurveOrder_Pricing", "CONST_REPAYMENT_TOKEN" -> asset))
       }.toMap
 
-      val set = StandardContracts(vault, fractionalVault, fractionalMint, dutchVault, maturity, markets)
+      val set = StandardContracts(vault, fractionalVault, fractionalMint, dutchVault, maturity, wrapVault, wrapMint, markets)
       cache = Some(set)
       set
     }
@@ -150,12 +157,13 @@ object StandardContracts {
         .getOrElse(throw new IllegalStateException(s"the pinned set has no ${market.fold(name)(m => s"$name $m")}"))
     StandardContracts(get("BondVault", None), get("FractionalVault", None), get("FractionalMint", None),
       get("DutchAuctionVault", None), get("MaturityLiquidation", None),
+      get("WrapVault", None), get("WrapMint", None),
       Market.all.map { m =>
         def of(name: String) = get(name, Some(m))
         m -> MarketContracts(of("Bond"), of("Order"), of("LendOffer"), of("SaleOrder"), of("PricedAsk"),
           of("DutchAuctionMint"), of("ERG_SigUSD_Liquidation"), of("ERG_SigUSD_CollateralPolicy"),
           of("ERG_SigUSD_FillGuard"), of("PricedOrder"), of("YieldOrder_Pricing"), of("YieldAsk_Pricing"),
-          of("ERG_SigUSD_GuardedYield_Pricing"), of("LotAuction"))
+          of("ERG_SigUSD_GuardedYield_Pricing"), of("LotAuction"), of("CurveOrder_Pricing"))
       }.toMap)
   }
 }

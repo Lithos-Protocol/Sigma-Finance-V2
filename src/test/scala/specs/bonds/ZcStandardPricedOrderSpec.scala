@@ -126,6 +126,53 @@ class ZcStandardPricedOrderSpec extends AnyPropSpec with ZcStandardSpecBase {
     }
   }
 
+  /** The same flow as a window order (mode 2): R4(3) becomes the window's minimum duration. */
+  private def window(f: Flow, min: Long, mode: Long = 2L): Flow = {
+    val data = f.data.updated(3, min).updated(6, mode)
+    f.copy(data = data, order = f.order.withRegNum(4, longsValue(data: _*)), bond = f.bond.withRegNum(6, longsValue(data: _*)))
+  }
+
+  for (kind <- Seq[Kind](ErgBond, TokenBond)) {
+    property(s"window order $kind: the lender's maturity, inside the window, priced on the borrower's curve to one raw unit") {
+      withCtx { ctx =>
+        val curve = c(ctx, kind).curveOrderPricing
+        // Filled half a year before its maturity: 131400 blocks, inside a 100000 to 200000 window.
+        val base = window(halfYear(ctx, kind), 100000L)
+        val h = base.height.toLong
+        val amount = if (kind == ErgBond) 104761904762L else 10477L
+        // Flat 10% (no points), and 5% at 100000 blocks rising to 15% at 162800, which is 10% at 131400.
+        Seq(Seq(200000L, 1000L), Seq(200000L, 5000L, 500L, 100000L, 1500L, 162800L)).foreach { payload =>
+          filled(priced(base, curve, payload, amount))
+          val under = priced(base, curve, payload, amount - 1L)
+          rejectsAtSigning(under.holder, standardFillTx(under))
+        }
+        // The cap binds: at most 8%, so 10% is too little principal.
+        val capped = priced(base, curve, Seq(200000L, 800L, 500L, 100000L, 1500L, 162800L), amount)
+        rejectsAtSigning(capped.holder, standardFillTx(capped))
+        // The window's ends are inclusive, and a duration outside them is refused.
+        filled(priced(window(halfYear(ctx, kind), 131400L), curve, Seq(131400L, 1000L), amount))
+        Seq(window(halfYear(ctx, kind), 131401L) -> Seq(200000L, 1000L), base -> Seq(131399L, 1000L),
+          window(halfYear(ctx, kind), 29L) -> Seq(200000L, 1000L), base -> Seq(99999L, 1000L)).foreach { case (b, payload) =>
+          val out = priced(b, curve, payload, amount)
+          rejectsAtSigning(out.holder, standardFillTx(out))
+        }
+        // Curve points out of order, negative yields, or an odd payload never fill.
+        Seq(Seq(200000L, 1000L, 1000L, 162800L, 1000L, 100000L), Seq(200000L, 1000L, -1L, 100000L), Seq(200000L, 1000L, 5L),
+          Seq(200000L)).foreach { payload =>
+          val bad = priced(base, curve, payload, 110L * (if (kind == ErgBond) Parameters.OneErg else 100L))
+          rejectsAtSigning(bad.holder, standardFillTx(bad))
+        }
+        // The two-point expression refuses a window order, since the shell reads its first value as the maximum.
+        val twoPoint = priced(base, c(ctx, kind).yieldOrderPricing, flat(1000L, h), amount)
+        rejectsAtSigning(twoPoint.holder, standardFillTx(twoPoint))
+        // There is no mode 3; the curve still prices a fixed-maturity order, its R9(0) unused.
+        val mode3 = priced(window(halfYear(ctx, kind), 100000L, 3L), curve, Seq(200000L, 1000L), amount)
+        rejectsAtSigning(mode3.holder, standardFillTx(mode3))
+        filled(priced(halfYear(ctx, kind), curve, Seq(1L, 1000L), amount))
+      }
+    }
+  }
+
   property("priced order: principal floor survives a permissive pricing expression; price and guard are independent") {
     withCtx { ctx =>
       val base = flow(ctx, ErgBond)

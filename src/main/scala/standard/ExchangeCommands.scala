@@ -25,7 +25,11 @@ object ExchangeCommands {
 
   val Commands: Set[String] = Set("shares", "fractionalize", "mint-shares", "cancel-share-request", "pull", "buy-lot",
     "claim-shares", "asks", "sell", "buy", "cancel-ask", "refund-ask", "offers", "create-offer", "cancel-offer",
-    "refund-offer", "match-offer", "lots", "sell-lot", "take-lot", "cancel-lot", "refund-lot", "pack", "batch")
+    "refund-offer", "match-offer", "lots", "sell-lot", "take-lot", "cancel-lot", "refund-lot", "pack", "batch",
+    "wraps", "wrap", "mint-wrap", "cancel-wrap", "unwrap", "refresh")
+
+  /** zcs1 client default for a wrap's mint fee. */
+  val DefaultWrapFee = "0.005"
 
   /** `run` executes a follow-up command line, as `batch --run` does with each piece of work. */
   def dispatch(app: StandardApp, a: Args, run: String => Boolean): Unit = a.command.get match {
@@ -51,7 +55,7 @@ object ExchangeCommands {
     case "match-offer" =>
       val offer = one(a, "offer box id")
       (a.opt("order"), a.opt("ask")) match {
-        case (Some(order), None) => app.submit(app.matchOrder(offer, order))
+        case (Some(order), None) => app.submit(app.matchOrder(offer, order, a.opt("maturity").map(parseLong(_, "--maturity"))))
         case (None, Some(ask)) => app.submit(app.matchAsk(offer, ask, a.opt("amount").map(parseLong(_, "--amount"))))
         case _ => throw CliError("match-offer needs exactly one of --order <order box id> or --ask <ask box id>")
       }
@@ -62,8 +66,21 @@ object ExchangeCommands {
     case "cancel-lot" => app.submit(app.cancelLot(one(a, "lot box id")))
     case "refund-lot" => app.submit(app.refundLot(one(a, "lot box id")))
 
+    case "wraps" => listWraps(app, a.flag("mine"))
+    case "wrap" => app.submit(app.wrap(one(a, "token id"), a.opt("amount").map(parseLong(_, "--amount")),
+      parseErg(a.opt("mint-fee").getOrElse(DefaultWrapFee)),
+      a.opt("refresh-reserve").map(parseErg).getOrElse(StandardProtocol.DefaultRefreshReserve)))
+    case "mint-wrap" => app.submit(app.mintWrap(one(a, "wrap request box id")))
+    case "cancel-wrap" => app.submit(app.cancelWrap(one(a, "wrap request box id")))
+    case "unwrap" => app.submit(app.unwrap(one(a, "receipt token id")))
+    case "refresh" =>
+      if (a.positional.isEmpty) throw CliError("refresh takes the box ids of bonds, bond vaults, share vaults or one wrap vault")
+      app.submit(app.refresh(a.positional))
+
     case "pack" =>
-      if (a.positional.isEmpty) throw CliError("pack takes the box ids of expired orders, offers, asks and lots and of liquidatable bonds")
+      if (a.positional.isEmpty)
+        throw CliError("pack takes the box ids of expired orders, offers, asks and lots, of liquidatable bonds, and of " +
+          "bonds and vaults old enough to refresh")
       app.submit(app.pack(a.positional))
     case "batch" => batch(app, a, run)
     case other => throw CliError(s"unknown command $other; run help for the list")
@@ -157,7 +174,7 @@ object ExchangeCommands {
   }
 
   /** A curve as "yield%:blocks,..." points, e.g. "8:21600,10:131400,12:262800". */
-  private def curve(a: Args): Seq[(Long, Long)] = a.opt("curve").toSeq.flatMap(_.split(",").map(_.trim).filter(_.nonEmpty)).map { p =>
+  private[standard] def curve(a: Args): Seq[(Long, Long)] = a.opt("curve").toSeq.flatMap(_.split(",").map(_.trim).filter(_.nonEmpty)).map { p =>
     p.split(":") match {
       case Array(y, d) => (nonNegativeBps(y, "curve"), parseLong(d, "--curve blocks"))
       case _ => throw CliError(s"--curve: $p is not <yield percent>:<blocks to maturity>")
@@ -240,7 +257,15 @@ object ExchangeCommands {
       metadataLine(app.shareMetadataIssues(v.shareId))
       val status =
         if (v.holding) "holds the bond unit; pull its settlement once the bond is repaid or liquidated"
-        else if (v.auctionOpen) {
+        else if (v.excess) {
+          val m = Market.of(v.currencyToken)
+          app.excessPrice(v, app.height.toLong) match {
+            case Some(p) => s"EXCESS AUCTION OPEN (the floor is already held): the thin lot costs " +
+              s"${m.fold(p.toString)(Units.amount(p, _))} now (`buy-lot ${v.box.id}`), falling to nothing at height " +
+              s"${v.claimableFrom}, when claims take it in kind"
+            case None => s"excess auction over: its price reached zero at height ${v.claimableFrom}; claims take the lot in kind"
+          }
+        } else if (v.auctionOpen) {
           val m = Market.of(v.currencyToken)
           val fallEnd = v.auctionStart + v.auctionLength
           val target = app.lotTarget(v, app.height.toLong)
@@ -250,8 +275,8 @@ object ExchangeCommands {
         } else v.state.map {
           case 0 => "repaid"
           case 1 if !v.dutch => "liquidated: paid in kind"
-          case 2 => "liquidated: the lot sold, or paid in kind (the floor was already held, or every item splits pro rata)"
-          case 3 => "liquidated: unsold by the auction's expiry, paid in kind"
+          case 2 => "liquidated: the lot sold, or paid in kind (nothing to sell, or every item splits pro rata)"
+          case 3 => "liquidated: unsold by the auction's end, paid in kind"
           case s => s"state $s"
         }.getOrElse("")
       println(s"  $status")
@@ -332,6 +357,28 @@ object ExchangeCommands {
       println(s"  expires at height ${l.expiry}" +
         (if (now >= l.expiry) s" (EXPIRED: anyone may refund-lot it for ${Fmt.erg(l.refundFee)})" else ""))
       if (app.isOwnHash(l.sellerHash)) println("  (your lot)")
+    }
+  }
+
+  private def listWraps(app: StandardApp, mine: Boolean): Unit = {
+    val requests = app.wrapRequests().filter(r => !mine || app.isOwnHash(r.ownerHash))
+    val vaults = app.wrapVaults().filter(v => !mine || (app.walletAvailable && app.walletHolds(v.receiptId)))
+    if (requests.isEmpty && vaults.isEmpty) println("No wrap requests or vaults.")
+    requests.foreach { r =>
+      println(s"Wrap request ${r.box.id}  ${r.wrapped.amount} of ${r.wrapped.id}")
+      println(s"  receipt named '${r.metadata.headOption.map(StandardMetadata.text).getOrElse("")}'; mint fee " +
+        s"${Fmt.erg(r.mintFee)}: anyone may `mint-wrap ${r.box.id}`")
+      if (app.isOwnHash(r.ownerHash)) println("  (your request)")
+    }
+    val now = app.height.toLong
+    vaults.foreach { v =>
+      println(s"Receipt ${v.receiptId}  vault ${v.box.id}")
+      println(s"  holds ${v.wrapped.amount} of ${v.wrapped.id} and ${Fmt.erg(v.box.value)}" +
+        (if (app.wrapVerified(v.receiptId)) "" else " (WARNING: not minted by a wrap request: this vault proves nothing)"))
+      val made = v.box.input.getCreationHeight.toLong
+      println(s"  made at height $made; refreshable from height ${made + StandardProtocol.RefreshAge + 1}" +
+        (if (StandardProtocol.refreshable(made, now)) " (NOW: `refresh " + v.box.id + "`)" else ""))
+      if (app.walletAvailable && app.walletHolds(v.receiptId)) println(s"  (you hold the receipt: `unwrap ${v.receiptId}`)")
     }
   }
 

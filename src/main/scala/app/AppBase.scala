@@ -221,7 +221,10 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
 
   protected def prepare(title: String, p: Plan, notes: Seq[String] = Seq.empty): Prepared = {
     val (inputs, disclosed) = disclose(p)
-    val tx = TxBuilder(ctx).setInputs(inputs: _*).setDataInputs(p.dataInputs: _*).setOutputs(p.outputs: _*)
+    val base = TxBuilder(ctx).setInputs(inputs: _*).setDataInputs(p.dataInputs: _*).setOutputs(p.outputs: _*)
+    // Only a subclass that moves `height` off the context's (a spec placing the app years later) needs a preheader
+    // for the scripts to run at that height; against a node the two are always the same.
+    val tx = (if (height == ctx.getHeight) base else base.setPreHeader(ctx.createPreHeader().height(height).build()))
       .buildTx(p.fee, myAddress, p.burn)
     Prepared(title, tx, notes ++ (if (disclosed == 0) Seq.empty
       else Seq(s"discloses $disclosed script(s) the outputs name by hash, in context variable ${DisclosureVar.toInt} (zcs1)")))

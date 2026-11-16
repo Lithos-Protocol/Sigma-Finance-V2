@@ -13,6 +13,7 @@ generated in [ZC_STANDARD_REFERENCE.md](./ZC_STANDARD_REFERENCE.md).
 |---|---|---|
 | `Order` | Principal, repayment and every borrower term | Nothing: fixed principal |
 | `PricedOrder` + `YieldOrder_Pricing` | Repayment, maturity rule, collateral, borrower, liquidation rule, fees | Minimum principal at fill, from a two-point yield |
+| `PricedOrder` (mode 2) + `CurveOrder_Pricing` | Repayment, maturity window, collateral, borrower, liquidation rule, fees | Minimum principal at the maturity the lender picks, from the borrower's yield curve |
 | `SaleOrder` | Price per raw token unit | Nothing: fixed price |
 | `PricedAsk` + `YieldAsk_Pricing` (or `ERG_SigUSD_GuardedYield_Pricing`) | Asset, seller, floor, minimum fill and expiry | Minimum payment for the units sold, from a two-point yield |
 | `LendOffer` | Yield curve, minimum yield, maturity window, collateral policy and fees | Maximum cost allowed by its yield test |
@@ -21,8 +22,8 @@ generated in [ZC_STANDARD_REFERENCE.md](./ZC_STANDARD_REFERENCE.md).
 An expression is a validator returning `SigmaProp`, not a function returning a price. The filler
 supplies bytes matching the expression hash the owner committed when posting. Adding another pricing
 policy needs no new shell. The `PricedOrder` and `PricedAsk` shells did not change when NAV was
-removed: their trees, hashes and addresses are the same, so the lend offer's pinned
-`CONST_PRICED_ORDER_HASH` still holds. Only the expressions changed.
+removed. `PricedOrder` changed later the same day, when it gained the window mode (and its bond hash
+changed with the bond's refresh path); the lend offer pins its new hash.
 
 The fixed order remains an accepted issuer. The lend offer pins **both** issuing hashes, for primary
 fills and secondary origin checks. Existing boxes keep their original scripts and hashes; changing
@@ -150,6 +151,58 @@ own capital; points out of order are refused so every batcher reads a curve the 
 `create-offer --yield 5 --curve 6:21600,8:131400,10:262800` bids at least 6% for a 30-day bond, 8% for
 six months and 10% for a year, interpolated in between, and never under 5%.
 
+## Window orders: the borrower's curve
+
+A window order (`PricedOrder` maturity mode 2) leaves the maturity to the lender: any duration from
+R4(3), at least 30 blocks, to R9(0) after the fill's recorded start. The shell checks the window on
+`maturity - start`, so no sum can overflow, and the bond records the maturity chosen in R9(2) as for
+every mode. `CurveOrder_Pricing` prices whatever the lender picks:
+
+```text
+R9 = (maximum duration, maximum yield, then 0..20 points (yield bps, blocks left))
+```
+
+It is the lend offer's curve read the other way round. On the offer each point is the least yield the
+lender accepts and R5(0) is a floor; here each point is the most the borrower pays and R9(1) is a
+ceiling. With D = maturity - HEIGHT, the yield is the curve's at D, capped at the maximum, exactly as
+`Y / L` with the same segment arithmetic, and the minimum principal is
+
+```text
+principal * (B * L + Y * D) >= R * B * L          i.e.  principal >= R / (1 + yield * D / 262800)
+```
+
+Points out of order or negative yields never fill. Repayment stays fixed, so a longer maturity pays
+less principal now; the principal floor R4(1) still binds at every maturity, which is the borrower's
+guaranteed minimum cash. `YieldOrder_Pricing` refuses mode 2, since the shell would read its start
+height as the window's maximum.
+
+Why fixed repayment: it keeps the "price principal only" rule, the collateral ratio is known when the
+order is posted, and lend offers already judge it on the same axis. A borrower thinking in cash sets
+the principal floor to what they need and quotes the most they pay at each term.
+
+### Which maturity a batcher picks
+
+Nothing on chain says; zcs1 does, so every batcher picks the same one. For a window order and an
+offer, the candidates are the ends of the heights both accept (the window, and the offer's minimum and
+maximum blocks left), both curves' breakpoints and the grid heights between them: between those, both
+yields are straight lines, so the best maturity is always one of them. Of the candidates the offer
+accepts (its yield, price, budget and policy, as for any fill):
+
+1. a grid height (a multiple of 21,600) first, so bonds gather on series maturities;
+2. then the widest gap between the yield the offer would earn at that price and the yield it requires,
+   the most room for the inclusion height to move;
+3. then the shorter maturity.
+
+A wallet lender picks freely; the client's default is the earliest grid height in the window, else the
+window's shortest maturity. A window fill is one transaction like any other, so it adds no batching
+step and no fee.
+
+```text
+create-order --principal 4 --repayment 6 --collateral-erg 10 --window 21600:131400 --yield 12 --curve 8:21600,12:131400
+fill-order <order> --maturity <height>
+match-offer <offer> --order <order> [--maturity <height>]
+```
+
 ## Fee treatment
 
 Borrower/seller yield is an upper limit on the gross yield they offer a buyer (a minimum price).
@@ -242,6 +295,7 @@ so a holder paid collateral in kind can turn it back into the repayment asset. S
 | G | On-close order at 50000%, matched by the batch runner with delivery into Selective shares |
 | K | A rising-yield order refunded at expiry, and a SigUSD yield order cancelled after a refused guarded fill |
 | L | Lot auctions: one bought, one refunded after expiry, one cancelled |
+| (none) | Window orders are covered offline only (`ZcStandardPricedOrderSpec`, `StandardWindowRefreshWrapAppSpec`) |
 
 The live loans last tens to hundreds of blocks, so yields that leave room for batcher fees are in the
 thousands of percent. Confirmation checks compare actual principal payments with the bond records,

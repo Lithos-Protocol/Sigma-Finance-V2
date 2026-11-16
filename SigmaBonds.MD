@@ -4,16 +4,17 @@ The ZC Standard is SigmaFi V2's contract set for P2P zero-coupon bonds on Ergo. 
 order with collateral; a lender fills it and receives a tradeable bond asset; the bond is repaid or
 liquidated into a vault, and whoever holds the asset claims the vault. Around that core sit
 fractional shares with a Selective or Dutch auction for liquidated collateral, asks for selling bonds
-and shares at a fixed price or a moving yield, a lot auction for selling collateral paid in kind, and
-a lend offer that buys on a yield curve.
+and shares at a fixed price or a moving yield, a lot auction for selling collateral paid in kind,
+a lend offer that buys on a yield curve, window orders whose lender picks the maturity, custody wraps
+for capability tokens, and a paid refresh that keeps long-held boxes ahead of storage rent.
 
 Status: the set is **not deployed**. Every contract has offline specs (see [TESTING.md](./TESTING.md)),
 and its compiled trees are pinned in [docs/ZC_STANDARD_REFERENCE.md](./docs/ZC_STANDARD_REFERENCE.md).
 The CLI builds every contract from those pinned trees: the bond lifecycle (orders, fills, repayment
 also from collateral, recollateralization, liquidation, expiry refunds, claims), fractional and Dutch
-auction shares, both asks and the lend offer, and a `batch` scan that lists, and with `--run` performs,
-every mint, pull, refund, liquidation and offer match that pays its runner. It follows the off-chain
-rules below. The CLI's `--old` commands still serve the
+auction shares, both asks and the lend offer, window orders, wraps, refreshes, and a `batch` scan that
+lists, and with `--run` performs, every mint, pull, refund, liquidation, refresh and offer match that
+pays its runner. It follows the off-chain rules below. The CLI's `--old` commands still serve the
 first-generation contracts in `contracts/old/`, described in [docs/SIGMABONDS_OLD.md](./docs/SIGMABONDS_OLD.md).
 
 Each contract's header comment is its authoritative schema: registers, context variables and every
@@ -34,11 +35,13 @@ All paths are under `contracts/bonds/`. Names drop the `ZC_Standard_` prefix.
 | `P2P/` | `LotAuction` | A Dutch-priced ask for a whole basket of tokens and ERG |
 | `lender-scripts/` | `FractionalMint`, `FractionalVault` | Turn one bond unit into N fungible shares, paid in kind |
 | `lender-scripts/` | `DutchAuctionMint`, `DutchAuctionVault` | The same, with a Selective or Dutch auction of liquidated collateral; the only shares lend offers buy |
+| `wrappers/` | `WrapMint`, `WrapVault` | Custody for a capability token (a LithosDex position's owner NFT): released only by burning its receipt |
 | `liquidations/` | `MaturityLiquidation` | Liquidation rule: at or after maturity |
 | `liquidations/` | `ERG_SigUSD_Liquidation` | Liquidation rule: an oracle collateral ratio, or maturity |
 | `policies/` | `ERG_SigUSD_CollateralPolicy` | The lend offer's risk rule |
 | `policies/` | `YieldAsk_Pricing` | A priced ask's two-point simple block-yield rule |
 | `policies/` | `YieldOrder_Pricing` | A priced order's two-point principal rule |
+| `policies/` | `CurveOrder_Pricing` | A window order's principal rule: the borrower's yield curve at the maturity the lender picks |
 | `policies/` | `ERG_SigUSD_GuardedYield_Pricing` | Yield pricing with a sale collateral guard |
 | `policies/` | `ERG_SigUSD_FillGuard` | The borrower's guard: an order fills only at a minimum collateral ratio |
 
@@ -140,6 +143,16 @@ an order can rise or fall without updates. It calculates principal from the fixe
 remaining blocks, exactly, and supports fixed and on-close maturity. The original principal floor
 always applies. See [pricing rules and examples](docs/ZC_STANDARD_PRICING.md).
 
+**Window orders** (maturity mode 2) let the lender pick the maturity: any duration from R4(3), at
+least 30 blocks, to R9(0) after the fill's start. The shell enforces the window; the bond records the
+maturity chosen in R9(2), like any other. `CurveOrder_Pricing` prices them: R9 is
+`(maximum duration, maximum yield, then up to 20 (yield bps, blocks left) points)`, the lend offer's
+curve read the other way round, a ceiling rather than a floor. Repayment stays fixed, so a longer
+maturity pays the borrower less principal now; the principal floor still guarantees a minimum.
+`YieldOrder_Pricing` refuses mode 2, since the shell would read its start height as the maximum. One
+order, and one pot of collateral, then meets lend offers at many maturities instead of one. Nothing on
+chain says which maturity a batcher picks; zcs1 does (see the off-chain rules below).
+
 ### Bond
 
 | Register | Contents |
@@ -178,13 +191,18 @@ context variables:
    liquidation: moving the bond voids the liquidator's transaction, but the liquidator rebuilds
    against the new box, which the borrower cannot move again in time. (It replaced a 1% growth
    floor, which was cheap to meet whenever one collateral holding was small.)
+4. **Refresh** (variable 9), anyone, once the box is more than 525,600 blocks old. See "Storage
+   rent and refresh" below. A bond's refresh stamps its successor 60 to 999 blocks back, so the
+   borrower may recollateralize at once, and is not allowed in the 720 blocks before maturity, where
+   voiding a pending repayment could push the borrower into liquidation.
 
 ### Vault and claim
 
 `BondVault` holds `(asset, 2)` and the settlement. The holder claims by spending the vault with their
 circulating unit and burning all 3 units; the outputs are theirs to choose. One transaction can sweep
 many vaults, each by its own unit, and a contract (such as a fractional vault) can direct a claim
-into itself.
+into itself. Anyone may refresh a vault more than two years old (variable 9); its R4 keeps naming the
+bond box that settled.
 
 ### Liquidation rules
 
@@ -263,19 +281,80 @@ liquidated, the pull opens an auction that sells the collateral for the bond's r
   times a basis-point figure falling in a straight line from the opening to the floor over the
   length, then staying at the floor. A buyer brings the vault's currency up to the target and takes
   the rest of the collateral. Currency already in the vault counts towards the target.
-- An auction opens only if the vault holds less currency than the floor target, and some lot item is
-  under the threshold. Otherwise holders take the collateral in kind. A floor of 0 means no auction.
-- The lot stays on sale at the floor from the end of the fall until the **expiry**. Partial claims wait
-  for the expiry; a claim after that takes the unsold collateral in kind and closes the auction. The
-  final claim works in every state.
+- An auction opens only if some lot item is under the threshold. Otherwise holders take the
+  collateral in kind.
+- If the vault holds less currency than the floor target, it is the floor auction (state 1). The lot
+  stays on sale at the floor from the end of the fall until the **expiry**. Partial claims wait for the
+  expiry; a claim after that takes the unsold collateral in kind and closes the auction.
+- If the vault already holds the floor target, it is the **excess auction** (state 4). The thin items
+  are surplus that pro rata claims would round away, leaving them all to the last claimant: an NFT, a
+  wrapped LithosDex receipt. Nothing values them, so the price is not measured against the currency
+  held: it falls from `opening × repayment` to zero over the length, and a sale must pay more than
+  zero. When it reaches zero, claims open and take the lot in kind. An opening of 0 opens no auction.
+- Which auction opens is fixed at the pull and recorded in R6, so nothing later (a refresh's bounty
+  out of an ERG currency) can move an auction from one case to the other. The final claim works in
+  every state.
 
 The guarantee to holders: after a liquidation the vault holds at least `floor × repayment` in the
-repayment asset, unless every collateral item splits pro rata (Selective), or an auction reaches its
-expiry with no buyer. Two cases still pay a thin item in kind: when the vault already holds the floor
-target (an auction would have to give the lot away), and when an auction expires unsold.
+repayment asset, unless every collateral item splits pro rata (Selective), or a floor auction reaches
+its expiry with no buyer. A thin item now goes in kind only when nobody pays anything for it in an
+excess auction, or a floor auction expires unsold; both are unavoidable without a price reference,
+and the floor is the lenders' own reserve, which offers rely on.
 
-The vault's state is R6: 0 repaid, 1 auction open, 2 sold or no auction needed, 3 paid out in kind.
-Registers are dense, so the mint places some R6 to carry R7 and R8; nothing reads it before the pull.
+The vault's state is R6: 0 repaid, 1 floor auction open, 2 sold or nothing to sell, 3 paid out in
+kind, 4 excess auction open. Registers are dense, so the mint places some R6 to carry R7 and R8;
+nothing reads it before the pull.
+
+## Custody wraps
+
+`LD_Provision` (LithosDex) authorizes Claim and Resize by "the owner NFT in any input". Any ZC path
+in which a third party spends a box holding that NFT (an order fill, a liquidation, a vault pull or
+claim, an ask or lot refund) could therefore drain the position while the NFT moves on, passing every
+ZC check. A wrap keeps such a capability token out of every transaction but its own:
+
+- `WrapMint` is a request holding the token, an owner hash (R4), a mint fee (R5) and the receipt's
+  EIP-4 (R6). Any batcher mints 3 receipt units, whose id is the request's: 1 to the owner, 2 and the
+  token into a bare `WrapVault`. The request must be the transaction's **only input**, so nothing the
+  token has authority over can be spent beside it; it pays the vault, the receipt and the miner itself.
+- `WrapVault` releases the token only when all 3 receipt units burn: the holder's and the vault's
+  two. Its refresh, too, must be the only input. Nothing claims or compounds a LithosDex position's
+  fees while it is wrapped (that would put the NFT in an input); they keep accruing and are claimed
+  after unwrapping.
+- Verifying a receipt Y is the share pattern: the request's serialized bytes hash to Y under
+  `WrapMint`, so the supply is 3; the box holding 2 of Y under `WrapVault` is the state box, and its
+  `tokens(1)` is the wrapped token. A collateral policy that values a LithosDex position follows it
+  from there to the provision box naming it in R6 and to the pool.
+
+The receipt, not the raw token, goes into orders, bonds and asks: their own rules keep every
+collateral token in their successors and settlements, so none can be burned there, and whoever buys
+or claims a receipt outright may unwrap it. The contract is generic: it serves any token whose
+presence among inputs grants authority elsewhere.
+
+## Storage rent and refresh
+
+Ergo lets anyone take a box four years old (1,051,200 blocks) whose value does not cover its rent
+(about 0.00125 ERG per byte at the launch parameter), **tokens included**. For a bond, a vault or a
+wrap that would free the authority tokens: a taken bond vault frees the 2-unit reserve, and a
+hand-made box under the bond script holding it would pass every state-box check.
+
+Bonds, bond vaults, fractional, Selective and Dutch vaults, and wrap vaults therefore have a paid
+refresh, matching LithosDex's T2T provisions so one refresher rule covers both: once a box is more than
+525,600 blocks (about two years) old, anyone may re-create it unchanged (script, tokens, registers),
+with a creation height within 1,000 blocks of inclusion, keeping up to **0.01 ERG** of its value as a
+bounty. A refresh never takes a box below its own floor: a bond's fee reserve plus 0.001 ERG, a
+vault's 0.001 ERG plus its pull fee while it still holds the bond unit, 0.001 ERG otherwise. At or under
+the floor a box is renewed for nothing. Each extra 0.01 ERG in a box buys about two more years.
+
+Boxes need not hold a whole rent payment (1.5 to 2.5 ERG for these 1 to 2 KB boxes): whoever refreshes
+first takes the bounty, so the refresh lands as soon as it opens, two years before rent is due. The
+safety rests on someone refreshing within that window; the bounty, and Lithos clients' batch scans, are
+the reason to. Orders, offers, asks and lots expire long before, so they have no refresh.
+
+What a refresh does not change: the bond asset, its origin, its state box (the box holding 2 units),
+the Dutch mint's settled-bond proof (the vault names the bond box that actually settled), share and
+wrap state boxes, or any price. What it does change is the box id, so pending transactions against
+the old box are rebuilt; the bond's two limits (stamped at least 60 blocks back, none in the 720 blocks
+before maturity) keep a third party from using that against the borrower.
 
 ## The exchange
 
@@ -406,8 +485,10 @@ Every box that waits on someone has a way out.
 | Lend offer | Owner cancels | From expiry: refund to the owner for the offer's batcher fee |
 | Sale order, priced ask | Seller cancels | From expiry: refund to the seller for the nanoERG funded above 0.001 ERG |
 | Fractional, Selective or Dutch mint request | Owner cancels | The mint itself, for the mint fee, at any time |
-| Bond | Borrower repays or recollateralizes | Liquidation, paid by the lender's reserve |
-| Bond vault, fractional, Selective and Dutch vaults | Holders claim | Pulls, for the pull fee; auction purchases |
+| Wrap request | Owner cancels | The mint itself, for the mint fee, at any time |
+| Bond | Borrower repays or recollateralizes | Liquidation, paid by the lender's reserve; refresh after two years |
+| Bond vault, fractional, Selective and Dutch vaults | Holders claim | Pulls, for the pull fee; auction purchases; refresh after two years |
+| Wrap vault | Receipt holder unwraps | Refresh after two years, as the only input |
 | Lot auction | Seller cancels | Purchase at the current price; from expiry, refund to the seller for the refund fee |
 
 Refunds are tagged with the box's id, so an owner that is a contract, which cannot co-sign a cancel,
@@ -420,17 +501,32 @@ Measured in the offline harness with appkit's signing estimate (see [TESTING.md]
 The reference node's default per-transaction limit is 1,000,000; mainnet's block limits are a cost
 of 7,030,268 and a size of 1,271,009 bytes.
 
+Highest cost and size per shape, measured 2026-11-16 over the whole suite (521 tests):
+
 | Transaction | Cost | Bytes |
 |---|---|---|
-| Offer buys shares from a priced ask (offer, policy, pricing, two serialized boxes, oracle; measured with the former NAV expression) | 24,521 | 6,251 |
-| Offer fills a new bond, with policy and oracle | 21,655 | 4,258 |
-| Offer buys from a sale order | 20,626 | 5,226 |
-| Dutch vault claim / pull / sale | 18,858 / 18,533 / 16,503 | up to 2,272 |
-| Bond repayment / liquidation | 19,096 / 16,841 | 743 / 1,019 |
-| Order fill by a wallet | 16,777 | 2,638 |
+| Two offers buying from two priced asks in one transaction | 37,343 | 12,352 |
+| Two offers buying from two sale orders in one transaction | 34,547 | 12,150 |
+| Offer fills a new SigUSD bond, with policy and oracle | 27,684 | 5,313 |
+| Offer buys shares from a SigUSD priced ask (two serialized boxes, oracle) | 26,304 | 7,578 |
+| Offer fills a priced order (curve offer, up to 20 points) | 26,115 | 2,161 |
+| Offer fills a new ERG bond | 25,907 | 5,434 |
+| Two expired offers refunded together | 26,333 | 490 |
+| Priced order filled by a wallet (two-point or window curve) | 21,179 | 2,643 |
+| Order filled by a wallet | 20,197 | 2,600 |
+| Bond repayment / oracle liquidation | 19,605 / 17,350 | 929 / 1,205 |
+| Dutch vault claim / sale / pull | 18,870 / 16,517 / 18,580 | up to 2,714 |
+| Unwrap (vault, receipt, wallet) | 17,933 | 458 |
+| Bond refresh | 16,100 | 1,814 |
+| Lot auction purchase | 15,824 | 443 |
+| Dutch, fractional, bond and wrap vault refresh | 13,478 / 13,434 / 13,245 / 13,215 | 2,443 / 1,511 / 683 / 628 |
+| Wrap mint (the request alone) | 13,297 | 657 |
 | Wallet-to-wallet payment, for scale | 12,205 | 166 |
 
-The heaviest match uses 2.5% of the per-transaction limit. A block holds about 200 of them by size.
+The heaviest transaction, two matched pairs at once, uses 3.7% of the per-transaction limit and 0.53%
+of a block's cost; a block holds about 100 of them by size and 188 by cost, so size binds first. A
+single match stays under 2.8%. These are appkit's estimates; a node adds signature checks, which are
+small next to them.
 
 ## Off-chain rules
 
@@ -459,9 +555,19 @@ input. In brief:
 - **Cover at the fill.** Oracle orders carry the fill guard by default, at their own ratio. Clients
   and batchers never fill or buy a bond under its own ratio (they liquidate it instead), and a
   fixed-maturity order's default expiry leaves at least half its term.
-- **Batching.** Pack refunds and liquidations into one transaction (the CLI's `pack`), chain fills
-  through continuations in one block, use one published matching order, and price yield asks and
-  orders at the most they ask over the next 3 blocks.
+- **Batching.** Pack refunds, liquidations and refreshes into one transaction (the CLI's `pack`),
+  chain fills through continuations in one block, use one published matching order, and price yield
+  asks and orders at the most they ask over the next 3 blocks.
+- **Window maturity.** A batcher filling a window order from an offer picks, among the maturities both
+  accept, a grid height first, then the widest gap between the yield the offer earns and the yield it
+  requires, then the shorter. Between the window's ends, both curves' breakpoints and the grid heights
+  both yields are straight lines, so the best maturity is always one of those. A wallet lender picks
+  freely; the client defaults to the earliest grid height in the window.
+- **Refresh.** A bond's successor is stamped 60 blocks back, and the refresh discloses the borrower's
+  script. A client that cannot find it there finds it in the fill that minted the bond asset, which
+  paid the principal to it, so a refresh by anyone, zcs1-aware or not, never hides a borrower.
+- **Wraps.** A raw capability token never goes into an order, bond or ask; its receipt does. Receipts
+  are named `ZCS-Wrap-<id6 of the token>`, with a JSON description of the token and amount.
 
 ## Limits and assumptions
 
@@ -473,7 +579,10 @@ input. In brief:
 - The ERG/SigUSD rules trust the USD oracle pool's identity NFT and value SigUSD at $1.
 - Only live bonds can be bought by an offer or priced by a yield ask; settled bonds cannot.
 - A share's value in the offer and a yield ask ignores the fractional vault's own nanoERG.
-- Storage rent is outside script evaluation and is not modelled.
+- Storage rent is outside script evaluation. The paid refresh keeps bonds and vaults ahead of it only
+  if someone sends it within two years of its opening; a box at its floor is renewed for nothing.
+- A capability token put raw into an order, bond or ask lends its authority to whoever spends that box;
+  wrap it first. Clients cannot yet tell a LithosDex owner NFT from any other token by themselves.
 - Nothing has run on a live node yet; the offline harness runs the real interpreter.
 
 Lenders and borrowers must evaluate collateral authenticity and their own risk before agreeing to a
@@ -503,4 +612,19 @@ have not been run against a live node. Historical cost figures above predate thi
   Its tree and address change; existing offer boxes keep their old scripts.
 
 Validation is offline (the real interpreter, by signing); nothing here has run on a live node.
-Cost and size figures above predate this change.
+Cost and size figures above were remeasured after the change that follows.
+
+## Refresh, window orders, wraps and excess auctions (2026-11-16)
+
+- **Paid refresh** on the bond, bond vault, fractional, Dutch and wrap vaults (variable 9): after
+  525,600 blocks anyone re-creates the box unchanged for a 0.01 ERG bounty, never under its floor. The
+  bond's refresh is stamped 60 to 999 blocks back and is not allowed in the 720 blocks before maturity.
+- **Window orders.** `PricedOrder` gains maturity mode 2 and the new `CurveOrder_Pricing`;
+  `YieldOrder_Pricing` refuses mode 2.
+- **Custody wraps.** New `WrapMint` and `WrapVault` under `contracts/bonds/wrappers/`.
+- **Excess auction.** `DutchAuctionVault` state 4 sells thin items when the floor is already held,
+  falling from the opening to zero; the mint's comments changed, not its logic.
+
+Every tree that pins another changed with them: the bond (through the vault), both orders, the offer,
+the Dutch mint and both share mints. Existing boxes keep their old scripts. Validation is offline
+(521 tests across 30 suites); nothing has run on a live node.

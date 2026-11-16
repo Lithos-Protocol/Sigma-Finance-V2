@@ -1,0 +1,90 @@
+{
+    // Standard custody wrap vault.
+    // Created only by ZC_Standard_WrapMint. Holds a wrapped capability token for the holder of its one
+    // circulating receipt. The token is an input of a transaction only when the receipt is burned
+    // (unwrap) or when this box alone is refreshed, so nothing the token has authority over (a
+    // LithosDex provision) can be spent while it stays wrapped.
+    // No constants.
+    //
+    // TOKENS
+    // tokens(0): (receipt, 2) - the reserve. Supply is exactly 3, so for a genuine receipt this is the
+    //   only box that can hold 2 units: found by token id, authenticated by amount, usable as a data
+    //   input. A hand-made box naming a genuine receipt cannot hold the reserve.
+    // tokens(1): (wrapped token, amount)
+    //
+    // REGISTERS
+    // None. Everything a reader needs is in the tokens.
+    //
+    // UNWRAP (context var 9 absent)
+    // More of the receipt than this box's reserve must be spent, and none may survive: the
+    // circulating receipt is presented and all 3 units are burned. Outputs are otherwise
+    // unconstrained: whoever burns the receipt takes the token, and with it the token's authority.
+    // A contract holding the receipt keeps it in its own successors and settlements, so it cannot
+    // be burned there; whoever buys or claims it outright may unwrap.
+    //
+    // REFRESH (context var 9 present; anyone, once the box is more than 525600 blocks, about two
+    //   years, old). Var 9: Int successor index.
+    // Storage rent lets anyone take a four-year-old box whose value does not cover the rent, tokens
+    // included, which would hand out the wrapped token and the reserve. So anyone may re-create this
+    // box unchanged to reset its age, keeping up to 10000000 nanoERG (0.01 ERG) as a bounty, never
+    // taking it below 1000000 (a box at or under that is renewed for nothing). This box must be the
+    // transaction's ONLY input: the wrapped token is in it, so any other input could be a box the
+    // token has authority over. The bounty therefore pays the transaction fee, or goes to an output
+    // of the refresher's choosing. The successor has this script, the same tokens, no registers, and
+    // a creation height within 1000 blocks of HEIGHT. The window and bounty match ZC_Standard_Bond's
+    // refresh and LithosDex's paid refresh.
+    //
+    // ASSUMPTIONS AND LIMITS
+    // - The receipt came from a verified ZC_Standard_WrapMint: supply 3, reserve 2. See there.
+    // - The wrapped token's authority is the token's own business; this vault only keeps it out of
+    //   other transactions. A LithosDex position keeps earning fees while wrapped, claimable after
+    //   unwrapping: nothing here claims or compounds them, since that would put the token in inputs.
+    // - A lost receipt strands the token. No timeout or sweep authority exists.
+    // - A refresh relies on someone sending it within the two years before rent is due.
+    //   Serialization and maximum cost are unverified.
+
+    def numTokenInInputs(tokenId: Coll[Byte]): Long = {
+        INPUTS.fold(0L, { (a: Long, b: Box) =>
+            val count = b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                if (t._1 == tokenId) z + t._2 else z
+            })
+            a + count
+        })
+    }
+
+    def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
+        OUTPUTS.fold(0L, { (a: Long, b: Box) =>
+            val count = b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                if (t._1 == tokenId) z + t._2 else z
+            })
+            a + count
+        })
+    }
+
+    val receipt = SELF.tokens(0)._1
+    val reserve = SELF.tokens(0)._2
+    val refreshIndex = getVar[Int](9)
+
+    if (refreshIndex.isDefined) {
+        // Refresh: re-create the box unchanged to reset its age, paying the refresher.
+        val index = refreshIndex.get
+        if (INPUTS.size != 1 || index < 0 || index >= OUTPUTS.size) {
+            sigmaProp(false)
+        } else {
+            val next = OUTPUTS(index)
+            val stamped = next.creationInfo._1
+            val kept = if (SELF.value < 1000000L) SELF.value else 1000000L
+            val least = if (SELF.value - 10000000L > kept) SELF.value - 10000000L else kept
+            sigmaProp(
+                SELF.creationInfo._1 < HEIGHT - 525600 &&
+                stamped > HEIGHT - 1000 && stamped <= HEIGHT &&
+                next.propositionBytes == SELF.propositionBytes &&
+                next.value >= least &&
+                next.tokens == SELF.tokens &&
+                next.R4[Coll[Byte]].isDefined == false
+            )
+        }
+    } else {
+        sigmaProp(numTokenInInputs(receipt) > reserve && numTokenInOutputs(receipt) == 0L)
+    }
+}

@@ -54,12 +54,14 @@ object OldCommands {
       println(s"Order ${o.box.id}  " + (o.schedule match {
         case FixedMaturity(_) => "(first generation, fixed maturity)"
         case OnClose(_) => "(first generation, on-close)"
+        case MaturityWindow(_, _) => "(first generation, unknown schedule)"
       }))
       println(s"  borrow:      ${Fmt.principal(o.principalErg, o.principalTokens)}; repay " +
         bond.fold("?")(t => Fmt.amount(o.repayment, t)))
       println("  maturity:    " + (o.schedule match {
         case FixedMaturity(h) => s"height $h (${h - app.height} blocks from now)"
         case OnClose(d) => s"$d blocks after the fill"
+        case MaturityWindow(lo, hi) => s"$lo to $hi blocks after the fill"
       }))
       println(s"  collateral:  ${Fmt.contents(o.box.value, o.box.tokens)}")
       println(s"  liquidation: ${liqName(app, o.liqScriptHash)}; fee reserve chosen and funded by lender on fill")

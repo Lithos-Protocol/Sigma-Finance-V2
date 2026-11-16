@@ -34,7 +34,8 @@ object StandardCommands {
         a.opts("add-token").map(parseToken)))
 
     case "fill-order" =>
-      app.submit(app.fillOrder(one(a, "order box id"), reserve(a, "fee-reserve"), a.flag("allow-liquidatable")))
+      app.submit(app.fillOrder(one(a, "order box id"), reserve(a, "fee-reserve"), a.flag("allow-liquidatable"),
+        a.opt("maturity").map(parseLong(_, "--maturity"))))
     case "claim" => app.submit(app.claim(one(a, "bond asset id")))
 
     case "liquidate" => app.submit(app.liquidate(a.positional))
@@ -54,7 +55,8 @@ object StandardCommands {
     val schedule = asked match {
       case FixedMaturity(h) if !a.flag("exact-maturity") => FixedMaturity(StandardProtocol.snapMaturity(h, app.height.toLong))
       case other =>
-        if (a.flag("exact-maturity") && other.isInstanceOf[OnClose]) throw CliError("--exact-maturity needs --maturity or --term")
+        if (a.flag("exact-maturity") && !other.isInstanceOf[FixedMaturity])
+          throw CliError("--exact-maturity needs --maturity or --term")
         other
     }
     val rule = a.opt("liquidation").getOrElse("maturity").toLowerCase match {
@@ -84,8 +86,22 @@ object StandardCommands {
     val expiry = a.opt("expires-in").map(n => app.height.toLong + parseLong(n, "--expires-in")).getOrElse(
       StandardProtocol.defaultOrderExpiry(app.height.toLong, schedule match {
         case FixedMaturity(h) => Some(h)
-        case OnClose(_) => None
+        case OnClose(_) | MaturityWindow(_, _) => None
       }, DefaultExpiry))
+    // A window order is priced by a curve: --yield is the most it pays, --curve the points under it. If only the
+    // curve is given, its highest point is the cap.
+    val windowPrice = schedule match {
+      case MaturityWindow(_, _) =>
+        if (Seq("end-yield", "end-height", "end-in").exists(a.opt(_).isDefined))
+          throw CliError("a window order's yield does not move with time: give --yield and --curve, not --end-*")
+        val points = ExchangeCommands.curve(a)
+        val cap = a.opt("yield").map(ExchangeCommands.nonNegativeBps(_)).orElse(points.map(_._1).reduceOption(_ max _))
+          .getOrElse(throw CliError("a window order needs --yield <the most you pay>, --curve <points>, or both"))
+        Some(CurveOrderPrice(cap, points))
+      case _ =>
+        if (a.opt("curve").isDefined) throw CliError("--curve on an order needs --window <minimum>:<maximum>")
+        None
+    }
     StdLoan(market,
       principal = Units.parse(a.need("principal"), market, "--principal"),
       repayment = Units.parse(a.need("repayment"), market, "--repayment"),
@@ -95,11 +111,11 @@ object StandardCommands {
       expiryFee = parseErg(a.opt("expiry-fee").getOrElse(DefaultExpiryFee)),
       requestedMaturity = asked match {
         case FixedMaturity(h) => Some(h)
-        case OnClose(_) => None
+        case OnClose(_) | MaturityWindow(_, _) => None
       },
       allowLiquidatable = a.flag("allow-liquidatable"),
       fillRatio = fillRatio,
-      price = {
+      price = windowPrice.orElse {
         val (endBps, endHeight) = ExchangeCommands.yieldEnd(app, a)
         a.opt("yield").map(s => YieldOrderPrice(ExchangeCommands.nonNegativeBps(s), endBps, endHeight))
       })
@@ -143,19 +159,26 @@ object StandardCommands {
     if (orders.isEmpty) println("No open orders.")
     orders.foreach { o =>
       val m = o.market
-      println(s"Order ${o.box.id}  ($m, ${if (o.onClose) "on-close" else "fixed maturity"})")
+      println(s"Order ${o.box.id}  ($m, ${if (o.window) "maturity window" else if (o.onClose) "on-close" else "fixed maturity"})")
       println(s"  borrow:      ${Units.amount(o.principal, m)}; repay ${Units.amount(o.repayment, m)}")
       if (o.priced) {
         val quote = Try(app.orderPrincipal(o, app.height.toLong + 3L, app.height.toLong))
           .map(p => Units.amount(p, m)).getOrElse("unavailable (unknown or invalid policy, or maturity too near)")
-        val label = app.protocol.orderYieldLine(o).filter(_ => Try(app.protocol.orderPricingOf(o)).isSuccess).fold("UNKNOWN pricing") { l =>
-          s"${Units.percent(l.bpsAt(app.height.toLong))} simple yield now" +
-            (if (l.fixed) "" else s", moving to ${Units.percent(l.endBps)} at height ${l.end}")
-        }
-        println(s"  PricedOrder: $label; the principal above is its floor; fill principal now: $quote")
+        val known = Try(app.protocol.orderPricingOf(o)).isSuccess
+        val label = app.protocol.orderBorrowCurve(o).filter(_ => known).map(c => s"curve: at most ${c.describe}")
+          .orElse(app.protocol.orderYieldLine(o).filter(_ => known).map { l =>
+            s"${Units.percent(l.bpsAt(app.height.toLong))} simple yield now" +
+              (if (l.fixed) "" else s", moving to ${Units.percent(l.endBps)} at height ${l.end}")
+          }).getOrElse("UNKNOWN pricing")
+        println(s"  PricedOrder: $label; the principal above is its floor; fill principal now: $quote" +
+          (if (o.window) " (at zcs1's default maturity)" else ""))
       }
-      println("  maturity:    " + (if (o.onClose) s"${o.terms(3)} blocks after the fill"
-        else s"height ${o.terms(3)} (${o.terms(3) - app.height} blocks from now)"))
+      println("  maturity:    " + (app.protocol.orderWindow(o) match {
+        case Some((lo, hi)) => s"the lender's choice, $lo to $hi blocks after the fill" +
+          Try(app.defaultWindowMaturity(o, app.height.toLong)).toOption.fold("")(d => s" (zcs1 default now: height $d)")
+        case None if o.onClose => s"${o.terms(3)} blocks after the fill"
+        case None => s"height ${o.terms(3)} (${o.terms(3) - app.height} blocks from now)"
+      }))
       println(s"  collateral:  ${Fmt.contents(o.collateralErg, o.collateral)}")
       println(s"  liquidation: ${app.protocol.ruleOf(o.liqHash).fold(app.protocol.ruleName(o.liqHash))(app.describeRule(_, o.payload))}")
       o.guardHash.foreach { h =>

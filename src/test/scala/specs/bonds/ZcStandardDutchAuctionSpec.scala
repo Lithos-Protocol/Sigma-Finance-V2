@@ -159,6 +159,21 @@ class ZcStandardDutchAuctionSpec extends AnyPropSpec with ZcStandardSpecBase {
     }
   }
 
+  property("mint: a refreshed bond is read like any other, live or settled, by the bytes of the box that settled") {
+    withCtx { ctx =>
+      val w = wrap(ctx)
+      // Refreshed after maturity (the default bond matures 1000 blocks out), 525601 blocks after its start.
+      val at = w.bond.input.getCreationHeight + 525601
+      val refreshed = spendOutput(accepts(executor(ctx), buildAt(ctx, at, Seq(w.bond.withCtxVar(9.toByte, ErgoValue.of(0))),
+        Seq(w.bond.toUTXO.subValue(10000000L).setCreationHeight(at - 60)), executor(ctx).getAddress)), 0)
+      accepts(executor(ctx), mintTx(w, state = refreshed))
+      val settled = spendOutput(accepts(executor(ctx), standardLiquidationTx(w.f, liquidationInput(w.f, refreshed), height = at)), 0)
+      accepts(executor(ctx), mintTx(w, state = settled, bondBytes = refreshed.bytes))
+      // The bond as it stood before the refresh no longer hashes to the settlement's R4.
+      rejectsAtSigning(executor(ctx), mintTx(w, state = settled, bondBytes = w.bond.bytes))
+    }
+  }
+
   property("mint: the owner cancels a request and nobody else can") {
     withCtx { ctx =>
       val w = wrap(ctx)
@@ -224,39 +239,58 @@ class ZcStandardDutchAuctionSpec extends AnyPropSpec with ZcStandardSpecBase {
     }
   }
 
-  property("pull: currency held at the floor target means no auction, one unit below it means an auction") {
+  /** The start a pulled vault records: the pull height when an auction opens (state 1 or 4), else 0. */
+  private def startFor(m: Minted, state: Byte): Long =
+    if (state == 1.toByte || state == 4.toByte) m.height.toLong else 0L
+
+  property("pull: currency held at the floor target opens the excess auction, one unit below it the floor auction") {
     withCtx { ctx =>
       // ERG: the floor target is 7 ERG * 150% = 10.5 ERG. The puller may add nanoERG to the vault.
       val m = minted(ctx)
       val proceeds = liquidated(m.w)
       val target = 10500000000L
-      accepts(executor(ctx), pullTx(m, proceeds, pulledBox(m, proceeds, 2.toByte, 0L, target), funded = true))
-      rejectsAtSigning(executor(ctx), pullTx(m, proceeds, pulledBox(m, proceeds, 1.toByte, m.height, target), funded = true))
+      accepts(executor(ctx), pullTx(m, proceeds, pulledBox(m, proceeds, 4.toByte, m.height, target), funded = true))
+      Seq(1.toByte, 2.toByte).foreach { wrong =>
+        rejectsAtSigning(executor(ctx), pullTx(m, proceeds, pulledBox(m, proceeds, wrong, startFor(m, wrong), target), funded = true))
+      }
+      // The excess auction records its start like the floor auction: within 8 blocks of the pull.
+      rejectsAtSigning(executor(ctx), pullTx(m, proceeds, pulledBox(m, proceeds, 4.toByte, 0L, target), funded = true))
+      rejectsAtSigning(executor(ctx), pullTx(m, proceeds, pulledBox(m, proceeds, 4.toByte, m.height - 9L, target), funded = true))
       accepts(executor(ctx), pullTx(m, proceeds, pulledBox(m, proceeds, 1.toByte, m.height, target - 1L), funded = true))
-      rejectsAtSigning(executor(ctx), pullTx(m, proceeds, pulledBox(m, proceeds, 2.toByte, 0L, target - 1L), funded = true))
+      Seq(2.toByte, 4.toByte).foreach { wrong =>
+        rejectsAtSigning(executor(ctx), pullTx(m, proceeds, pulledBox(m, proceeds, wrong, startFor(m, wrong), target - 1L), funded = true))
+      }
 
       // SigUSD: the floor target is 700 * 110% = 770 raw SigUSD, counted among the proceeds.
-      Seq(770L -> 2.toByte, 769L -> 1.toByte).foreach { case (held, state) =>
+      Seq(770L -> 4.toByte, 769L -> 1.toByte).foreach { case (held, state) =>
         val t = minted(ctx, TokenBond, collateral = Seq(Token(collateralToken, 100L), Token(SigUSD, held)))
         val src = liquidated(t.w)
-        val start = if (state == 1.toByte) t.height.toLong else 0L
-        accepts(executor(ctx), pullTx(t, src, pulledBox(t, src, state, start)))
-        val other = if (state == 1.toByte) 2.toByte else 1.toByte
-        rejectsAtSigning(executor(ctx), pullTx(t, src, pulledBox(t, src, other, if (other == 1.toByte) t.height.toLong else 0L)))
+        accepts(executor(ctx), pullTx(t, src, pulledBox(t, src, state, startFor(t, state))))
+        Seq(1.toByte, 2.toByte, 4.toByte).filter(_ != state).foreach { other =>
+          rejectsAtSigning(executor(ctx), pullTx(t, src, pulledBox(t, src, other, startFor(t, other))))
+        }
       }
     }
   }
 
-  property("pull: nothing to sell, a floor of 0, or a Selective lot that splits pro rata, opens no auction") {
+  property("pull: nothing to sell, an opening of 0, or a Selective lot that splits pro rata, opens no auction") {
     withCtx { ctx =>
       val bare = minted(ctx, collateral = Seq.empty)
       val src = liquidated(bare.w)
       accepts(executor(ctx), pullTx(bare, src, pulledBox(bare, src, 2.toByte, 0L)))
       rejectsAtSigning(executor(ctx), pullTx(bare, src, pulledBox(bare, src, 1.toByte, bare.height)))
+      rejectsAtSigning(executor(ctx), pullTx(bare, src, pulledBox(bare, src, 4.toByte, bare.height)))
+      // A floor of 0 is never short, so a thin lot gets the excess auction, with no reserve.
       val zero = minted(ctx, a = Auction(20000L, 0L, 500L))
       val src0 = liquidated(zero.w)
-      accepts(executor(ctx), pullTx(zero, src0, pulledBox(zero, src0, 2.toByte, 0L)))
+      accepts(executor(ctx), pullTx(zero, src0, pulledBox(zero, src0, 4.toByte, zero.height)))
+      rejectsAtSigning(executor(ctx), pullTx(zero, src0, pulledBox(zero, src0, 2.toByte, 0L)))
       rejectsAtSigning(executor(ctx), pullTx(zero, src0, pulledBox(zero, src0, 1.toByte, zero.height)))
+      // An opening of 0 (so a floor of 0) opens nothing.
+      val none = minted(ctx, a = Auction(0L, 0L, 500L))
+      val srcN = liquidated(none.w)
+      accepts(executor(ctx), pullTx(none, srcN, pulledBox(none, srcN, 2.toByte, 0L)))
+      rejectsAtSigning(executor(ctx), pullTx(none, srcN, pulledBox(none, srcN, 4.toByte, none.height)))
       // Selective (threshold 100): a token of 100 raw units splits and is paid in kind; one of 99 is auctioned.
       Seq(100L -> 2.toByte, 99L -> 1.toByte).foreach { case (units, state) =>
         val s = minted(ctx, a = Auction(20000L, 15000L, 500L, threshold = 100L), collateral = Seq(Token(collateralToken, units)))
@@ -329,12 +363,64 @@ class ZcStandardDutchAuctionSpec extends AnyPropSpec with ZcStandardSpecBase {
         sold.setContract(otherTree(ctx))).foreach { bad =>
         rejectsAtSigning(executor(ctx), saleTx(o, bad, 100L))
       }
-      // A vault that already held the floor in currency has no auction to buy into.
-      val held = minted(ctx)
-      val src = liquidated(held.w)
-      val closed = spendOutput(accepts(executor(ctx), pullTx(held, src, pulledBox(held, src, 2.toByte, 0L, 10500000000L),
-        funded = true)), 0)
+      // A vault with nothing to sell (state 2) has no auction to buy into.
+      val bare = minted(ctx, collateral = Seq.empty)
+      val src = liquidated(bare.w)
+      val closed = spendOutput(accepts(executor(ctx), pullTx(bare, src, pulledBox(bare, src, 2.toByte, 0L))), 0)
       rejectsAtSigning(executor(ctx), saleTx(o, soldBox(o.copy(vault = closed), 20000000000L), 100L, vault = closed))
+    }
+  }
+
+  /** A liquidated ERG vault lifted to the 10.5 ERG floor target at the pull: its thin lot is surplus. */
+  private def openExcess(ctx: BlockchainContext, a: Auction = null): Open = {
+    val m = minted(ctx, a = a)
+    val src = liquidated(m.w)
+    val tx = accepts(executor(ctx), pullTx(m, src, pulledBox(m, src, 4.toByte, m.height.toLong, 10500000000L), funded = true))
+    Open(m, spendOutput(tx, 0), m.height)
+  }
+
+  /** What an excess sale `since` blocks in must add: repayment * opening * (length - since) / (10000 * length). */
+  private def excessPrice(o: Open, since: Long): Long = {
+    val a = o.m.w.a
+    ceilDiv(BigInt(o.m.w.f.data(0)) * a.opening * (a.length - since), BigInt(10000L) * a.length)
+  }
+
+  property("excess sale: the price falls from the opening to zero over the length, to one raw unit, and must stay above zero") {
+    withCtx { ctx =>
+      val o = openExcess(ctx)
+      val held = o.vault.value
+      // 7 ERG at 200%: 14 ERG at the start, 7 ERG halfway, 0.028 ERG one block before the end.
+      excessPrice(o, 0L) shouldBe 14000000000L
+      Seq(0L, 250L, 499L).foreach { since =>
+        accepts(executor(ctx), saleTx(o, soldBox(o, held + excessPrice(o, since)), since))
+        rejectsAtSigning(executor(ctx), saleTx(o, soldBox(o, held + excessPrice(o, since) - 1L), since))
+      }
+      // At the end of the fall the price is zero and no payment buys the lot.
+      Seq(500L, 800L).foreach { since =>
+        rejectsAtSigning(executor(ctx), saleTx(o, soldBox(o, held + 15000000000L), since))
+      }
+      // The floor auction's target is no excess price: reaching 150% of the repayment pays nothing here.
+      rejectsAtSigning(executor(ctx), saleTx(o, soldBox(o, held), 100L))
+      // The lot leaves whole and the state closes.
+      val sold = soldBox(o, held + excessPrice(o, 100L))
+      Seq(sold.setTokens(sold.tokens.head, Token(collateralToken, 1L)), sold.withRegNum(6, ErgoValue.of(4.toByte))).foreach { bad =>
+        rejectsAtSigning(executor(ctx), saleTx(o, bad, 100L))
+      }
+    }
+  }
+
+  property("excess claims: wait for the end of the fall, not the expiry, then take the lot in kind") {
+    withCtx { ctx =>
+      // Falls for 500 blocks; the 700-block expiry does not apply to an excess auction.
+      val o = openExcess(ctx, Auction(20000L, 15000L, 500L, expiry = 700L))
+      val w = o.m.w
+      rejectsAtSigning(w.f.holder, partialTx(w, o.vault, o.m.holder, 250L, shares, 3.toByte, o.start + 499))
+      rejectsAtSigning(w.f.holder, partialTx(w, o.vault, o.m.holder, 250L, shares, 4.toByte, o.start + 500))
+      val tx = accepts(w.f.holder, partialTx(w, o.vault, o.m.holder, 250L, shares, 3.toByte, o.start + 500))
+      // 100 raw units of the thin token, a quarter of the shares: 25 units in kind.
+      tx.getOutputsToSpend.get(0).getTokens.get(0).getValue.longValue shouldBe 25L
+      // The final claim needs no wait, in an excess auction too.
+      accepts(w.f.holder, finalTx(w, o.vault, o.m.holder, o.start + 1))
     }
   }
 

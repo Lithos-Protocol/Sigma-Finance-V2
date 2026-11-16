@@ -23,7 +23,8 @@
     // R6: Coll[Long] - borrower values (7..64 Longs), with actual principal resolved by PricedOrder:
     //   0 repayment amount; 1 principal nanoERG; 2 repayment ERG floor excluding fee refund;
     //   3 requested maturity height or on-close duration; 4 order expiry height (historical);
-    //   5 expiry fee (already refunded); 6 maturity mode; 7.. liquidation payload
+    //   5 expiry fee (already refunded); 6 maturity mode (0 fixed, 1 on-close, 2 window: 3 is then
+    //   the window's minimum duration and the lender chose the maturity); 7.. liquidation payload
     // R7: Coll[(Coll[Byte], Long)] - agreed principal tokens
     // Both accepted issuing orders lend only in this bond's repayment asset, so for a bond it created the
     // principal P is R6(1) for ERG (R7 empty) and R7(0)._2 for a token (R7 exactly that token),
@@ -36,6 +37,7 @@
     // recollateralization stamps a new one (see RECOLLATERALIZE).
     //
     // PATHS AND CONTEXT VARS
+    // Refresh:     9 Int successor output index. Selects this path whatever else is set.
     // Liquidation: 0 Coll[Byte] liquidation expression; 1 Int settlement output index.
     // Repayment:   1 Int settlement output index; 2 Int collateral-return output index. Vars 0, 3 absent.
     // Recollateralize:      3 Int successor output index. Var 0 absent.
@@ -70,12 +72,31 @@
     // liquidator's transaction, but the liquidator rebuilds against the new box, which the borrower
     // cannot move again in time. The box id changes; the asset does not.
     //
+    // REFRESH (anyone, once the box is more than 525600 blocks, about two years, old)
+    // Storage rent lets anyone take a box four years old whose value does not cover the rent, tokens
+    // included. Here that would free the 2-unit reserve, and a hand-made box holding it under this
+    // script would pass every state-box check. So anyone may re-create the box unchanged to reset its
+    // age, keeping up to 10000000 nanoERG (0.01 ERG) of its value as a bounty, never taking it below
+    // the fee reserve plus 1000000 (a box at or under that is renewed for nothing). The bounty and the
+    // window match LithosDex's paid refresh, so one refresher rule covers both. The successor has
+    // this script, the same tokens and registers, and a creation height between 1000 and 60 blocks
+    // before HEIGHT, so the next refresh is about two years away. The bounty comes out of collateral
+    // ERG, so it can lower an oracle cover by up to 0.01 ERG.
+    // A refresh moves the bond, so pending transactions against the old box id must be rebuilt.
+    // Two limits keep a third party from using that against the borrower:
+    // - The stamp is at least 60 blocks old, so the refreshed bond has already rested and the
+    //   borrower can recollateralize at once: a refresh never starts the 60-block wait.
+    // - No refresh in the 720 blocks before maturity, where voiding a pending repayment could push
+    //   the borrower past maturity into liquidation. From maturity on, liquidation is open to anyone
+    //   anyway, and a refresh is allowed again.
+    //
     // ASSUMPTIONS
     // A hand-made box with this script proves nothing: authenticate the asset's issuer (Order or PricedOrder).
     // The liquidation expression controls the vault's contents; both parties must inspect it.
     // Anyone may repay in full. Liquidation may run before maturity if the expression allows it.
     // An anyone-can-spend borrower script lets anyone recollateralize or repay from collateral.
-    // Storage rent, live-node serialization and maximum cost are unverified.
+    // A refresh relies on someone sending it within the two years before rent is due; the bounty is
+    // the reason to. Live-node serialization and maximum cost are unverified.
 
     val borrower = SELF.R6[Coll[Long]].get
     val lender = SELF.R9[Coll[Long]].get
@@ -89,6 +110,7 @@
         val collateral = SELF.tokens.slice(1, SELF.tokens.size)
         val liquidationScript = getVar[Coll[Byte]](0)
         val recollateralizeIndex = getVar[Int](3)
+        val refreshIndex = getVar[Int](9)
         val repaymentToken = CONST_REPAYMENT_TOKEN
         // An empty collection taken from the box, not written as a literal. Testing the constant
         // alone (its size) is folded at compile time, which gives the ERG and token bonds different
@@ -100,6 +122,34 @@
 
         if (fee < 0L || fee > SELF.value - 1000000L) {
             sigmaProp(false)
+        } else if (refreshIndex.isDefined) {
+            // Refresh: re-create the box unchanged to reset its age, paying the refresher.
+            val index = refreshIndex.get
+            if (index < 0 || index >= OUTPUTS.size) {
+                sigmaProp(false)
+            } else {
+                val next = OUTPUTS(index)
+                val stamped = next.creationInfo._1
+                // The least the successor may hold: at most the bounty less, never under the floor.
+                val floor = fee + 1000000L
+                val kept = if (SELF.value < floor) SELF.value else floor
+                val least = if (SELF.value - 10000000L > kept) SELF.value - 10000000L else kept
+                // Not in the last 720 blocks before maturity, where it could void a repayment for good.
+                val clearOfMaturity = HEIGHT.toLong < maturity - 720L || HEIGHT.toLong >= maturity
+                sigmaProp(
+                    SELF.creationInfo._1 < HEIGHT - 525600 && clearOfMaturity &&
+                    stamped > HEIGHT - 1000 && stamped <= HEIGHT - 60 &&
+                    next.propositionBytes == SELF.propositionBytes &&
+                    next.value >= least &&
+                    next.tokens == SELF.tokens &&
+                    next.R4[Coll[Byte]].get == SELF.R4[Coll[Byte]].get &&
+                    next.R5[Coll[Byte]].get == borrowerHash &&
+                    next.R6[Coll[Long]].get == borrower &&
+                    next.R7[Coll[(Coll[Byte], Long)]].get == SELF.R7[Coll[(Coll[Byte], Long)]].get &&
+                    next.R8[Coll[Byte]].get == SELF.R8[Coll[Byte]].get &&
+                    next.R9[Coll[Long]].get == lender
+                )
+            }
         } else if (liquidationScript.isDefined || !recollateralizeIndex.isDefined) {
             // Settlement: liquidation or repayment
             val settlementIndex = getVar[Int](1).get

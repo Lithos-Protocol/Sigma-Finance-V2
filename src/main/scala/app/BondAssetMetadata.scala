@@ -35,7 +35,7 @@ object BondAssetMetadata {
       "height" -> Json.fromInt(buildHeight))
     val duration = order.schedule match {
       case OnClose(blocks) => Seq("durationBlocks" -> Json.fromLong(blocks))
-      case FixedMaturity(_) => Seq.empty
+      case FixedMaturity(_) | MaturityWindow(_, _) => Seq.empty
     }
     Json.obj((fields ++ duration): _*).noSpaces
   }

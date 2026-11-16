@@ -382,6 +382,31 @@ A batcher following this profile:
   current height's price, because that price only falls.
 - **Skips** boxes that break script disclosure and boxes that name an expression missing from the
   reference (it cannot supply the bytes).
+- **Picks a window order's maturity by one rule.** When an offer fills a window order, the candidates are
+  the ends of the heights both accept, both curves' breakpoints and the grid heights between: between
+  them both yields are straight lines, so the best is always one of them. Of the ones the offer accepts,
+  a grid height first, then the widest gap between the yield the offer earns and the one it requires,
+  then the shorter. The match command names the maturity (`match-offer ... --maturity <height>`).
+- **Refreshes old boxes.** Bonds, bond vaults, share vaults and wrap vaults more than 525,600 blocks old
+  pay up to 0.01 ERG to whoever refreshes them; bonds and vaults pack with refunds and liquidations, a
+  wrap vault goes alone. A bond due for liquidation is liquidated instead, and none is refreshed in the
+  720 blocks before its maturity. A box at its floor pays nothing; a client may still refresh it.
+
+## Window maturity, refresh and wraps
+
+- **Window orders.** A wallet lender picks any maturity in the window; the client's default is the
+  earliest grid height in it, else its shortest maturity. Batchers use the rule above.
+- **Refresh.** A bond's successor is stamped 60 blocks back (the contract allows 60 to 999), so the
+  borrower may recollateralize at once, and the refresh discloses the borrower's script. A vault's is
+  stamped at the current height. A reader who cannot find a bond's borrower through the box's creating
+  transaction looks in the fill that minted the bond asset, which paid the principal to it: a refresh
+  is open to anyone, zcs1 client or not, and must never hide a borrower.
+- **Wraps.** A capability token (one whose presence among inputs grants authority elsewhere, such as a
+  LithosDex position's owner NFT) never goes raw into an order, bond, ask or lot: its receipt does.
+  Receipts are named `ZCS-Wrap-<id6 of the token>` with decimals 0 and a description
+  `{"zcs":1,"type":"wrap receipt","token":"<id>","amount":<n>,"note":"Verify on chain."}`. A new wrap
+  funds its vault with a refresh reserve, 0.03 ERG by default (three refreshes, about six years).
+  Readers verify a receipt as a share: the request box it is named after was spent under `WrapMint`.
 
 ## Expressions
 
@@ -421,6 +446,9 @@ when the order's oracle age is at least the offer's. The values are the CLI's cu
 | Yield end point | the order's or ask's expiry | after the start |
 | Lot auction fall, hold | 720 and 2,160 blocks | the fall at least 1 block |
 | Lot refund fee | 0.002 ERG | none |
+| Window order's maturity on a wallet fill | the earliest grid height in the window, else its shortest | in the window |
+| Wrap mint fee; wrap vault refresh reserve | 0.005 ERG; 0.03 ERG | 0.002 ERG; none |
+| Refresh age, bounty, stamp | 525,600 blocks; 0.01 ERG; a bond 60 blocks back, a vault now | the same; bond 60 to 999 back, others up to 999 |
 
 Token offers also enforce a proportional total ERG budget covering rewards, box funding and reserves.
 The original capital and both budgets survive every continuation. A 1% minimum therefore permits at
@@ -460,6 +488,12 @@ opening and floor of a lot.
 4. Specs for packing pulls, and for several refunds or liquidations of one owner in a single
    transaction, in the contract harness.
 5. Check how wallets show the supply of a bond unit (3, issued across two outputs) and of shares (2N+1).
+6. Recognize capability tokens without being told: a client that knows LithosDex's provision guard hashes
+   and provision tokens can refuse a raw owner NFT in any order, ask or lot, and offer to wrap it. The
+   CLI does not yet; LithosDex's guard reads context variable 64, which this profile reserves for script
+   disclosure on `INPUTS(0)`, so keep provision boxes off `INPUTS(0)` in ZC transactions.
+7. Nautilus (ErgoTree v2 only) users: v2 intent contracts batched by Lithos clients. Edge contracts,
+   planned after the standard is final; notes in the local plan.
 
 ## CLI status
 
@@ -473,5 +507,9 @@ opening and floor of a lot.
 | Cover at the fill | `create-order` gives an oracle order the fill guard at its `--ratio`, or at `--fill-ratio`; `--no-fill-guard` leaves it out. It notes the cover now and the ERG price at which the guard stops fills, and warns when it would refuse one now; an unguarded order already under its own ratio is refused. `fill-order`, `match-offer` and `batch` supply the guard and the oracle and check the guard first. `sell --min-cover <percent> [--oracle-age <blocks>]` adds the sale guard at a yield or a fixed price; `buy`, `match-offer` and `batch` check it. `fill-order` and `buy` refuse a bond under its own ratio, and `buy` names the `liquidate` command instead; `--allow-liquidatable` overrides those and the unguarded create-order refusal, never a guard. A fixed-maturity order's default expiry is half its term at most, and a later `--expires-in` warns. Without a readable oracle, unguarded boxes are not checked and a note says so. |
 | Shares | `fractionalize` and `create-offer --deliver-shares` make only Selective (default) or Dutch (`--vault dutch`) requests, and need `--auction-opening` and `--auction-floor`. Plain fractional vaults made earlier stay listable, pullable and claimable. `match-offer` buys shares only from the Dutch-pair mint, within the offer's floor and expiry bounds. |
 | Lots | `sell-lot`, `lots`, `take-lot`, `cancel-lot`, `refund-lot`; `pack` and `batch` include expired lots. |
-| Batching | `pack` for refunds and liquidations; `batch --run` packs, ranks offers and their sources, and runs up to 5 rounds with mempool lookups. `--mempool` turns those lookups on for any command. |
+| Window orders | `create-order --window <min>:<max> [--yield <cap>] [--curve ...]`; `fill-order --maturity`, defaulting to the earliest grid height; `match-offer --maturity`, defaulting to the zcs1 rule, which `batch` uses and names in each match command. `orders` shows the window and curve. |
+| Dutch excess auctions | `pull` opens state 4 when the floor is held; `buy-lot` pays its falling price and refuses once it reaches zero; `claim-shares` waits for the end of its fall; `shares` shows it. |
+| Refresh | `refresh <box id ...>` (bonds, bond vaults and share vaults pack; a wrap vault alone); `pack` refreshes old bonds that are not due and old vaults; `batch` lists every refresh that pays. Bonds are stamped 60 back and disclose their borrower; a borrower is also found through the fill. |
+| Wraps | `wrap`, `mint-wrap` (the request as the only input), `cancel-wrap`, `unwrap`, `wraps` (with receipt verification and refresh height); `batch` lists mints. Raw capability tokens are not yet recognized and refused. |
+| Batching | `pack` for refunds, liquidations and refreshes; `batch --run` packs, ranks offers and their sources, and runs up to 5 rounds with mempool lookups. `--mempool` turns those lookups on for any command. |
 | Defaults | As in the table above |

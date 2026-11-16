@@ -95,6 +95,16 @@ object StandardMetadata {
       ShareDecimals)
   }
 
+  /**
+   * A wrap receipt's (name, description, decimals): one indivisible unit standing for `amount` raw units of the
+   * wrapped token, which the receipt's holder takes back by burning it.
+   */
+  def receipt(wrapped: ErgoId, amount: Long): Seq[String] = Seq(
+    s"ZCS-Wrap-${id6(wrapped)}",
+    json(Seq("zcs" -> Version, "type" -> str("wrap receipt"), "token" -> str(wrapped.toString),
+      "amount" -> amount.toString, "note" -> str(Verify))),
+    "0")
+
   /** The metadata as EIP-4 register bytes. */
   def bytes(metadata: Seq[String]): Seq[Array[Byte]] = metadata.map(_.getBytes("UTF-8"))
 

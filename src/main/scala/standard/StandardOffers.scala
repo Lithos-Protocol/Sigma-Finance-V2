@@ -176,6 +176,39 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     else None
   }
 
+  /**
+   * zcs1's maturity for filling window order `order` from offer `o`, or None when no maturity suits both. The
+   * candidates are the ends of the heights both accept, both curves' breakpoints and the grid heights between: between
+   * those, both yields are straight lines, so the best maturity is always one of them. Of the ones the offer accepts,
+   * a grid height comes first (bonds then gather on series maturities), then the widest gap between the yield the
+   * offer would earn and the yield it requires (the most room for the inclusion height to move), then the shorter.
+   * Nothing on chain enforces this: it is how every zcs1 batcher picks the same maturity.
+   */
+  def windowMaturity(o: StdOffer, order: StdOrder, oracle: Option[OracleState]): Option[Long] = {
+    val start = height.toLong
+    val at = start + 1L
+    (protocol.orderWindow(order), protocol.orderBorrowCurve(order)) match {
+      case (Some((lo, hi)), Some(borrow)) =>
+        val from = math.max(start + lo, at + o.minBlocks)
+        val to = math.min(start + hi, at + o.maxBlocks)
+        val candidates = (Seq(from, to) ++ borrow.breakpoints.map(start + _) ++ o.curve.points.map(p => at + p._2) ++
+          windowGrid(from, to)).filter(m => m >= from && m <= to).distinct
+        val feasible: Seq[(Long, BigInt)] = candidates.flatMap { m =>
+          Try[Option[(Long, BigInt)]] {
+            val resolved = resolveOrder(order, start, Some(m))
+            val bond = prospective(resolved, start, m, o.feeReserve)
+            if (offerRefusal(o, bond, resolved.principal, 1L, 1L, oracle, primary = true).isEmpty &&
+              guardRefusal(resolved, bond, oracle).isEmpty) {
+              val (rate, span) = o.curve.at(m - at)
+              Some(m -> (impliedYield(o, resolved.repayment, resolved.principal, 1L, 1L, m) - rate * 1000000 / span))
+            } else None
+          }.toOption.flatten.toSeq
+        }
+        feasible.sortBy { case (m, gap) => (if (m % MaturityGrid == 0L) 0 else 1, -gap, m) }.headOption.map(_._1)
+      case _ => None
+    }
+  }
+
   /** The offer's context vars common to every match: 0 its continuation, 1 the policy expression. */
   private def offerInput(o: StdOffer, nextIndex: Int): InputUTXO =
     o.box.withCtxVar(0.toByte, intValue(nextIndex)).withCtxVar(1.toByte, bytesValue(protocol.market(o.market).policy.valueBytes))
@@ -222,16 +255,19 @@ trait StandardOffers extends AppBase { self: StandardApp =>
    * principal and the new bond's fee reserve, and this wallet keeps the offer's batcher fee. Outputs: 0 the
    * delivery, 1 the bond, 2 the principal, 3 the offer's continuation.
    */
-  def matchOrder(offerId: String, orderId: String): Prepared = {
+  def matchOrder(offerId: String, orderId: String, chosenMaturity: Option[Long] = None): Prepared = {
     val o = protocol.asOffer(unspent(offerId)).getOrElse(fail(s"$offerId is not a ZC Standard lend offer"))
     val original = protocol.asOrder(unspent(orderId)).getOrElse(fail(s"$orderId is not a ZC Standard order"))
     checkOrder(original)
-    val order = resolveOrder(original, height.toLong)
+    val oracle = Try(self.oracle()).toOption.flatten
     val start = height.toLong
-    val maturity = if (order.onClose) addAmount(start, order.terms(3)) else order.terms(3)
+    // A window order matches at the maturity given, or else the one zcs1's rule picks for this offer.
+    val maturity = if (!original.window) orderMaturity(original, start, chosenMaturity)
+      else orderMaturity(original, start, chosenMaturity.orElse(windowMaturity(o, original, oracle))
+        .orElse(Some(fail("no maturity in the order's window suits the offer: its window, curve, minimum price or policy refuse every one"))))
+    val order = resolveOrder(original, start, Some(maturity))
     val asset = order.box.id
     val bond = prospective(order, start, maturity, o.feeReserve)
-    val oracle = Try(self.oracle()).toOption.flatten
     offerRefusal(o, bond, order.principal, 1L, 1L, oracle, primary = true).foreach(r => fail(s"the offer refuses this order: $r"))
     guardRefusal(order, bond, oracle).foreach(r => fail(s"the order's fill guard refuses this fill: $r"))
     oracle.foreach(readableOracle)

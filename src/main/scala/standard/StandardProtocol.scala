@@ -105,8 +105,45 @@ case class YieldCurve(minBps: Long, points: Seq[(Long, Long)]) {
 }
 
 /**
+ * A window order's yield curve (CurveOrder_Pricing): the most it pays at each number of blocks left, in straight
+ * lines between (yield bps, blocks left) points, flat beyond the first and last, and never above `maxBps`. With no
+ * points it is `maxBps` everywhere. The mirror of `YieldCurve`, compared exactly as the expression does.
+ */
+case class BorrowCurve(maxBps: Long, points: Seq[(Long, Long)]) {
+  def ordered: Boolean = points.map(_._2).sliding(2).forall { case Seq(a, b) => b > a; case _ => true }
+  def valid: Boolean = maxBps >= 0L && points.size <= StandardProtocol.MaxCurvePoints && ordered && points.forall(_._1 >= 0L)
+
+  /** The yield paid at `blocksLeft`, exactly `rate / span` bps. */
+  def at(blocksLeft: Long): (BigInt, BigInt) = {
+    val (rate, span) = YieldCurve(0L, points).at(blocksLeft) match {
+      case _ if points.isEmpty => (BigInt(maxBps), BigInt(1))
+      case other => other
+    }
+    (rate.min(BigInt(maxBps) * span), span)
+  }
+
+  def bpsAt(blocksLeft: Long): Long = { val (r, s) = at(blocksLeft); (r / s).toLong }
+
+  /** The least principal for a bond repaying `repayment`, `blocksLeft` blocks out: ceil(R B L / (B L + Y D)). */
+  def price(repayment: Long, blocksLeft: Long): BigInt = {
+    val (rate, span) = at(blocksLeft)
+    val num = BigInt(repayment) * StandardProtocol.Year * span
+    val den = StandardProtocol.Year * span + rate * blocksLeft
+    (num + den - 1) / den
+  }
+
+  /** The curve's own breakpoints, in blocks left. */
+  def breakpoints: Seq[Long] = points.map(_._2)
+
+  def describe: String =
+    if (points.isEmpty) s"${Units.percent(maxBps)} at every maturity"
+    else points.map { case (y, d) => s"${Units.percent(y)} at $d blocks" }.mkString(", ") + s", never above ${Units.percent(maxBps)}"
+}
+
+/**
  * A fixed or priced order. `terms` is R4; a priced fill resolves principal before copying it: 0 repayment, 1 principal nanoERG,
- * 2 repayment ERG floor, 3 maturity height or duration, 4 expiry height, 5 expiry fee, 6 mode, 7.. payload.
+ * 2 repayment ERG floor, 3 maturity height, duration or (window) minimum duration, 4 expiry height, 5 expiry fee,
+ * 6 mode (0 fixed, 1 on-close, 2 window), 7.. payload.
  * `guardHash` is fixed Order R8 or PricedOrder R8(1), the optional fill guard; the
  * standard guard reads its minimum fill ratio at payload(2).
  */
@@ -122,6 +159,8 @@ case class StdOrder(box: InputUTXO, market: Market, terms: Seq[Long], principalT
   def expiry: Long = terms(4)
   def expiryFee: Long = terms(5)
   def onClose: Boolean = terms(6) == 1L
+  /** A window order: the lender picks the maturity, between `terms(3)` and R9(0) blocks after the start. */
+  def window: Boolean = terms(6) == 2L
   def payload: Seq[Long] = terms.drop(7)
   /** The principal in the market's unit: nanoERG, or the one principal token's amount. */
   def principal: Long = if (market.token.isEmpty) principalErg else principalTokens.headOption.fold(0L)(_.amount)
@@ -180,22 +219,27 @@ case class StdShareRequest(box: InputUTXO, dutch: Option[Market], ownerHash: Arr
  * A share vault: ZC_Standard_FractionalVault or ZC_Standard_DutchAuctionVault. It holds the share's
  * N+1 reserve, then the bond unit until the pull, then the settlement's proceeds. For a Dutch vault,
  * `auction` is (repayment, opening bps, floor bps, length, expiry, in-kind threshold, start height) and
- * `state` is 0 repaid, 1 auction open, 2 sold, nothing to sell or paid in kind at the pull, 3 paid in kind
- * after the auction's expiry (meaningful only after the pull).
+ * `state` is 0 repaid, 1 auction open short of the floor, 2 sold or nothing to sell, 3 paid in kind after an
+ * auction, 4 excess auction open (the floor already held; meaningful only after the pull).
  */
 case class StdShareVault(box: InputUTXO, dutch: Boolean, bondAsset: ErgoId, n: Long, outstanding: Long,
                          pullFee: Long, state: Option[Byte], auction: Seq[Long], currency: Option[Array[Byte]]) {
   def shareId: ErgoId = box.tokens.head.id
   def assets: Seq[Token] = box.tokens.drop(1)
   def holding: Boolean = assets.exists(_.id == bondAsset)
-  def auctionOpen: Boolean = dutch && !holding && state.contains(1.toByte)
+  def auctionOpen: Boolean = dutch && !holding && (state.contains(1.toByte) || state.contains(4.toByte))
+  /** An excess auction: the vault held the floor at the pull, and its thin lot sells from the opening down to zero. */
+  def excess: Boolean = auctionOpen && state.contains(4.toByte)
   def currencyToken: Option[ErgoId] = currency.filter(_.length == 32).map(new ErgoId(_))
   def auctionLength: Long = auction(3)
   def auctionExpiry: Long = auction(4)
   def threshold: Long = auction(5)
   def auctionStart: Long = auction(6)
-  /** The first height at which holders may claim an unsold lot in kind. */
-  def claimableFrom: Long = auctionStart + auctionExpiry
+  /**
+   * The first height at which holders may claim an unsold lot in kind: a floor auction's expiry, or the end of an
+   * excess auction's fall, where its price reaches zero.
+   */
+  def claimableFrom: Long = auctionStart + (if (excess) auctionLength else auctionExpiry)
 }
 
 /** An ask: a ZC_Standard_SaleOrder, or a ZC_Standard_PricedAsk (`priced`) priced by its R6 expression. */
@@ -212,6 +256,21 @@ case class StdAsk(box: InputUTXO, market: Market, priced: Boolean, sellerHash: A
     else Some(YieldLine(terms(5), terms(6), terms(7), terms(8)))
   /** The fixed price (a sale order's price, a priced ask's floor) of `units` raw units. */
   def fixedPrice(units: Long): BigInt = (BigInt(units) * numerator + denominator - 1) / denominator
+}
+
+/**
+ * A ZC_Standard_WrapMint request: one token (any amount) waiting to be wrapped. R4 the owner's script hash, R5 the
+ * mint fee, R6 the receipt's EIP-4 (name, description, decimals).
+ */
+case class StdWrapRequest(box: InputUTXO, ownerHash: Array[Byte], mintFee: Long, metadata: Seq[Array[Byte]]) {
+  def wrapped: Token = box.tokens.head
+  def receiptId: ErgoId = box.id
+}
+
+/** A ZC_Standard_WrapVault: the receipt's 2-unit reserve, and the wrapped token, released by burning all 3. */
+case class StdWrapVault(box: InputUTXO) {
+  def receiptId: ErgoId = box.tokens.head.id
+  def wrapped: Token = box.tokens(1)
 }
 
 /** A ZC_Standard_LotAuction: everything in the box sold whole for the market's asset at a falling price. */
@@ -317,11 +376,22 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
 
   def orderPricingOf(order: StdOrder): Contract = {
     val c = market(order.market)
-    Seq(c.yieldOrderPricing).find(p => order.pricingHash.exists(_.sameElements(p.hashedValueBytes)))
+    Seq(c.yieldOrderPricing, c.curveOrderPricing).find(p => order.pricingHash.exists(_.sameElements(p.hashedValueBytes)))
       .getOrElse(throw app.CliError("the order names an unknown pricing expression"))
   }
 
   def yieldOrder(order: StdOrder): Boolean = order.pricingHash.exists(_.sameElements(market(order.market).yieldOrderPricing.hashedValueBytes))
+
+  def curveOrder(order: StdOrder): Boolean = order.pricingHash.exists(_.sameElements(market(order.market).curveOrderPricing.hashedValueBytes))
+
+  /** A window order's durations from the start: (R4(3) minimum, R9(0) maximum), as its shell reads them. */
+  def orderWindow(order: StdOrder): Option[(Long, Long)] =
+    if (!order.window || order.pricingTerms.isEmpty) None else Some(order.terms(3) -> order.pricingTerms.head)
+
+  /** A curve order's curve: R9 = (maximum duration, maximum yield, then (yield, blocks left) points). */
+  def orderBorrowCurve(order: StdOrder): Option[BorrowCurve] =
+    if (!curveOrder(order) || order.pricingTerms.size < 2 || order.pricingTerms.size % 2 != 0) None
+    else Some(BorrowCurve(order.pricingTerms(1), curvePoints(order.pricingTerms.drop(2))))
 
   /** A yield order's two points, R9 = (start height, start yield, end height, end yield). */
   def orderYieldLine(order: StdOrder): Option[YieldLine] =
@@ -433,6 +503,19 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
     terms <- longsReg(box, 5) if terms.length == 6
   } yield StdLot(box, m, seller, terms.toSeq)
 
+  def asWrapRequest(box: InputUTXO): Option[StdWrapRequest] =
+    if (!sameTree(box.input.getErgoTree, contracts.wrapMint.ergoTree) || box.tokens.size != 1) None
+    else for {
+      owner <- bytesReg(box, 4) if owner.length == 32
+      fee <- longReg(box, 5)
+      metadata <- bytesListReg(box, 6) if metadata.size == 3
+    } yield StdWrapRequest(box, owner, fee, metadata)
+
+  def asWrapVault(box: InputUTXO): Option[StdWrapVault] =
+    if (!sameTree(box.input.getErgoTree, contracts.wrapVault.ergoTree) || box.tokens.size != 2 ||
+      box.tokens.head.amount != 2L || box.registers.nonEmpty) None
+    else Some(StdWrapVault(box))
+
   /** A short name for a script this client knows, for transaction summaries. */
   def nameOf(tree: ErgoTree): Option[String] =
     contracts.entries.find(e => !e.expression && sameTree(tree, e.contract.ergoTree)).map(e => s"ZC_Standard_${e.label}")
@@ -443,13 +526,14 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
 
   /**
    * The register in which a box under `tree` names a script by its hash, which zcs1 script disclosure
-   * covers: an order's borrower (R6), a bond's borrower (R5), a lend offer's owner and an ask's seller (R4),
-   * and a share mint request's owner (R7).
+   * covers: an order's borrower (R6), a bond's borrower (R5), a lend offer's owner, an ask's seller and a wrap
+   * request's owner (R4), and a share mint request's owner (R7).
    */
   def namedScriptRegister(tree: ErgoTree): Option[Int] =
     if (orderMarket(tree).isDefined) Some(6)
     else if (bondMarket(tree).isDefined) Some(5)
     else if (Seq[MarketContracts => Contract](_.offer, _.saleOrder, _.pricedAsk, _.lotAuction).exists(marketWhere(tree, _).isDefined)) Some(4)
+    else if (sameTree(tree, contracts.wrapMint.ergoTree)) Some(4)
     else if (isShareMint(tree)) Some(7)
     else None
 
@@ -497,6 +581,27 @@ object StandardProtocol {
 
   /** The start-height window a fill may use. */
   val StartSlack: Long = 8L
+
+  /**
+   * The paid refresh on bonds, bond vaults, share vaults and wrap vaults, matching LithosDex's T2T provisions: a
+   * box more than `RefreshAge` blocks old (about two years) may be re-created unchanged by anyone, who keeps up to
+   * `RefreshBounty` of its nanoERG, never taking it below the box's own floor. The successor's creation height is
+   * within `RefreshSlack` blocks of inclusion; a bond's is also at least `RecollateralizeWait` old, and a bond is
+   * not refreshed in the `RefreshMaturityGap` blocks before its maturity.
+   */
+  val RefreshAge: Long = 525600L
+  val RefreshBounty: Long = 10000000L
+  val RefreshSlack: Long = 1000L
+  val RefreshMaturityGap: Long = 720L
+
+  /** What a refresh must leave in a box holding `value` with floor `floor`: at most the bounty less, never under it. */
+  def refreshedValue(value: Long, floor: Long): Long = math.max(math.min(value, floor), value - RefreshBounty)
+
+  /** Whether a box created at `created` may be refreshed at `height`. */
+  def refreshable(created: Long, height: Long): Boolean = created < height - RefreshAge
+
+  /** zcs1's default refresh reserve funded into a new wrap vault: three refreshes, about six more years. */
+  val DefaultRefreshReserve: Long = 3L * RefreshBounty
 
   /** The floor every standard batching fee shares on-chain: 0.002 ERG. */
   val MinBatchingFee: Long = 2000000L

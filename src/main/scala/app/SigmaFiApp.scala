@@ -84,6 +84,7 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
       case OnClose(d) =>
         if (d < 30) fail(s"the order's duration of $d blocks is under the 30-block minimum, so it cannot be filled")
         addAmount(height.toLong, d)
+      case MaturityWindow(_, _) => fail("first-generation orders have no maturity window")
     }
     val borrower = treeFor(order.borrowerHash, order.box, treesReg(order.box, 4)).getOrElse(fail(
       "cannot find the borrower's ErgoTree: the order carries no hint, and no box in the transaction that " +
@@ -141,6 +142,7 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
         if (d < 30) fail("an on-close order's duration must be at least 30 blocks")
         protocol.onCloseTemplate.withTerms(OnCloseOrderTerms(bondHash, borrowerHash, loan.principalErg,
           principalTokens, loan.repayment, d, liq.hash))
+      case MaturityWindow(_, _) => fail("a maturity window needs a ZC Standard order")
     }
     val order = UTXO(Contract(tree), loan.collateralErg, loan.collateralTokens, Seq(treesValue(myTree)))
 
@@ -148,6 +150,7 @@ class SigmaFiApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, o
       case FixedMaturity(h) => s"maturity: height $h (${h - height} blocks from now). Cancel the order if it " +
         "is still open close to then."
       case OnClose(d) => s"maturity: $d blocks after a lender fills it"
+      case MaturityWindow(lo, hi) => s"maturity: $lo to $hi blocks after a lender fills it"
     }, "Output 0 is the order. Cancel it any time before it is filled with `cancel-order --old <its box id>`.")
     prepare("Create order", plan(Seq.empty, Seq(order)), notes)
   }

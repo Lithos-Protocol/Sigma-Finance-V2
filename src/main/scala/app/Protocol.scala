@@ -21,6 +21,8 @@ import scala.collection.mutable
 sealed trait Schedule
 case class FixedMaturity(height: Long) extends Schedule
 case class OnClose(duration: Long) extends Schedule
+/** ZC Standard only: the lender picks a maturity `minDuration` to `maxDuration` blocks after the fill. */
+case class MaturityWindow(minDuration: Long, maxDuration: Long) extends Schedule
 
 /** A borrower's order, of either style. The box's whole contents are the collateral. */
 case class OrderInfo(box: InputUTXO,

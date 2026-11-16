@@ -26,7 +26,10 @@ case class AuctionTerms(openingBps: Long, floorBps: Long, length: Long, expiry: 
      else s"after a liquidation the collateral is auctioned only if some item holds fewer than $threshold raw units, " +
        "otherwise holders are paid in kind") +
       s"; the auction falls from ${Units.percent(openingBps)} to ${Units.percent(floorBps)} of the repayment over " +
-      s"$length blocks and holds there until $expiry blocks after it opens, when holders may take it in kind"
+      s"$length blocks and holds there until $expiry blocks after it opens, when holders may take it in kind" +
+      (if (openingBps > 0L) s"; if the vault already holds the floor, thin items are sold in an excess auction falling " +
+        s"from ${Units.percent(openingBps)} of the repayment to nothing over $length blocks, then paid in kind"
+       else "")
 }
 
 object AuctionTerms {
@@ -206,8 +209,9 @@ trait StandardShares extends AppBase { self: StandardApp =>
 
   /**
    * Pull a settled bond's vault into the share vault holding its unit; all 3 bond units burn. A liquidated
-   * bond's lot opens a Dutch auction if the vault holds less currency than the floor and some lot item is under
-   * the vault's in-kind threshold. Earns the pull fee.
+   * bond's lot opens an auction when some lot item is under the vault's in-kind threshold: the floor auction
+   * (state 1) if the vault holds less currency than the floor, else an excess auction (state 4) if the opening
+   * is above zero. Earns the pull fee.
    */
   def pull(vaultId: String): Prepared = {
     val v = protocol.asShareVault(unspent(vaultId)).getOrElse(fail(s"$vaultId is not a share vault"))
@@ -229,17 +233,21 @@ trait StandardShares extends AppBase { self: StandardApp =>
         val hasLot = lotTokens.nonEmpty || lotErg > 0L
         val short = BigInt(held) * 10000 < BigInt(v.auction(0)) * v.auction(2)
         val thin = lotTokens.exists(_.amount < v.threshold) || (currency.isDefined && lotErg < v.threshold)
-        val state: Byte = if (!source.liquidated) 0 else if (hasLot && short && thin) 1 else 2
-        val began = if (state == 1) height.toLong else 0L
+        val sells = source.liquidated && hasLot && thin
+        val state: Byte =
+          if (!source.liquidated) 0 else if (sells && short) 1 else if (sells && v.auction(1) > 0L) 4 else 2
+        val began = if (state == 1 || state == 4) height.toLong else 0L
         (supply ++ Seq(ErgoValue.of(state), longsValue(v.auction.updated(6, began): _*), bytesValue(v.currency.get)),
           state match {
             case 0 => "repaid"
             case 1 => s"liquidated: a Dutch auction of the lot opens at height $began; holders may take it in kind " +
               s"from height ${began + v.auctionExpiry} if it is unsold"
+            case 4 => s"liquidated with the floor already held: an excess auction of the thin lot opens at height $began, " +
+              s"falling to nothing by height ${began + v.auctionLength}, after which holders take it in kind"
             case _ if !hasLot => "liquidated: there is no lot to sell; holders are paid in kind"
-            case _ if !short => "liquidated: the vault already holds the floor; holders are paid in kind"
-            case _ => s"liquidated: every lot item holds at least ${v.threshold} raw units, so it splits pro rata; " +
+            case _ if !thin => s"liquidated: every lot item holds at least ${v.threshold} raw units, so it splits pro rata; " +
               "holders are paid in kind (`sell-lot` auctions what you claim)"
+            case _ => "liquidated: the auction's opening is 0, so nothing is auctioned; holders are paid in kind"
           })
       }
     val next = UTXO(Contract(v.box.input.getErgoTree), value, tokens, regs)
@@ -262,15 +270,38 @@ trait StandardShares extends AppBase { self: StandardApp =>
     v.currencyToken.fold(v.box.value)(id => v.assets.filter(_.id == id).map(_.amount).sum)
 
   /**
-   * Buy a Dutch auction's lot: bring the vault's currency up to the current target and take everything else.
-   * The target falls with height, so a purchase priced now stays valid later.
+   * What an excess auction's buyer adds at `at`: repayment * opening * (length - since) / (10000 * length), rounded
+   * up. None once the fall has ended: the price is zero and the lot goes in kind.
+   */
+  def excessPrice(v: StdShareVault, at: Long): Option[Long] = {
+    val Seq(repayment, opening, _, length, _, _, began) = v.auction
+    val since = math.max(at - began, 0L)
+    if (since >= length) None
+    else {
+      val num = BigInt(repayment) * opening * (length - since)
+      val den = BigInt(10000) * length
+      Some(((num + den - 1) / den).toLong)
+    }
+  }
+
+  /**
+   * Buy a Dutch auction's lot and take everything that is not the currency. A floor auction: bring the vault's
+   * currency up to the current target. An excess auction: add its current price. Both fall with height, so a
+   * purchase priced now stays valid later, except that an excess auction ends when its price reaches zero.
    */
   def buyLot(vaultId: String): Prepared = {
     val v = protocol.asShareVault(unspent(vaultId)).getOrElse(fail(s"$vaultId is not a share vault"))
     if (!v.auctionOpen) fail("the vault has no open auction")
     if (v.auction(3) < 1L) fail("the auction has no length")
     val before = currencyHeld(v)
-    val after = math.max(lotTarget(v, height.toLong), before)
+    // An excess sale must land strictly before the end of the fall, so it is priced at the next block.
+    val after = if (v.excess) {
+      val price = excessPrice(v, height.toLong).getOrElse(fail(s"the excess auction's price reached zero at height " +
+        s"${v.auctionStart + v.auctionLength}: holders now claim the lot in kind"))
+      if (height.toLong + 1L >= v.auctionStart + v.auctionLength)
+        fail("the excess auction ends at the next block, so a purchase could not land in time")
+      addAmount(before, price)
+    } else math.max(lotTarget(v, height.toLong), before)
     val m = Market.of(v.currencyToken).getOrElse(fail("the vault's currency is not a market this client knows"))
     val regs = v.box.registers.updated(2, ErgoValue.of(2.toByte))
     val sold = v.currencyToken match {
@@ -309,7 +340,8 @@ trait StandardShares extends AppBase { self: StandardApp =>
       if (burned >= v.outstanding) fail(s"$burned is every outstanding share: that is a final claim, which needs them all")
       if (v.holding) fail("the bond has not settled into the vault yet: pull it first, or make a final claim with every share")
       if (v.auctionOpen && height.toLong < v.claimableFrom)
-        fail(s"the auction holds until its expiry at height ${v.claimableFrom}; claims wait for it")
+        fail(if (v.excess) s"the excess auction runs until height ${v.claimableFrom}, when its price reaches zero; claims wait for it"
+          else s"the auction holds until its expiry at height ${v.claimableFrom}; claims wait for it")
       def part(n: Long): Long = (BigInt(n) * burned / v.outstanding).toLong
       val paidErg = part(v.box.value)
       // A token's part can round to zero, and a token box cannot hold zero of one: drop it before building.

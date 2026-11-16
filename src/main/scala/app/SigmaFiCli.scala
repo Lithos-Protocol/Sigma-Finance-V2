@@ -55,7 +55,8 @@ object SigmaFiCli {
       |
       |  Borrower:
       |  create-order --principal <amount> --repayment <amount> --collateral-erg <ERG>
-      |               (--maturity <height> | --term <blocks> | --duration <blocks>) [--exact-maturity]
+      |               (--maturity <height> | --term <blocks> | --duration <blocks> |
+      |                --window <min blocks>:<max blocks>) [--exact-maturity]
       |               [--market ERG|SigUSD] [--collateral-token <token id>:<n> ...]
       |               [--liquidation maturity|oracle] [--ratio <percent>] [--oracle-age <blocks>]
       |               [--fill-ratio <percent> | --no-fill-guard] [--allow-liquidatable]
@@ -79,6 +80,11 @@ object SigmaFiCli {
       |      to --end-yield at the end (default: the order's expiry), so an order can rise or fall. Repayment stays
       |      fixed; fixed or on-close maturity. No calendar clock or compounding; fees excluded, so quote a little
       |      above a lend offer's yield.
+      |      --window <min>:<max> [--yield <percent>] [--curve <percent>:<blocks>,...] makes a window order: the
+      |      lender picks the maturity, min to max blocks after the fill (min at least 30), and pays the principal
+      |      the curve prices there: up to 20 points of simple yield by blocks to maturity, as on a lend offer,
+      |      never above --yield (default: the highest point), never under --principal. Repayment stays fixed, so
+      |      a longer maturity pays you less now. zcs1 batchers prefer grid maturities (multiples of 21600).
       |  cancel-order <order box id>
       |  repay <bond box id> [--from-collateral]
       |      --from-collateral repays out of the bond's own ERG or repayment token, as far as it holds them
@@ -86,16 +92,23 @@ object SigmaFiCli {
       |      at most once per 60 blocks; a token bond may add its repayment token even if it holds none
       |
       |  Lender:
-      |  fill-order <order box id> [--fee-reserve <ERG>] [--allow-liquidatable]
+      |  fill-order <order box id> [--fee-reserve <ERG>] [--allow-liquidatable] [--maturity <height>]
       |      --fee-reserve: the liquidation reserve you fund in the bond (minimum and default $MinimumReserve).
       |      A fill that would start a bond under its own oracle ratio is refused unless --allow-liquidatable.
+      |      --maturity picks a window order's maturity (default: the earliest grid height in its window, else
+      |      its shortest).
       |  claim <bond asset id>               collect a repaid or liquidated bond from the vault
       |
       |  Anyone:
       |  liquidate <bond box id> [...]       keeps each bond's fee reserve
       |  refund-order <order box id>        return an expired order to its borrower; keeps its expiry fee
-      |  pack <box id> [...]                refund expired orders, offers, asks and lots and liquidate bonds, any
-      |                                     mix, in one transaction with one miner fee; keeps every fee
+      |  pack <box id> [...]                refund expired orders, offers, asks and lots, liquidate bonds, and
+      |                                     refresh old bonds and vaults, any mix, in one transaction with one
+      |                                     miner fee; keeps every fee
+      |  refresh <box id> [...]             re-create bonds, bond vaults and share vaults more than 525600 blocks
+      |                                     (about two years) old, before storage rent can take them; keeps up to
+      |                                     0.01 ERG of each. A wrap vault is refreshed on its own. A bond is not
+      |                                     refreshed in the 720 blocks before its maturity.
       |
       |  Shares (Selective or Dutch: a liquidated bond's collateral is auctioned for its repayment asset):
       |  shares [--mine]                    share requests and vaults, with any open auction's price
@@ -109,7 +122,9 @@ object SigmaFiCli {
       |      --vault dutch always auctions it. The auction falls from --auction-opening to --auction-floor
       |      percent of the repayment (both yours to choose) over --auction-length blocks (default 720), then
       |      holds at the floor until --auction-expiry blocks after it opened (default 2160); only then can
-      |      holders take an unsold lot in kind. Lend offers buy only Selective and Dutch shares.
+      |      holders take an unsold lot in kind. If the vault already holds the floor, a thin lot is sold in an
+      |      excess auction instead, falling from --auction-opening to nothing over --auction-length blocks,
+      |      after which holders take it in kind. Lend offers buy only Selective and Dutch shares.
       |      zcs1 defaults: 100000000 shares with 6 decimals (1.000000 = 1% of the bond), and a name and
       |      description built from the bond, such as ZCS-Bond-Shares-3fa2c1. Overriding any of them is nonstandard.
       |  mint-shares <request box id>       anyone: mint a request's shares; keeps the mint fee
@@ -171,10 +186,23 @@ object SigmaFiCli {
       |      the default 1% --min-fill-percent. --fees also funds box/reserve costs and the expiry refund.
       |  cancel-offer <offer box id>
       |  refund-offer <offer box id>        anyone, after expiry; keeps the batcher fee
-      |  match-offer <offer box id> (--order <order box id> | --ask <ask box id> [--amount <n>])
-      |      anyone: fill an order or buy from an ask with the offer; keeps the batcher fee
+      |  match-offer <offer box id> (--order <order box id> [--maturity <height>] | --ask <ask box id> [--amount <n>])
+      |      anyone: fill an order or buy from an ask with the offer; keeps the batcher fee. A window order
+      |      matches at --maturity, or by default at zcs1's choice: of the maturities both accept, a grid height
+      |      first, then the widest gap between the yield the offer earns and the one it requires, then the
+      |      shorter.
       |
-      |  batch [--run]                      list every mint, pull, refund, liquidation and offer match that pays
+      |  Wraps (custody for a capability token, such as a LithosDex position's owner NFT, whose presence in a
+      |  transaction's inputs grants authority elsewhere; put the receipt, never the raw token, into orders):
+      |  wraps [--mine]
+      |  wrap <token id> [--amount <n>] [--mint-fee <ERG>] [--refresh-reserve <ERG>]
+      |      any batcher then mints a receipt to you and locks the token in a vault until the receipt is
+      |      burned. --refresh-reserve (default 0.03 ERG) pays the vault's refreshes, 0.01 ERG every two years.
+      |  mint-wrap <request box id>         anyone: mint a wrap's receipt; keeps the mint fee
+      |  cancel-wrap <request box id>
+      |  unwrap <receipt id>                burn the receipt and take the token back
+      |
+      |  batch [--run]                      list every mint, pull, refund, liquidation, refresh and offer match that pays
       |                                     whoever runs it, and what it passed over because a box does not
       |                                     disclose a script it names. --run does the work in rounds: refunds
       |                                     and liquidations packed together, offers matched best yield first,
@@ -357,12 +385,17 @@ object SigmaFiCli {
 
   /** --maturity <height>, --term <blocks> (from now) or --duration <blocks> (from the fill): exactly one. */
   def schedule(a: Args, height: Int): Schedule =
-    Seq("maturity", "term", "duration").flatMap(k => a.opt(k).map(k -> _)) match {
+    Seq("maturity", "term", "duration", "window").flatMap(k => a.opt(k).map(k -> _)) match {
       case Seq(("maturity", h)) => FixedMaturity(parseLong(h, "--maturity"))
       case Seq(("term", n)) => FixedMaturity(Try(Math.addExact(height.toLong, parseLong(n, "--term")))
         .getOrElse(throw CliError("--term overflows a Long")))
       case Seq(("duration", n)) => OnClose(parseLong(n, "--duration"))
-      case _ => throw CliError("give exactly one of --maturity <height>, --term <blocks> or --duration <blocks>")
+      case Seq(("window", w)) => w.split(":") match {
+        case Array(lo, hi) => MaturityWindow(parseLong(lo, "--window minimum"), parseLong(hi, "--window maximum"))
+        case _ => throw CliError(s"--window: $w is not <minimum blocks>:<maximum blocks>")
+      }
+      case _ => throw CliError("give exactly one of --maturity <height>, --term <blocks>, --duration <blocks> or " +
+        "--window <minimum blocks>:<maximum blocks>")
     }
 
   /** A warning when the node's index trails the chain, since every listing comes from it. */
@@ -396,7 +429,7 @@ object Args {
   val SessionOptions: Set[String] = Set("node", "api-key", "wallet-pass", "address", "fee")
   val Options: Set[String] = SessionOptions ++ Set(
     "principal", "principal-token", "repayment", "collateral-erg", "collateral-token", "batching-fee",
-    "liquidation", "maturity", "term", "duration",
+    "liquidation", "maturity", "term", "duration", "window", "refresh-reserve",
     "market", "ratio", "oracle-age", "fill-ratio", "min-cover", "expires-in", "expiry-fee", "fee-reserve", "add-erg", "add-token",
     "shares", "share-name", "share-description", "decimals", "pull-fee", "mint-fee",
     "vault", "auction-opening", "auction-floor", "auction-length", "auction-expiry", "amount",

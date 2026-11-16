@@ -114,6 +114,47 @@ trait StandardBatch extends AppBase { self: StandardApp =>
   }
 
   /**
+   * A paid refresh (StandardProtocol.RefreshAge): the box re-created unchanged, keeping at most the bounty and never
+   * going under the box's floor, its successor named in context var 9. Bonds, bond vaults and share vaults pack with
+   * other pieces; a wrap vault must be its transaction's only input (`wrapRefresh`). A bond's successor is stamped
+   * 60 blocks back, so the borrower may recollateralize at once, and the transaction discloses the borrower's script
+   * (zcs1), so later batchers still find it.
+   */
+  private[standard] def refreshPiece(box: InputUTXO): Piece = {
+    val now = height.toLong
+    val created = box.input.getCreationHeight.toLong
+    if (!refreshable(created, now))
+      fail(s"box ${box.id} was made at height $created; it can be refreshed from height ${created + RefreshAge + 1}")
+    val (floor, stamp, what) = protocol.asBond(box) match {
+      case Some(b) =>
+        if (now < b.maturity && now + 1L >= b.maturity - RefreshMaturityGap)
+          fail(s"bond ${box.id} matures at height ${b.maturity}: it is not refreshed in the $RefreshMaturityGap blocks " +
+            "before maturity, where a refresh could void a borrower's repayment; from maturity on it may be")
+        bondBorrowerTree(b)
+        (b.feeReserve + MinBox, now - RecollateralizeWait, s"bond ${box.id}")
+      case None =>
+        protocol.asSettlement(box).map(_ => (MinBox, now, s"bond vault ${box.id}"))
+          .orElse(protocol.asShareVault(box).map(v => (if (v.holding) MinBox + v.pullFee else MinBox, now, s"share vault ${box.id}")))
+          .getOrElse(fail(s"${box.id} is not a bond, bond vault or share vault (a wrap vault is refreshed on its own)"))
+    }
+    val value = refreshedValue(box.value, floor)
+    val successor = UTXO(Contract(box.input.getErgoTree), value, box.tokens, box.registers, Some(stamp.toInt))
+    Piece(box.id.toString, i => box.withCtxVar(9.toByte, intValue(i)), Seq(successor), box.value - value,
+      s"refreshes $what, made at height $created, for a ${Fmt.erg(box.value - value)} bounty")
+  }
+
+  /** Refresh boxes old enough for it: several bonds and vaults pack into one transaction; a wrap vault goes alone. */
+  def refresh(boxIds: Seq[String]): Prepared = {
+    if (boxIds.isEmpty) fail("name at least one box id")
+    val boxes = boxIds.distinct.map(unspent)
+    boxes.flatMap(protocol.asWrapVault) match {
+      case Seq(v) if boxes.size == 1 => wrapRefresh(v)
+      case Seq() => packed(s"Refresh ${boxes.size} box(es)", boxes.map(refreshPiece))
+      case _ => fail("a wrap vault must be its refresh's only input: refresh each one by itself")
+    }
+  }
+
+  /**
    * Several pieces in one transaction: inputs in order, each naming its own outputs, one miner fee, and the
    * fees left over to this wallet. Each contract reads only its own context variables and outputs, so pieces
    * of different kinds mix.
@@ -140,10 +181,12 @@ trait StandardBatch extends AppBase { self: StandardApp =>
         .orElse(protocol.asOffer(box).map(offerRefund))
         .orElse(protocol.asAsk(box).map(askRefund))
         .orElse(protocol.asLot(box).map(lotRefund))
-        .orElse(protocol.asBond(box).map(liquidation))
-        .getOrElse(fail(s"$id is not a ZC Standard order, offer, ask, lot or bond"))
+        .orElse(protocol.asBond(box).map(b => if (refreshable(box.input.getCreationHeight.toLong, height.toLong) &&
+          Try(liquidation(b)).isFailure) refreshPiece(box) else liquidation(b)))
+        .orElse((protocol.asSettlement(box) orElse protocol.asShareVault(box)).map(_ => refreshPiece(box)))
+        .getOrElse(fail(s"$id is not a ZC Standard order, offer, ask, lot, bond or vault"))
     }
-    packed(s"Pack ${pieces.size} refund(s) and liquidation(s)", pieces)
+    packed(s"Pack ${pieces.size} refund(s), liquidation(s) and refresh(es)", pieces)
   }
 
   // ═══ SCAN ═════════════════════════════════════════════════════════════════
@@ -197,6 +240,31 @@ trait StandardBatch extends AppBase { self: StandardApp =>
         work += packWork(s"liquidate bond ${b.box.id} (${b.market})", s"liquidate ${b.box.id}", b.feeReserve, b.box.id.toString)
     }
 
+    // Paid refreshes: anything more than two years old that pays a bounty. A bond that is also due is liquidated
+    // instead, and none is refreshed in the blocks before its maturity.
+    def bounty(box: InputUTXO, floor: Long): Long = box.value - refreshedValue(box.value, floor)
+    def old(box: InputUTXO): Boolean = refreshable(box.input.getCreationHeight.toLong, now)
+    val liquidating = work.flatMap(_.packBox).toSet
+    liveBonds.filter(b => old(b.box) && !liquidating(b.box.id.toString) &&
+      (now >= b.maturity || next < b.maturity - RefreshMaturityGap) && bounty(b.box, b.feeReserve + MinBox) > 0L).foreach { b =>
+      work += packWork(s"refresh bond ${b.box.id}, made at height ${b.box.input.getCreationHeight}", s"refresh ${b.box.id}",
+        bounty(b.box, b.feeReserve + MinBox), b.box.id.toString)
+    }
+    (settlements().map(s => s.box -> MinBox) ++
+      shareVaults().map(v => v.box -> (if (v.holding) MinBox + v.pullFee else MinBox)))
+      .filter { case (box, floor) => old(box) && bounty(box, floor) > 0L }.foreach { case (box, floor) =>
+        work += packWork(s"refresh vault ${box.id}, made at height ${box.input.getCreationHeight}", s"refresh ${box.id}",
+          bounty(box, floor), box.id.toString)
+      }
+    wrapVaults().filter(v => old(v.box) && alone(bounty(v.box, MinBox))).foreach { v =>
+      work += Work(s"refresh wrap vault ${v.box.id} (alone: it holds a wrapped token)", s"refresh ${v.box.id}",
+        bounty(v.box, MinBox), Set(v.box.id.toString))
+    }
+    wrapRequests().filter(r => alone(r.mintFee) && served(r.ownerHash, r.box, "wrap request", "owner")).foreach { r =>
+      work += Work(s"mint the wrap receipt for ${r.wrapped.amount} of ${r.wrapped.id}", s"mint-wrap ${r.box.id}", r.mintFee,
+        Set(r.box.id.toString))
+    }
+
     val openOrders = orders()
     openOrders.filter(o => now >= o.expiry && o.expiryFee >= MinBatchingFee && o.expiryFee <= o.box.value - MinBox &&
       served(o.borrowerHash, o.box, "order", "borrower")).foreach { o =>
@@ -226,14 +294,18 @@ trait StandardBatch extends AppBase { self: StandardApp =>
     allOffers.filter(o => next < o.expiry && alone(o.fillFee(o.capital)) && served(o.ownerHash, o.box, "lend offer", "owner"))
       .sortBy(o => (-o.fillFee(o.capital), o.box.id.toString)).foreach { o =>
         val fromOrders = orderSources.filter(x => x.market == o.market && !taken(x.box.id.toString)).flatMap { original =>
-          val order = resolveOrder(original, height.toLong)
-          val maturity = if (order.onClose) height.toLong + order.terms(3) else order.terms(3)
-          val bond = prospective(order, height.toLong, maturity, o.feeReserve)
-          if (!alone(o.fillFee(order.principal)) || offerRefusal(o, bond, order.principal, 1L, 1L, usableOracle, primary = true).nonEmpty ||
-            guardRefusal(order, bond, usableOracle).nonEmpty) None
-          else Some((impliedYield(o, order.repayment, order.principal, 1L, 1L, maturity), order.box.id.toString,
-            Work(s"fill order ${order.box.id} from offer ${o.box.id}", s"match-offer ${o.box.id} --order ${order.box.id}",
-              o.fillFee(order.principal), Set(o.box.id.toString, order.box.id.toString))))
+          // A window order matches at the maturity zcs1's rule picks for this offer, if any maturity in it suits both.
+          val chosen = if (original.window) windowMaturity(o, original, usableOracle) else Some(orderMaturity(original, height.toLong))
+          chosen.flatMap { maturity =>
+            val order = resolveOrder(original, height.toLong, Some(maturity))
+            val bond = prospective(order, height.toLong, maturity, o.feeReserve)
+            if (!alone(o.fillFee(order.principal)) || offerRefusal(o, bond, order.principal, 1L, 1L, usableOracle, primary = true).nonEmpty ||
+              guardRefusal(order, bond, usableOracle).nonEmpty) None
+            else Some((impliedYield(o, order.repayment, order.principal, 1L, 1L, maturity), order.box.id.toString,
+              Work(s"fill order ${order.box.id} from offer ${o.box.id}" + (if (original.window) s" at maturity $maturity" else ""),
+                s"match-offer ${o.box.id} --order ${order.box.id}" + (if (original.window) s" --maturity $maturity" else ""),
+                o.fillFee(order.principal), Set(o.box.id.toString, order.box.id.toString))))
+          }
         }
         val fromAsks = askSources.filter(a => a.market == o.market && !taken(a.box.id.toString)).flatMap { a =>
           Try[Option[(BigInt, String, Work)]] {
