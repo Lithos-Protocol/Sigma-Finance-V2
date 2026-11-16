@@ -46,12 +46,11 @@ object LiveChecks {
             else None
           case _ => Some("the priced fill's historical order, bond or borrower payout could not be read")
         }
-      case Check.AskPricing(a, yieldBased, margin) => box(v(a)).flatMap(protocol.asAsk) match {
+      case Check.AskPricing(a, startBps, endBps) => box(v(a)).flatMap(protocol.asAsk) match {
         case Some(ask) if ask.priced =>
           val known = Try(protocol.pricingOf(ask)).isSuccess
-          val actual = if (yieldBased) ask.terms.lift(6) else Some(ask.margin)
-          if (known && protocol.yieldAsk(ask) == yieldBased && actual.contains(margin)) None
-          else Some("the ask's pricing policy or price margin differs from the planned one")
+          if (known && protocol.yieldAsk(ask) && ask.yieldLine.exists(l => l.valid && l.startBps == startBps && l.endBps == endBps)) None
+          else Some("the ask's pricing policy or yields differ from the planned ones")
         case _ => Some("the historical priced ask could not be read")
       }
     }

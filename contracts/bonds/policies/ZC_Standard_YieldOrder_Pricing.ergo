@@ -1,10 +1,20 @@
 {
-    // PricedOrder var 2. R9 = (reference simple yield bps per 262800 blocks, signed price margin bps).
-    // Minimum principal = ceil(R * B * (10000+margin) / ((B + yield * D)*10000)), B=10000*262800, D=M-HEIGHT.
+    // PricedOrder var 2: the least principal a lender pays, from a simple block yield that moves in a
+    // straight line between two points in time, so an order can rise or fall without updates.
+    // R9 = (start height, start yield, end height, end yield), yields in bps per 262800 blocks, >= 0,
+    //   and end height > start height. The yield is the start yield up to the start height, the end
+    //   yield from the end height on, and on the straight line between them in between. Equal yields
+    //   give one fixed rate. Clients put the end at or near the order's expiry.
+    // With D = maturity - HEIGHT blocks left, L = end - start, at = HEIGHT clamped to [start, end],
+    // and the yield taken exactly as Y / L, Y = y0 * L + (y1 - y0) * (at - start):
+    //   principal * (B * L + Y * D) >= R * B * L, B = 10000 * 262800.
+    // That is principal >= R / (1 + yield * D / B): the price at which the lender earns the yield.
+    // The comparison is exact: no division and no rounding.
     // The shell additionally enforces the borrower's fixed principal floor and actual payment record.
-    // Uses remaining blocks, not calendar time, market rates or compounding. Fees are not included.
+    // Uses remaining blocks, not calendar time, market rates or compounding. Fees are not included:
+    // a borrower quotes a little above a lend offer's yield to leave room for its batcher fee.
     val payload = SELF.R9[Coll[Long]].get
-    if (payload.size != 2) {
+    if (payload.size != 4) {
         sigmaProp(false)
     } else {
         val bond = OUTPUTS(1)
@@ -12,9 +22,19 @@
         val remaining = bond.R9[Coll[Long]].get(2) - HEIGHT.toLong
         val principal = if (CONST_REPAYMENT_TOKEN == SELF.id.slice(0, 0)) borrower(1)
             else bond.R7[Coll[(Coll[Byte], Long)]].get(0)._2
+        val start = payload(0)
+        val startYield = payload(1)
+        val end = payload(2)
+        val endYield = payload(3)
+        val now = HEIGHT.toLong
+        val at = if (now < start) start else if (now > end) end else now
+        val span = (end - start).toBigInt
+        val rate = startYield.toBigInt * span + (endYield.toBigInt - startYield.toBigInt) * (at - start).toBigInt
         val scale = 2628000000L.toBigInt
-        sigmaProp(payload(0) >= 0L && payload(1) > -10000L && payload(1) <= 1000000L && remaining > 0L && principal > 0L && borrower(0) > 0L &&
-            principal.toBigInt * (scale + payload(0).toBigInt * remaining.toBigInt) * 10000L.toBigInt >=
-                borrower(0).toBigInt * scale * (10000L + payload(1)).toBigInt)
+        sigmaProp(
+            startYield >= 0L && endYield >= 0L && end > start &&
+            remaining > 0L && principal > 0L && borrower(0) > 0L &&
+            principal.toBigInt * (scale * span + rate * remaining.toBigInt) >=
+                borrower(0).toBigInt * scale * span)
     }
 }

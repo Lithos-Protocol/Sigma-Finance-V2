@@ -18,8 +18,11 @@ case object MaturityChoice extends RuleChoice
 case class OracleChoice(ratioBps: Long, maxAge: Long) extends RuleChoice
 
 sealed trait OrderPrice
-case class NavOrderPrice(marginBps: Long = 0L) extends OrderPrice
-case class YieldOrderPrice(yieldBps: Long, marginBps: Long = 0L) extends OrderPrice
+/**
+ * A simple block yield that moves in a straight line from `startBps` now to `endBps` at `endHeight`, then holds:
+ * a rising or falling order. `endBps` defaults to `startBps` (one fixed yield), `endHeight` to the order's expiry.
+ */
+case class YieldOrderPrice(startBps: Long, endBps: Option[Long] = None, endHeight: Option[Long] = None) extends OrderPrice
 
 /**
  * A borrower's terms for a standard order. A standard loan is lent and repaid in one asset, the market's:
@@ -158,30 +161,24 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
   /** Minimum principal at an inclusion height, without fees or the refunded expiry fee. */
   def orderPrincipal(order: StdOrder, at: Long, start: Long): Long = {
     if (!order.priced) return order.principal
-    val expression = protocol.orderPricingOf(order)
+    protocol.orderPricingOf(order) // Refuse unknown policies rather than applying an unrelated formula.
     val maturity = if (order.onClose) addAmount(start, order.terms(3)) else order.terms(3)
-    val data = order.pricingTerms
-    val (num, den) = if (expression.hashedValueBytes.sameElements(protocol.market(order.market).yieldOrderPricing.hashedValueBytes)) {
-      if (data.size != 2 || data.head < 0L || data(1) <= -10000L || data(1) > 1000000L || maturity <= at) fail("invalid yield pricing terms or no blocks left to maturity")
-      (BigInt(order.repayment) * 2628000000L * (10000L + data(1)),
-        (BigInt(2628000000L) + BigInt(data.head) * (maturity - at)) * 10000L)
-    } else {
-      if (data.size != 2 || data.head != order.box.input.getCreationHeight.toLong ||
-        data.head < 0L || at < data.head || maturity <= at || data(1) <= -10000L || data(1) > 1000000L)
-        fail("invalid NAV pricing terms: the order's creation height and a future maturity are required")
-      val term = maturity - data.head
-      val elapsed = at - data.head
-      ((BigInt(order.principal) * (term - elapsed) + BigInt(order.repayment) * elapsed) * (10000L + data(1)),
-        BigInt(term) * 10000L)
-    }
-    val result = ((num + den - 1) / den).max(BigInt(order.principal))
+    val line = protocol.orderYieldLine(order).filter(_.valid).getOrElse(fail("invalid yield pricing terms"))
+    if (maturity <= at) fail("no blocks left to maturity")
+    val result = line.price(order.repayment, 1L, 1L, maturity - at, at).max(BigInt(order.principal))
     if (result <= 0 || !result.isValidLong) fail("the priced principal is outside the supported amount range")
     result.toLong
   }
 
+  /**
+   * Blocks a priced quote covers: signing runs at the current height and inclusion lands up to a few blocks
+   * later. A two-point yield can move the price either way, so a quote takes the most over the window.
+   */
+  private[standard] val QuoteBlocks: Long = 3L
+
   /** Quote a few blocks ahead; store exactly what is actually paid in the standard bond. */
   private[standard] def resolveOrder(order: StdOrder, start: Long): StdOrder = {
-    val amount = orderPrincipal(order, height.toLong + 3L, start)
+    val amount = (0L to QuoteBlocks).map(d => orderPrincipal(order, height.toLong + d, start)).max
     if (!order.priced) order
     else order.market.token match {
       case None => order.copy(terms = order.terms.updated(1, amount))
@@ -245,15 +242,13 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
     }
     val terms = Seq(loan.repayment, principalErg, floor, maturityTerm, loan.expiry, loan.expiryFee, mode) ++ payload
     val c = protocol.market(m)
-    val pricing = loan.price.map {
-      case NavOrderPrice(margin) =>
-        if (margin <= -10000L || margin > 1000000L) fail("the margin must be above -100% and at most 10000%")
-        c.navOrderPricing -> Seq(height.toLong, margin)
-      case YieldOrderPrice(rate, margin) =>
-        if (rate < 0L) fail("the yield cannot be negative")
-        if (margin <= -10000L || margin > 1000000L) fail("the margin must be above -100% and at most 10000%")
-        c.yieldOrderPricing -> Seq(rate, margin)
+    val line = loan.price.map { case YieldOrderPrice(startBps, endBps, endHeight) =>
+      val l = YieldLine(height.toLong, startBps, endHeight.getOrElse(loan.expiry), endBps.getOrElse(startBps))
+      if (l.startBps < 0L || l.endBps < 0L) fail("the yield cannot be negative")
+      if (l.end <= l.start) fail(s"the yield's end height ${l.end} is not above the current height $height")
+      l
     }
+    val pricing = line.map(l => c.yieldOrderPricing -> l.terms)
     val coreRegs = Seq(longsValue(terms: _*), tokensValue(principalTokens), bytesValue(hashOf(myTree)), bytesValue(rule.hashedValueBytes))
     val extraRegs = pricing.fold(loan.fillRatio.map(_ => bytesValue(c.fillGuard.hashedValueBytes)).toSeq) { case (expression, data) =>
       Seq(byteArraysValue(Seq(expression.hashedValueBytes,
@@ -280,9 +275,12 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
       s"expiry: height ${loan.expiry}; from then anyone may return it to you and keep the ${Fmt.erg(loan.expiryFee)} " +
         "expiry fee, which a fill refunds to you instead") ++ coverNotes ++ termNotes :+
       "Output 0 is the order. Cancel it any time before it is filled with `cancel-order <its box id>`."
-    val priceNotes = loan.price.toSeq.map {
-      case NavOrderPrice(m) => s"PricedOrder: NAV principal from height $height, margin ${Units.percent(m)}; the quoted principal is also its floor"
-      case YieldOrderPrice(y, m) => s"PricedOrder: principal at reference ${Units.percent(y)} simple yield per 262800 blocks, price margin ${Units.percent(m)}, subject to the principal floor; fees excluded"
+    val priceNotes = line.toSeq.map { l =>
+      val rate = if (l.fixed) s"${Units.percent(l.startBps)} simple yield per 262800 blocks"
+        else s"a simple yield per 262800 blocks moving in a straight line from ${Units.percent(l.startBps)} now to " +
+          s"${Units.percent(l.endBps)} at height ${l.end}"
+      s"PricedOrder: principal at $rate, never under the principal floor; fees excluded, so quote a little above " +
+        "a lend offer's yield to leave room for its batcher fee"
     }
     prepare("Create order", plan(Seq.empty, Seq(order)), notes ++ priceNotes)
   }

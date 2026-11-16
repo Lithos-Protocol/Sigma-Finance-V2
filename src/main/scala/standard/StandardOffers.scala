@@ -13,13 +13,15 @@ import scala.util.Try
 case class OfferDelivery(terms: ShareTerms)
 
 /**
- * A lender's yield bid. `capital` and `minPrice` are raw units of the market's asset; `fees` is the nanoERG a
- * token offer carries for batcher fees and box minimums (an ERG offer pays them from its capital).
+ * A lender's yield-curve bid. `capital` and `minPrice` are raw units of the market's asset; `fees` is the nanoERG
+ * a token offer carries for batcher fees and box minimums (an ERG offer pays them from its capital). `yieldBps`
+ * is the minimum yield at every maturity; `curve` adds up to 20 (yield bps, blocks left) points, interpolated
+ * in straight lines. `auctionExpiry` bounds how long a Dutch-pair share's unsold auction can hold its holders.
  */
 case class OfferSpec(market: Market, capital: Long, fees: Long, yieldBps: Long, minBlocks: Long, maxBlocks: Long,
                      batcherFee: Long, feeReserve: Long, floorBps: Long, maxAge: Long, expiry: Long, minPrice: Long,
-                     auctionFloorBps: Long, auctionLength: Long, delivery: Option[OfferDelivery],
-                     minFillBps: Long = 100L, batcherBudget: Option[Long] = None)
+                     auctionFloorBps: Long, auctionExpiry: Long, delivery: Option[OfferDelivery],
+                     minFillBps: Long = 100L, batcherBudget: Option[Long] = None, curve: Seq[(Long, Long)] = Seq.empty)
 
 /**
  * Lend offers: ZC_Standard_LendOffer with ZC_Standard_ERG_SigUSD_CollateralPolicy. Creating, cancelling and
@@ -29,9 +31,6 @@ case class OfferSpec(market: Market, capital: Long, fees: Long, yieldBps: Long, 
 trait StandardOffers extends AppBase { self: StandardApp =>
 
   import StandardProtocol._
-
-  /** One year of 2-minute blocks, times the basis-point denominator, as the offer's yield test uses it. */
-  private val Year = BigInt(2628000000L)
 
   def offers(): Seq[StdOffer] =
     decoded(nodeApi.unspentByTemplateHash(Base16.encode(protocol.offerTemplateHash))).flatMap(protocol.asOffer)
@@ -51,7 +50,11 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     if (s.minPrice < 1L) fail("the minimum price must be at least 1")
     if (m.token.isDefined && (s.minFillBps < 100L || s.minFillBps > 10000L))
       fail("the minimum fill must be 1% to 100% of the original capital")
-    if (s.auctionFloorBps < 0L || s.auctionLength < 0L) fail("the auction bounds cannot be negative")
+    if (s.auctionFloorBps < 0L || s.auctionExpiry < 0L) fail("the auction bounds cannot be negative")
+    val curve = YieldCurve(s.yieldBps, s.curve)
+    if (s.curve.size > MaxCurvePoints) fail(s"a yield curve has at most $MaxCurvePoints points")
+    if (s.curve.exists { case (y, d) => y < 0L || d < 1L }) fail("curve yields cannot be negative, and maturities are at least 1 block")
+    if (!curve.ordered) fail("the curve's maturities must strictly increase from point to point")
     // An offer is posted before it knows which bond it buys, so zcs1 metadata here leaves the bond out.
     val standard = s.delivery.map(d => StandardMetadata.shares(m, d.terms.auction, None))
     val (fractional, metadata, mint) = s.delivery match {
@@ -59,6 +62,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
       case Some(OfferDelivery(t)) =>
         if (t.shares < 1L || t.shares > 1000000000L) fail("the share count must be 1 to 1000000000")
         if (t.pullFee < MinBatchingFee || t.mintFee < MinBatchingFee) fail(s"the pull and mint fees must each be at least ${Fmt.erg(MinBatchingFee)}")
+        t.auction.foreach(checkAuction)
         (t.longs, textsValue(t.metadata(standard.get): _*),
           if (t.auction.isDefined) protocol.market(m).dutchMint.hashedPropBytes else protocol.contracts.fractionalMint.hashedPropBytes)
     }
@@ -70,7 +74,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
       Seq(s.capital, spend.toLong, s.minFillBps, reward)
     }
     val terms = Seq(s.yieldBps, s.minBlocks, s.maxBlocks, s.batcherFee, s.feeReserve, s.floorBps, s.expiry,
-      s.minPrice, s.maxAge, s.auctionFloorBps, s.auctionLength) ++ budgetTerms
+      s.minPrice, s.maxAge, s.auctionFloorBps, s.auctionExpiry) ++ budgetTerms ++ s.curve.flatMap { case (y, d) => Seq(y, d) }
     val regs = Seq(bytesValue(hashOf(myTree)), longsValue(terms: _*),
       bytesValue(protocol.market(m).policy.hashedValueBytes), longsValue(fractional: _*), metadata, bytesValue(mint))
     val offer = m.token match {
@@ -78,17 +82,18 @@ trait StandardOffers extends AppBase { self: StandardApp =>
       case Some(id) => UTXO(protocol.market(m).offer, s.fees, Seq(Token(id, s.capital)), regs)
     }
     prepare("Create lend offer", plan(Seq.empty, Seq(offer)), Seq(
-      s"lend up to ${Units.amount(s.capital, m)} at ${Units.percent(s.yieldBps)} simple yield per 262800 blocks or better",
+      s"lend up to ${Units.amount(s.capital, m)} at a simple yield per 262800 blocks of ${curve.describe}, or better",
       s"bonds maturing ${s.minBlocks} to ${s.maxBlocks} blocks after a fill, with the oracle rule at a ratio of at " +
         s"least ${Units.percent(s.floorBps)} and collateral worth that now; minimum price ${Units.amount(s.minPrice, m)}",
       (if (m.token.isEmpty) s"batcher fee ${Fmt.erg(s.batcherFee)} per fill"
        else s"batcher reward budget ${Fmt.erg(budgetTerms(3))}, proportional to the filled capital; " +
          s"minimum fill ${Units.percent(s.minFillBps)} of original capital; total ERG spend budget ${Fmt.erg(budgetTerms(1))}") +
         s"; new bonds carry a ${Fmt.erg(s.feeReserve)} fee reserve",
-      if (s.auctionLength == 0L) "buys no Dutch auction shares"
-      else s"buys Dutch auction shares with a floor of at least ${Units.percent(s.auctionFloorBps)} and at most ${s.auctionLength} blocks",
+      if (s.auctionExpiry == 0L) "buys no shares"
+      else s"buys Selective or Dutch shares with an auction floor of at least ${Units.percent(s.auctionFloorBps)} and an " +
+        s"expiry of at most ${s.auctionExpiry} blocks",
       s.delivery.fold("bond units come to this wallet")(d => s"bond units are delivered into ${d.terms.shares} shares" +
-        d.terms.auction.fold("")(_ => " with a Dutch auction") + s", named '${d.terms.metadata(standard.get).head}'"),
+        d.terms.auction.fold(" (plain fractional)")(a => s" (${a.kind})") + s", named '${d.terms.metadata(standard.get).head}'"),
       s"expires at height ${s.expiry}; cancel it any time with `cancel-offer <its box id>`") ++
       s.delivery.toSeq.flatMap(_.terms.departures(standard.get)))
   }
@@ -97,7 +102,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
   def offerMetadataIssues(o: StdOffer): Seq[String] =
     if (!o.delivers) Seq.empty
     else {
-      val auction = if (o.fractional.size >= 6) Some(AuctionTerms(o.fractional(3), o.fractional(4), o.fractional(5))) else None
+      val auction = AuctionTerms.fromLongs(o.fractional.drop(3))
       val standard = StandardMetadata.shares(o.market, auction, None)
       val found = o.metadata.map(StandardMetadata.text)
       (if (o.fractional.head != StandardMetadata.ShareCount)
@@ -140,8 +145,10 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     else if (remaining <= 0L || remaining < o.terms(1) || remaining > o.terms(2))
       Some(s"the bond matures in $remaining blocks, outside the offer's ${o.terms(1)} to ${o.terms(2)}")
     else if (price <= 0L || price < o.minPrice) Some(s"the price ${Units.amount(price, o.market)} is under the offer's minimum")
-    else if (BigInt(bond.repayment) * units * Year < cost * whole * (Year + BigInt(o.yieldBps) * remaining))
-      Some(s"${Units.amount(price, o.market)} for $units of $whole is under the offer's ${Units.percent(o.yieldBps)} yield")
+    else if (!o.curve.ordered || o.yieldBps < 0L) Some("the offer's yield curve is malformed")
+    else if (!o.curve.accepts(bond.repayment, units, cost.toLong, whole, remaining))
+      Some(s"${Units.amount(price, o.market)} for $units of $whole is under the offer's " +
+        s"${Units.percent(o.curve.bpsAt(remaining))} yield at $remaining blocks")
     else if (o.capital < price) Some(s"the offer holds only ${Units.amount(o.capital, o.market)}")
     else if (o.market.token.isDefined && (o.originalCapital <= 0L || o.capital > o.originalCapital ||
       o.spendBudget <= 0L || o.batcherBudget <= 0L || o.batcherBudget >= o.spendBudget ||
@@ -279,11 +286,12 @@ trait StandardOffers extends AppBase { self: StandardApp =>
       val request = nodeApi.boxById(v.shareId.toString).flatMap(j => Try(NodeJson.box(j)).toOption)
         .getOrElse(fail("the request that minted the shares is not in the node's index"))
       val req = protocol.asShareRequest(request).getOrElse(fail("the shares were not minted by a standard share mint"))
-      req.dutch.foreach { _ =>
-        if (o.terms(10) == 0L) fail("the offer buys no Dutch auction shares")
-        if (req.auction(1) < o.terms(9) || req.auction(2) > o.terms(10))
-          fail(s"the shares' auction (floor ${Units.percent(req.auction(1))}, ${req.auction(2)} blocks) is outside the offer's bounds")
-      }
+      if (req.dutch.isEmpty) fail("offers buy shares only from the Selective/Dutch mint: plain fractional shares are paid " +
+        "in kind after a liquidation")
+      if (o.terms(10) == 0L) fail("the offer buys no shares")
+      if (req.auction(1) < o.terms(9) || req.auction(3) > o.terms(10))
+        fail(s"the shares' auction (floor ${Units.percent(req.auction(1))}, expiry ${req.auction(3)} blocks) is outside " +
+          "the offer's bounds")
       request.bytes
     }
     val rest = askRest(ask, n)

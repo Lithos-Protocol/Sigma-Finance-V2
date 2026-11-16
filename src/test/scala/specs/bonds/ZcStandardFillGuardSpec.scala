@@ -7,7 +7,7 @@ import work.lithos.mutations.{Contract, InputUTXO, Token, UTXO}
 
 /**
  * The guards: ZC_Standard_ERG_SigUSD_FillGuard, which ZC_Standard_Order runs on a fill when its R8 names
- * it, and ZC_Standard_ERG_SigUSD_GuardedNav_Pricing, which ZC_Standard_PricedAsk runs on a sale. Each lets
+ * it, and ZC_Standard_ERG_SigUSD_GuardedYield_Pricing, which ZC_Standard_PricedAsk runs on a sale. Each lets
  * its owner, the borrower or the seller, set a collateral ratio below which the box does not trade.
  *
  * Covers used throughout: an ERG bond holds 10 ERG against a 7 ERG repayment, 142.857% whatever the
@@ -126,17 +126,15 @@ class ZcStandardFillGuardSpec extends AnyPropSpec with ZcStandardSpecBase {
     }
   }
 
-  // ═══ GUARDED NAV PRICING ══════════════════════════════════════════════════
+  // ═══ GUARDED YIELD PRICING ════════════════════════════════════════════════
 
   /** A live bond, filled, and a height 300 blocks into its term. */
   private case class Live(f: Flow, state: InputUTXO) {
     val height: Int = f.height + 300
-    /** What AccruedValue_Pricing asks for one whole bond unit at `height`, plus `margin`. */
-    def owed(margin: Long): Long = {
-      val principal = if (f.kind == ErgBond) f.data(1) else 600L
-      val term = f.maturity - f.start
-      val elapsed = height - f.start
-      ceilDiv((BigInt(principal) * (term - elapsed) + BigInt(f.data(0)) * elapsed) * (10000L + margin), BigInt(term) * 10000L)
+    /** What the yield expression asks for one whole bond unit at `height`, at a flat `yieldBps`. */
+    def owed(yieldBps: Long): Long = {
+      val year = BigInt(2628000000L)
+      ceilDiv(BigInt(f.data(0)) * year, year + BigInt(yieldBps) * (f.maturity - height))
     }
   }
 
@@ -145,14 +143,18 @@ class ZcStandardFillGuardSpec extends AnyPropSpec with ZcStandardSpecBase {
     Live(f, spendOutput(filled(f), 1))
   }
 
-  /** A NAV ask for the bond unit under the guarded expression: R5 floor, min fill, expiry, margin, N, minimum, age. */
-  private def guardedAsk(l: Live, minBps: Long, margin: Long = 0L, floor: (Long, Long) = (1L, 1000000000L),
+  /**
+   * A yield ask for the bond unit under the guarded expression: R5 floor, min fill, expiry, N, a flat yield as its
+   * two points, then the minimum cover and the oracle age.
+   */
+  private def guardedAsk(l: Live, minBps: Long, yieldBps: Long = 0L, floor: (Long, Long) = (1L, 1000000000L),
                          maxAge: Long = 30L): UTXO = {
     val ctx = l.f.ctx
     UTXO(marketOf(ctx, l.f.kind).pricedAsk, minBox, Seq(Token(l.f.asset, 1L)),
       Seq(bytesValue(hashOf(otherTree(ctx))),
-        longsValue(floor._1, floor._2, 1L, l.f.maturity + 100L, margin, 1L, minBps, maxAge),
-        bytesValue(marketOf(ctx, l.f.kind).guardedPricing.hashedValueBytes), bytesValue(l.f.asset.getBytes)))
+        longsValue(floor._1, floor._2, 1L, l.f.maturity + 100L, 1L, l.height - 10L, yieldBps, l.height + 10L, yieldBps,
+          minBps, maxAge),
+        bytesValue(marketOf(ctx, l.f.kind).guardedYieldPricing.hashedValueBytes), bytesValue(l.f.asset.getBytes)))
   }
 
   /** A buyer takes the unit, paying `paid`; data inputs: 0 the bond's state box, then `data` (an oracle by default). */
@@ -162,7 +164,7 @@ class ZcStandardFillGuardSpec extends AnyPropSpec with ZcStandardSpecBase {
     val kind = l.f.kind
     val askIn = inputAt(ask, ctx, 0)
     val in = askIn.withCtxVar(0.toByte, ErgoValue.of(0)).withCtxVar(3.toByte, ErgoValue.of(0))
-      .withCtxVar(2.toByte, liqVar(if (expression == null) marketOf(ctx, kind).guardedPricing else expression))
+      .withCtxVar(2.toByte, liqVar(if (expression == null) marketOf(ctx, kind).guardedYieldPricing else expression))
     val regs = Seq(bytesValue(askIn.id.getBytes), ErgoValue.of(1L))
     val pay = if (kind == ErgBond) UTXO(otherTree(ctx), paid, Seq.empty[Token], regs)
       else UTXO(otherTree(ctx), minBox, Seq(Token(SigUSD, paid)), regs)
@@ -171,26 +173,26 @@ class ZcStandardFillGuardSpec extends AnyPropSpec with ZcStandardSpecBase {
       dataInputs = l.state +: (if (data == null) Seq(oracleBox(l.f, price = price, created = l.height)) else data))
   }
 
-  property("guarded nav: a sale passes only while the bond's cover is at least the seller's minimum, priced as accrued value") {
+  property("guarded yield: a sale passes only while the bond's cover is at least the seller's minimum, priced at the yield") {
     withCtx { ctx =>
       val erg = live(ctx, ErgBond)
-      accepts(executor(ctx), saleTx(erg, guardedAsk(erg, 14285L), erg.owed(0L)))
-      rejectsAtSigning(executor(ctx), saleTx(erg, guardedAsk(erg, 14285L), erg.owed(0L) - 1L))
-      rejectsAtSigning(executor(ctx), saleTx(erg, guardedAsk(erg, 14286L), erg.owed(0L)))
+      accepts(executor(ctx), saleTx(erg, guardedAsk(erg, 14285L, 2000L), erg.owed(2000L)))
+      rejectsAtSigning(executor(ctx), saleTx(erg, guardedAsk(erg, 14285L, 2000L), erg.owed(2000L) - 1L))
+      rejectsAtSigning(executor(ctx), saleTx(erg, guardedAsk(erg, 14286L, 2000L), erg.owed(2000L)))
 
       val usd = live(ctx, TokenBond)
-      val ask = guardedAsk(usd, 20000L, margin = 250L)
-      accepts(executor(ctx), saleTx(usd, ask, usd.owed(250L)))
-      rejectsAtSigning(executor(ctx), saleTx(usd, ask, usd.owed(250L) - 1L))
+      val ask = guardedAsk(usd, 20000L, 2500L)
+      accepts(executor(ctx), saleTx(usd, ask, usd.owed(2500L)))
+      rejectsAtSigning(executor(ctx), saleTx(usd, ask, usd.owed(2500L) - 1L))
       // ERG falls to $1.25: 178%, under the seller's 200%, whatever the buyer pays.
-      rejectsAtSigning(executor(ctx), saleTx(usd, ask, 3L * usd.owed(250L), price = 800000000L))
+      rejectsAtSigning(executor(ctx), saleTx(usd, ask, 3L * usd.owed(2500L), price = 800000000L))
     }
   }
 
-  property("guarded nav: margin -9999 leaves the fixed floor as the price, still guarded") {
+  property("guarded yield: a huge yield leaves the fixed floor as the price, still guarded") {
     withCtx { ctx =>
       val l = live(ctx, TokenBond)
-      val ask = guardedAsk(l, 20000L, margin = -9999L, floor = (500L, 1L))
+      val ask = guardedAsk(l, 20000L, yieldBps = 1000000000000000L, floor = (500L, 1L))
       accepts(executor(ctx), saleTx(l, ask, 500L))
       rejectsAtSigning(executor(ctx), saleTx(l, ask, 499L))
       rejectsAtSigning(executor(ctx), saleTx(l, ask, 500L, price = 800000000L))
@@ -200,40 +202,31 @@ class ZcStandardFillGuardSpec extends AnyPropSpec with ZcStandardSpecBase {
   property("guarded yield: payment cannot bypass cover, oracle freshness or the pinned pricing expression") {
     withCtx { ctx =>
       val l = live(ctx, TokenBond)
-      val expression = ZcStandardSpecBase.compiled(ctx).market(ksingh.sigmabonds.standard.Market.SigUsd).guardedYieldPricing
       // Zero yield asks for the full repayment, so the boundary is independently known.
-      val original = guardedAsk(l, 20000L).withRegNum(6, bytesValue(expression.hashedValueBytes))
-      val ask = original.withRegNum(5, longsValue(original.parseCollReg[Long](1).toSeq.patch(6, Seq(0L), 0): _*))
+      val ask = guardedAsk(l, 20000L)
       val paid = l.f.data(0)
-      accepts(executor(ctx), saleTx(l, ask, paid, expression = expression))
-      rejectsAtSigning(executor(ctx), saleTx(l, ask, paid - 1L, expression = expression))
-      rejectsAtSigning(executor(ctx), saleTx(l, ask, paid * 2L, price = 800000000L, expression = expression))
-      rejectsAtSigning(executor(ctx), saleTx(l, ask, paid, data = Seq.empty, expression = expression))
-      rejectsAtSigning(executor(ctx), saleTx(l, ask, paid,
-        data = Seq(oracleBox(l.f, created = l.height - 31)), expression = expression))
+      l.owed(0L) shouldBe paid
+      accepts(executor(ctx), saleTx(l, ask, paid))
+      rejectsAtSigning(executor(ctx), saleTx(l, ask, paid - 1L))
+      rejectsAtSigning(executor(ctx), saleTx(l, ask, paid * 2L, price = 800000000L))
+      rejectsAtSigning(executor(ctx), saleTx(l, ask, paid, data = Seq.empty))
+      rejectsAtSigning(executor(ctx), saleTx(l, ask, paid, data = Seq(oracleBox(l.f, created = l.height - 31))))
       rejectsAtSigning(executor(ctx), saleTx(l, ask, paid, expression = alwaysTrue(ctx)))
-      Seq(-200L, 200L).foreach { margin =>
-        val withMargin = ask.withRegNum(5, longsValue(ask.parseCollReg[Long](1).toSeq.updated(6, margin): _*))
-        val amount = paid * (10000L + margin) / 10000L
-        accepts(executor(ctx), saleTx(l, withMargin, amount, expression = expression))
-        rejectsAtSigning(executor(ctx), saleTx(l, withMargin, amount - 1L, expression = expression))
-        rejectsAtSigning(executor(ctx), saleTx(l, withMargin, amount * 2L, price = 800000000L, expression = expression))
-      }
     }
   }
 
-  property("guarded nav: it needs one fresh oracle, positive bounds, and its own expression") {
+  property("guarded yield: it needs one fresh oracle, positive bounds, and its own expression") {
     withCtx { ctx =>
       val l = live(ctx, TokenBond)
-      val ask = guardedAsk(l, 20000L)
-      val paid = l.owed(0L)
+      val ask = guardedAsk(l, 20000L, 1000L)
+      val paid = l.owed(1000L)
       rejectsAtSigning(executor(ctx), saleTx(l, ask, paid, data = Seq.empty))
       accepts(executor(ctx), saleTx(l, ask, paid, data = Seq(oracleBox(l.f, created = l.height - 30))))
       rejectsAtSigning(executor(ctx), saleTx(l, ask, paid, data = Seq(oracleBox(l.f, created = l.height - 31))))
-      rejectsAtSigning(executor(ctx), saleTx(l, guardedAsk(l, 0L), paid))
-      rejectsAtSigning(executor(ctx), saleTx(l, guardedAsk(l, 20000L, maxAge = 0L), paid))
-      // The plain accrued-value expression is not the one this ask's R6 names.
-      rejectsAtSigning(executor(ctx), saleTx(l, ask, paid, expression = marketOf(ctx, TokenBond).pricing))
+      rejectsAtSigning(executor(ctx), saleTx(l, guardedAsk(l, 0L, 1000L), paid))
+      rejectsAtSigning(executor(ctx), saleTx(l, guardedAsk(l, 20000L, 1000L, maxAge = 0L), paid))
+      // The plain yield expression is not the one this ask's R6 names.
+      rejectsAtSigning(executor(ctx), saleTx(l, ask, paid, expression = marketOf(ctx, TokenBond).yieldPricing))
     }
   }
 }

@@ -4,8 +4,15 @@
     // unit and turns it into N fungible shares backed by an ZC_Standard_DutchAuctionVault. If the bond is
     // repaid, that vault behaves like the standard fractional vault. If the bond is liquidated, the
     // vault sells the collateral it receives in a Dutch auction for the bond's repayment asset, so
-    // share holders are paid in one currency. The bond, its terms and its liquidation expression
-    // are untouched and never learn any of this.
+    // share holders are paid in one currency, unless every collateral item clears the in-kind
+    // threshold (see R8(7)). The bond, its terms and its liquidation expression are untouched and
+    // never learn any of this.
+    // Two settings of one contract pair, named off-chain:
+    //   Selective: threshold 100. Collateral is auctioned only if some item holds fewer than 100
+    //     raw units (an NFT, or a token too thin to split pro rata); otherwise it is paid in kind.
+    //   Dutch: threshold 9223372036854775807 (Long max). Liquidated collateral is always auctioned.
+    // The threshold is at least 100, so a token too thin to split is never paid in kind while an
+    // auction could sell it. This is the only share mint ZC_Standard_LendOffer buys from.
     // The owner is never assumed to be online after creating this box: any batcher runs the mint
     // for the mint fee.
     //
@@ -22,7 +29,7 @@
     // R4-R6: free. When this box is an order's OUTPUTS(0) they hold the bond asset's EIP-4 data.
     // R7: Coll[Byte] - 32-byte owner script hash, optionally followed by a 32-byte offer delivery tag.
     //   Only the owner hash controls delivery and cancellation; the suffix attributes the deposit.
-    // R8: Coll[Long] - exactly 6:
+    // R8: Coll[Long] - exactly 8:
     //   0 N, the number of shares, 1 <= N <= 1000000000
     //   1 pull batching fee, >= 2000000 nanoERG, moved into the vault
     //   2 mint batching fee, >= 2000000 nanoERG, paid to whoever runs the mint
@@ -32,6 +39,13 @@
     //   5 auction length in blocks, 1..1000000. The vault's currency target falls in a straight
     //     line from the opening to the floor over this many blocks and then stays at the floor.
     //     See ZC_Standard_DutchAuctionVault: a floor of 0 never opens an auction.
+    //   6 auction expiry in blocks from the auction's start, length..1000000. The lot stays on
+    //     sale at the floor from the end of the fall until then; share holders cannot claim the
+    //     unsold lot in kind before it. It counts from the start because the start is only known
+    //     when a liquidated settlement is pulled.
+    //   7 in-kind threshold in raw units, >= 100. After a liquidation the vault opens an auction
+    //     only if some lot item holds fewer raw units than this. 100 is Selective; Long max is
+    //     Dutch (always auction).
     // R9: Coll[Coll[Byte]] - the share token's EIP-4 (name, description, decimals), exactly 3 items
     //
     // VALUE
@@ -55,7 +69,7 @@
     // OUTPUTS(0): N shares at tokens(0), at the owner script. R4, R5, R6 = the three items of R9.
     // OUTPUTS(1): ZC_Standard_DutchAuctionVault with tokens ((share, N+1), (bond asset, 1)),
     //   R4 = bond asset id, R5 = (N, N, pull fee), R6 any value,
-    //   R7 = (repayment, opening bps, floor bps, length, 0), R8 = CONST_REPAYMENT_TOKEN.
+    //   R7 = (repayment, opening bps, floor bps, length, expiry, threshold, 0), R8 = CONST_REPAYMENT_TOKEN.
     //   Registers are dense, so R6 must exist to carry R7 and R8. Nothing reads it until the pull
     //   sets the vault's state, so this script leaves it free.
     //
@@ -66,10 +80,11 @@
     // As for the standard mint: share id Y is genuine iff the box with id Y was spent under this
     // exact script and constants. A buyer must ALSO read the auction terms in that box's R8: a
     // low floor, or a short auction, can sell the collateral cheaply after a liquidation (a floor
-    // of 0 means no auction, and holders are paid in kind). This script
+    // of 0 means no auction, and holders are paid in kind); a long expiry locks holders out of
+    // an unsold lot for longer. This script
     // does not check that the bond asset is genuine: the depositor answers for what they wrap.
     // ZC_Standard_LendOffer does all of this before it buys: it pins this script's hash, verifies the bond
-    // asset, and requires the floor and the length to clear the lender's bounds in its R5(9), R5(10).
+    // asset, and requires the floor and the expiry to clear the lender's bounds in its R5(9), R5(10).
 
     def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
         OUTPUTS.fold(0L, { (a: Long, b: Box) =>
@@ -89,7 +104,7 @@
         val terms = SELF.R8[Coll[Long]].get
         val metadata = SELF.R9[Coll[Coll[Byte]]].get
         val stateIndex = getVar[Int](0).get
-        if (terms.size != 6 || metadata.size != 3 || OUTPUTS.size < 2 || SELF.tokens.size != 1 ||
+        if (terms.size != 8 || metadata.size != 3 || OUTPUTS.size < 2 || SELF.tokens.size != 1 ||
             stateIndex < 0 || stateIndex >= CONTEXT.dataInputs.size) {
             sigmaProp(false)
         } else {
@@ -99,6 +114,8 @@
             val openingBps = terms(3)
             val floorBps = terms(4)
             val length = terms(5)
+            val expiry = terms(6)
+            val threshold = terms(7)
             val shareOut = OUTPUTS(0)
             val vault = OUTPUTS(1)
             val bondUnit = SELF.tokens(0)
@@ -115,7 +132,8 @@
                 pullFee >= 2000000L && mintFee >= 2000000L &&
                 pullFee <= SELF.value && mintFee <= SELF.value - pullFee &&
                 floorBps >= 0L && floorBps <= openingBps && openingBps <= 1000000L &&
-                length >= 1L && length <= 1000000L
+                length >= 1L && expiry >= length && expiry <= 1000000L &&
+                threshold >= 100L
 
             val mintValid =
                 SELF.id == INPUTS(0).id &&
@@ -149,7 +167,7 @@
                     vault.tokens == Coll((SELF.id, shares + 1L), bondUnit) &&
                     vault.R4[Coll[Byte]].get == bondUnit._1 &&
                     vault.R5[Coll[Long]].get == Coll(shares, shares, pullFee) &&
-                    vault.R7[Coll[Long]].get == Coll(repayment, openingBps, floorBps, length, 0L) &&
+                    vault.R7[Coll[Long]].get == Coll(repayment, openingBps, floorBps, length, expiry, threshold, 0L) &&
                     vault.R8[Coll[Byte]].get == CONST_REPAYMENT_TOKEN
 
                 sigmaProp(repayment > 0L && sharesPaid && vaultValid)

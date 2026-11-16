@@ -75,6 +75,16 @@ trait StandardBatch extends AppBase { self: StandardApp =>
         Fmt.erg(ask.box.value - refund.value))
   }
 
+  private[standard] def lotRefund(lot: StdLot): Piece = {
+    if (height.toLong < lot.expiry) fail(s"the lot expires at height ${lot.expiry}; it can be refunded from then on")
+    if (lot.refundFee < 0L || lot.box.value - lot.refundFee < MinBox)
+      fail("the lot's refund fee leaves no box minimum: only its seller can cancel it")
+    val refund = UTXO(Contract(ownerTree(lot.sellerHash, lot.box, "seller")), lot.box.value - lot.refundFee, lot.box.tokens,
+      Seq(bytesValue(lot.box.id.getBytes)))
+    Piece(lot.box.id.toString, i => lot.box.withCtxVar(0.toByte, intValue(i)), Seq(refund), lot.refundFee,
+      s"returns lot ${lot.box.id} to its seller, for its ${Fmt.erg(lot.refundFee)} refund fee")
+  }
+
   /**
    * A bond's liquidation: its rule from context var 0, its vault output named in var 1. An oracle-rule bond
    * before maturity reads the oracle pool as data input 0. Its fee reserve goes to the runner.
@@ -129,8 +139,9 @@ trait StandardBatch extends AppBase { self: StandardApp =>
       protocol.asOrder(box).map(orderRefund)
         .orElse(protocol.asOffer(box).map(offerRefund))
         .orElse(protocol.asAsk(box).map(askRefund))
+        .orElse(protocol.asLot(box).map(lotRefund))
         .orElse(protocol.asBond(box).map(liquidation))
-        .getOrElse(fail(s"$id is not a ZC Standard order, offer, ask or bond"))
+        .getOrElse(fail(s"$id is not a ZC Standard order, offer, ask, lot or bond"))
     }
     packed(s"Pack ${pieces.size} refund(s) and liquidation(s)", pieces)
   }
@@ -164,7 +175,8 @@ trait StandardBatch extends AppBase { self: StandardApp =>
       Work(summary, command, reward, Set(box), Some(box))
 
     shareRequests().filter(r => alone(r.mintFee) && served(r.ownerHash, r.box, "share request", "owner")).foreach { r =>
-      work += Work(s"mint ${r.shares} shares of bond ${r.bondAsset}" + r.dutch.fold("")(_ => " (Dutch auction)"),
+      work += Work(s"mint ${r.shares} shares of bond ${r.bondAsset}" +
+        r.dutch.fold(" (plain fractional)")(_ => AuctionTerms.fromLongs(r.auction).fold(" (Dutch pair)")(a => s" (${a.kind})")),
         s"mint-shares ${r.box.id}", r.mintFee, Set(r.box.id.toString))
     }
     val settled = settlements().map(s => s.asset -> s).toMap
@@ -199,6 +211,10 @@ trait StandardBatch extends AppBase { self: StandardApp =>
     openAsks.filter(a => now >= a.expiry && a.box.value > MinBox && served(a.sellerHash, a.box, "ask", "seller")).foreach { a =>
       work += packWork(s"return expired ask ${a.box.id} to its seller", s"refund-ask ${a.box.id}", a.box.value - MinBox,
         a.box.id.toString)
+    }
+    lots().filter(l => now >= l.expiry && l.refundFee > 0L && l.box.value - l.refundFee >= MinBox &&
+      served(l.sellerHash, l.box, "lot", "seller")).foreach { l =>
+      work += packWork(s"return expired lot ${l.box.id} to its seller", s"refund-lot ${l.box.id}", l.refundFee, l.box.id.toString)
     }
 
     // Matches. Offers go by maximum remaining batcher reward, highest first, then box id; each takes the order or ask that gives it

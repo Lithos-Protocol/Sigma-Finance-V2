@@ -109,30 +109,30 @@ class LivePlanSpec extends AnyPropSpec with Matchers {
     run.exists(a => a.command.contains("batch") && a.flag("run")) shouldBe true
   }
 
-  property("priced issuance covers both policies and maturity modes, and yield asks finish before repayment") {
+  property("priced issuance covers moving and fixed yields and both maturity modes, and yield asks finish before repayment") {
     def args(id: String) = Args.parse(Args.tokenize(LivePlan.fill(byId(id).command, sample).right.get))
-    for ((id, nav, onClose) <- Seq(("A1", true, false), ("B1", true, true), ("E1", false, false), ("G1", false, true))) {
+    for ((id, moving, onClose) <- Seq(("A1", true, false), ("B1", false, true), ("E1", true, false), ("G1", false, true))) {
       withClue(s"$id: ") {
-        args(id).flag("nav") shouldBe nav
-        args(id).opt("yield").isDefined shouldBe !nav
+        args(id).opt("yield").isDefined shouldBe true
+        args(id).opt("end-yield").isDefined shouldBe moving
         args(id).opt("duration").isDefined shouldBe onClose
-        args(id).opt("margin").isDefined shouldBe true
       }
     }
     Seq("A2", "B2", "E2", "G3").foreach { id =>
       byId(id).check shouldBe a[Check.PricedFill]
       byId(id).binds.exists(_.output == 2) shouldBe true
     }
-    Seq("A6", "E9").foreach { id =>
+    Seq("A6", "E4", "E9").foreach { id =>
       args(id).opt("yield").isDefined shouldBe true
-      args(id).opt("margin").isDefined shouldBe true
       byId(id).check shouldBe a[Check.AskPricing]
     }
+    args("A6").opt("end-yield") shouldBe Some("10")
     args("E9").opt("min-cover") shouldBe Some("150")
     // A yield ask needs a live bond; the old fixed ask could trade after repayment.
     closure(byId("A10")) should contain("A9")
-    args("K1").flag("nav") shouldBe true
+    args("K1").opt("end-yield") shouldBe Some("10")
     args("K3").opt("yield").isDefined shouldBe true
+    args("O1").opt("curve").isDefined shouldBe true
   }
 
   property("every step explains itself in a sentence or two, and every explanation belongs to a step") {

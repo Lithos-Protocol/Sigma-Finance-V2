@@ -27,6 +27,84 @@ case class OracleRatio(market: Market, expression: Contract) extends Liquidation
 }
 
 /**
+ * A simple block yield moving in a straight line between two heights: the start yield up to `start`, the end
+ * yield from `end` on. Yields are bps per 262800 blocks. The payload of the yield pricing expressions, which
+ * compare exactly as this does: the yield at a height is `rate / span`.
+ */
+case class YieldLine(start: Long, startBps: Long, end: Long, endBps: Long) {
+  def valid: Boolean = startBps >= 0L && endBps >= 0L && end > start
+  def terms: Seq[Long] = Seq(start, startBps, end, endBps)
+  def fixed: Boolean = startBps == endBps
+
+  /** The yield at `height`, exactly `rate / span` bps. */
+  def at(height: Long): (BigInt, BigInt) = {
+    val h = height.max(start).min(end)
+    val span = BigInt(end - start)
+    (BigInt(startBps) * span + (BigInt(endBps) - startBps) * (h - start), span)
+  }
+
+  /** The yield at `height` in whole bps, rounded down, for display. */
+  def bpsAt(height: Long): Long = { val (r, s) = at(height); (r / s).toLong }
+
+  /**
+   * The least a buyer pays for `units` of the `whole` units of a bond repaying `repayment` with `blocksLeft`
+   * blocks left, at `height`: ceil(units * R * B * L / (whole * (B * L + Y * D))).
+   */
+  def price(repayment: Long, units: Long, whole: Long, blocksLeft: Long, height: Long): BigInt = {
+    val (rate, span) = at(height)
+    val num = BigInt(units) * repayment * StandardProtocol.Year * span
+    val den = BigInt(whole) * (StandardProtocol.Year * span + rate * blocksLeft)
+    (num + den - 1) / den
+  }
+}
+
+/**
+ * A lend offer's required yield by blocks left to maturity: straight lines between (yield bps, blocks left)
+ * points, flat beyond the first and last, and never below `minBps`. With no points it is `minBps` everywhere.
+ * The offer compares exactly as `accepts` does.
+ */
+case class YieldCurve(minBps: Long, points: Seq[(Long, Long)]) {
+  def ordered: Boolean = points.map(_._2).sliding(2).forall { case Seq(a, b) => b > a; case _ => true }
+
+  /** The yield required at `blocksLeft`, exactly `rate / span` bps. */
+  def at(blocksLeft: Long): (BigInt, BigInt) = {
+    val below = points.count(_._2 <= blocksLeft)
+    val (rate, span) =
+      if (points.isEmpty) (BigInt(minBps), BigInt(1))
+      else if (below == 0) (BigInt(points.head._1), BigInt(1))
+      else if (below == points.size) (BigInt(points.last._1), BigInt(1))
+      else {
+        val (y1, d1) = points(below - 1)
+        val (y2, d2) = points(below)
+        val l = BigInt(d2 - d1)
+        (BigInt(y1) * l + (BigInt(y2) - y1) * (blocksLeft - d1), l)
+      }
+    (rate.max(BigInt(minBps) * span), span)
+  }
+
+  /** The yield required at `blocksLeft` in whole bps, rounded up, for display. */
+  def bpsAt(blocksLeft: Long): Long = { val (r, s) = at(blocksLeft); ((r + s - 1) / s).toLong }
+
+  /** Whether paying `cost` for `units` of the `whole` units of a bond repaying R, D blocks out, meets the curve. */
+  def accepts(repayment: Long, units: Long, cost: Long, whole: Long, blocksLeft: Long): Boolean = {
+    val (rate, span) = at(blocksLeft)
+    BigInt(repayment) * units * StandardProtocol.Year * span >=
+      BigInt(cost) * whole * (StandardProtocol.Year * span + rate * blocksLeft)
+  }
+
+  /** The most an offer pays for `units` of `whole` (cost including an ERG offer's fee), rounded down. */
+  def ceiling(repayment: Long, units: Long, whole: Long, blocksLeft: Long): BigInt = {
+    val (rate, span) = at(blocksLeft)
+    BigInt(repayment) * units * StandardProtocol.Year * span / (BigInt(whole) * (StandardProtocol.Year * span + rate * blocksLeft))
+  }
+
+  def describe: String =
+    if (points.isEmpty) s"${Units.percent(minBps)} at every maturity"
+    else points.map { case (y, d) => s"${Units.percent(y)} at $d blocks" }.mkString(", ") +
+      (if (minBps > 0L) s", never below ${Units.percent(minBps)}" else "")
+}
+
+/**
  * A fixed or priced order. `terms` is R4; a priced fill resolves principal before copying it: 0 repayment, 1 principal nanoERG,
  * 2 repayment ERG floor, 3 maturity height or duration, 4 expiry height, 5 expiry fee, 6 mode, 7.. payload.
  * `guardHash` is fixed Order R8 or PricedOrder R8(1), the optional fill guard; the
@@ -86,7 +164,7 @@ case class OracleState(box: InputUTXO, price: Long, epoch: Int, created: Int, re
 /**
  * A request to turn one bond unit into shares: ZC_Standard_FractionalMint, or a market's
  * ZC_Standard_DutchAuctionMint (`dutch`). R8 is (N, pull fee, mint fee), then for a Dutch request the
- * auction's (opening bps, floor bps, length).
+ * auction's (opening bps, floor bps, length, expiry, in-kind threshold).
  */
 case class StdShareRequest(box: InputUTXO, dutch: Option[Market], ownerHash: Array[Byte], terms: Seq[Long],
                            metadata: Seq[Array[Byte]]) {
@@ -101,8 +179,9 @@ case class StdShareRequest(box: InputUTXO, dutch: Option[Market], ownerHash: Arr
 /**
  * A share vault: ZC_Standard_FractionalVault or ZC_Standard_DutchAuctionVault. It holds the share's
  * N+1 reserve, then the bond unit until the pull, then the settlement's proceeds. For a Dutch vault,
- * `auction` is (repayment, opening bps, floor bps, length, start height) and `state` is 0 repaid, 1 auction
- * open, 2 sold or nothing to sell, 3 paid in kind (meaningful only after the pull).
+ * `auction` is (repayment, opening bps, floor bps, length, expiry, in-kind threshold, start height) and
+ * `state` is 0 repaid, 1 auction open, 2 sold, nothing to sell or paid in kind at the pull, 3 paid in kind
+ * after the auction's expiry (meaningful only after the pull).
  */
 case class StdShareVault(box: InputUTXO, dutch: Boolean, bondAsset: ErgoId, n: Long, outstanding: Long,
                          pullFee: Long, state: Option[Byte], auction: Seq[Long], currency: Option[Array[Byte]]) {
@@ -111,6 +190,12 @@ case class StdShareVault(box: InputUTXO, dutch: Boolean, bondAsset: ErgoId, n: L
   def holding: Boolean = assets.exists(_.id == bondAsset)
   def auctionOpen: Boolean = dutch && !holding && state.contains(1.toByte)
   def currencyToken: Option[ErgoId] = currency.filter(_.length == 32).map(new ErgoId(_))
+  def auctionLength: Long = auction(3)
+  def auctionExpiry: Long = auction(4)
+  def threshold: Long = auction(5)
+  def auctionStart: Long = auction(6)
+  /** The first height at which holders may claim an unsold lot in kind. */
+  def claimableFrom: Long = auctionStart + auctionExpiry
 }
 
 /** An ask: a ZC_Standard_SaleOrder, or a ZC_Standard_PricedAsk (`priced`) priced by its R6 expression. */
@@ -121,21 +206,49 @@ case class StdAsk(box: InputUTXO, market: Market, priced: Boolean, sellerHash: A
   def denominator: Long = terms(1)
   def minFill: Long = terms(2)
   def expiry: Long = terms(3)
-  def margin: Long = if (!priced) 0L else terms.lift(if (yieldBased) 6 else 4).getOrElse(0L)
-  def wholeUnits: Long = if (priced) terms(5) else 1L
-  /** The fixed price (a sale order's price, a NAV ask's floor) of `units` raw units. */
+  def wholeUnits: Long = if (priced) terms(4) else 1L
+  /** A yield ask's two points: R5(5..8). */
+  def yieldLine: Option[YieldLine] = if (!yieldBased || terms.size < 9) None
+    else Some(YieldLine(terms(5), terms(6), terms(7), terms(8)))
+  /** The fixed price (a sale order's price, a priced ask's floor) of `units` raw units. */
   def fixedPrice(units: Long): BigInt = (BigInt(units) * numerator + denominator - 1) / denominator
 }
 
+/** A ZC_Standard_LotAuction: everything in the box sold whole for the market's asset at a falling price. */
+case class StdLot(box: InputUTXO, market: Market, sellerHash: Array[Byte], terms: Seq[Long]) {
+  def opening: Long = terms(0)
+  def floor: Long = terms(1)
+  def start: Long = terms(2)
+  def end: Long = terms(3)
+  def expiry: Long = terms(4)
+  def refundFee: Long = terms(5)
+  def valid: Boolean = floor >= 1L && floor <= opening && start < end && end <= expiry
+  /** The least the lot sells for at `height`: the opening, falling in a straight line to the floor. */
+  def price(height: Long): Long = {
+    val at = height.max(start).min(end)
+    val span = BigInt(end - start)
+    // paid * span >= opening * span - (opening - floor) * (at - start), rounded up.
+    val owed = BigInt(opening) * span - BigInt(opening - floor) * (at - start)
+    ((owed + span - 1) / span).toLong
+  }
+  /** What the buyer takes: every token, and for a token currency the nanoERG too. */
+  def lot: Seq[Token] = box.tokens
+}
+
 /**
- * A lend offer. R5 terms: 0 yield bps, 1 min and 2 max blocks to maturity, 3 batcher fee, 4 new-bond fee
- * reserve, 5 collateral floor bps, 6 expiry, 7 minimum price, 8 oracle age, 9 min auction floor, 10 max
- * auction length. Token offers append 11 original capital, 12 total ERG spend budget, 13 minimum fill
- * bps of original capital, 14 batcher reward budget. R7, R8, R9: fractional terms, metadata, mint hash.
+ * A lend offer. R5 terms: 0 minimum yield bps, 1 min and 2 max blocks to maturity, 3 batcher fee, 4 new-bond
+ * fee reserve, 5 collateral floor bps, 6 expiry, 7 minimum price, 8 oracle age, 9 min auction floor, 10 max
+ * auction expiry. Token offers append 11 original capital, 12 total ERG spend budget, 13 minimum fill
+ * bps of original capital, 14 batcher reward budget. Then the yield curve: up to 20 (yield bps, blocks left)
+ * points. R7, R8, R9: fractional terms, metadata, mint hash.
  */
 case class StdOffer(box: InputUTXO, market: Market, ownerHash: Array[Byte], terms: Seq[Long],
                     policyHash: Array[Byte], fractional: Seq[Long], metadata: Seq[Array[Byte]], mintHash: Array[Byte]) {
+  /** The offer's minimum yield: the floor of its curve, and with no points its one yield. */
   def yieldBps: Long = terms(0)
+  def curve: YieldCurve = YieldCurve(terms(0), StandardProtocol.curvePoints(terms.drop(StandardProtocol.offerBase(market))))
+  def minBlocks: Long = terms(1)
+  def maxBlocks: Long = terms(2)
   def batcherFee: Long = terms(3)
   def originalCapital: Long = if (market.token.isEmpty) box.value else terms(11)
   def spendBudget: Long = if (market.token.isEmpty) 0L else terms(12)
@@ -204,33 +317,35 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
 
   def orderPricingOf(order: StdOrder): Contract = {
     val c = market(order.market)
-    Seq(c.navOrderPricing, c.yieldOrderPricing).find(p => order.pricingHash.exists(_.sameElements(p.hashedValueBytes)))
+    Seq(c.yieldOrderPricing).find(p => order.pricingHash.exists(_.sameElements(p.hashedValueBytes)))
       .getOrElse(throw app.CliError("the order names an unknown pricing expression"))
   }
 
   def yieldOrder(order: StdOrder): Boolean = order.pricingHash.exists(_.sameElements(market(order.market).yieldOrderPricing.hashedValueBytes))
+
+  /** A yield order's two points, R9 = (start height, start yield, end height, end yield). */
+  def orderYieldLine(order: StdOrder): Option[YieldLine] =
+    if (!yieldOrder(order) || order.pricingTerms.size != 4) None
+    else Some(YieldLine(order.pricingTerms(0), order.pricingTerms(1), order.pricingTerms(2), order.pricingTerms(3)))
 
   /** Whether `hash` is the standard fill guard compiled for `m`. */
   def isFillGuard(hash: Array[Byte], m: Market): Boolean = hash.sameElements(market(m).fillGuard.hashedValueBytes)
 
   /** Whether a priced ask's R6 names a guarded pricing expression, which also holds a sale to a minimum cover. */
   def isGuarded(ask: StdAsk): Boolean = ask.pricingHash.exists(h =>
-    Seq(market(ask.market).guardedPricing, market(ask.market).guardedYieldPricing).exists(_.hashedValueBytes.sameElements(h)))
+    market(ask.market).guardedYieldPricing.hashedValueBytes.sameElements(h))
 
   def yieldAsk(ask: StdAsk): Boolean = ask.pricingHash.exists(h =>
     Seq(market(ask.market).yieldPricing, market(ask.market).guardedYieldPricing).exists(_.hashedValueBytes.sameElements(h)))
 
-  /** A guarded ask's (minimum cover bps, oracle age): NAV R5(6..7), yield R5(7..8). */
+  /** A guarded ask's (minimum cover bps, oracle age): R5(9..10). */
   def saleGuard(ask: StdAsk): Option[(Long, Long)] =
-    if (!isGuarded(ask)) None else {
-      val offset = if (yieldAsk(ask)) 7 else 6
-      if (ask.terms.size >= offset + 2) Some(ask.terms(offset) -> ask.terms(offset + 1)) else None
-    }
+    if (!isGuarded(ask) || ask.terms.size < 11) None else Some(ask.terms(9) -> ask.terms(10))
 
   /** The pricing expression a priced ask's R6 names, as the bytes its var 2 carries. */
   def pricingOf(ask: StdAsk): Contract = {
     val c = market(ask.market)
-    Seq(c.pricing, c.guardedPricing, c.yieldPricing, c.guardedYieldPricing)
+    Seq(c.yieldPricing, c.guardedYieldPricing)
       .find(p => ask.pricingHash.exists(_.sameElements(p.hashedValueBytes)))
       .getOrElse(throw app.CliError("the ask names an unknown pricing expression"))
   }
@@ -257,6 +372,7 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
   val pricedAskTemplateHash: Array[Byte] = templateHash(market(Market.Erg).pricedAsk.ergoTree)
   val offerTemplateHash: Array[Byte] = templateHash(market(Market.Erg).offer.ergoTree)
   val dutchMintTemplateHash: Array[Byte] = templateHash(market(Market.Erg).dutchMint.ergoTree)
+  val lotTemplateHash: Array[Byte] = templateHash(market(Market.Erg).lotAuction.ergoTree)
 
   def asShareRequest(box: InputUTXO): Option[StdShareRequest] = {
     val tree = box.input.getErgoTree
@@ -266,7 +382,7 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
       if box.tokens.size == 1 && box.tokens.head.amount == 1L
       ownerRecord <- bytesReg(box, 7) if ownerRecord.length == 32 || ownerRecord.length == 64
       owner = ownerRecord.take(32)
-      terms <- longsReg(box, 8) if terms.length == (if (dutch.isDefined) 6 else 3)
+      terms <- longsReg(box, 8) if terms.length == (if (dutch.isDefined) 8 else 3)
       metadata <- bytesListReg(box, 9) if metadata.size == 3
     } yield StdShareRequest(box, dutch, owner, terms.toSeq, metadata)
   }
@@ -279,7 +395,7 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
       if box.tokens.nonEmpty
       asset <- bytesReg(box, 4) if asset.length == 32
       supply <- longsReg(box, 5) if supply.length == 3 && box.tokens.head.amount == supply(0) + 1L
-      auction <- if (dutch) longsReg(box, 7).filter(_.length == 5).map(_.toSeq) else Some(Seq.empty[Long])
+      auction <- if (dutch) longsReg(box, 7).filter(_.length == 7).map(_.toSeq) else Some(Seq.empty[Long])
       currency <- if (dutch) bytesReg(box, 8).map(Some(_)) else Some(None)
     } yield StdShareVault(box, dutch, new ErgoId(asset), supply(0), supply(1), supply(2), byteReg(box, 6), auction, currency)
   }
@@ -292,7 +408,7 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
       m <- sale.orElse(nav)
       if box.tokens.size == 1
       seller <- bytesReg(box, 4) if seller.length == 32
-      terms <- longsReg(box, 5) if (if (nav.isDefined) terms.length >= 6 && terms.length <= 64 else terms.length == 4)
+      terms <- longsReg(box, 5) if (if (nav.isDefined) terms.length >= 5 && terms.length <= 64 else terms.length == 4)
       if terms(0) > 0L && terms(1) > 0L
       pricing <- if (nav.isDefined) bytesReg(box, 6).map(Some(_)) else Some(None)
       asset <- if (nav.isDefined) bytesReg(box, 7).filter(_.length == 32).map(a => Some(new ErgoId(a))) else Some(None)
@@ -303,13 +419,19 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
   def asOffer(box: InputUTXO): Option[StdOffer] = for {
     m <- marketWhere(box.input.getErgoTree, _.offer)
     owner <- bytesReg(box, 4) if owner.length == 32
-    terms <- longsReg(box, 5) if terms.length == (if (m.token.isEmpty) 11 else 15)
+    terms <- longsReg(box, 5) if offerTermsShape(m, terms.length)
     policyRecord <- bytesReg(box, 6) if policyRecord.length == 32 || policyRecord.length == 64
     policy = policyRecord.take(32)
     fractional <- longsReg(box, 7)
     metadata <- bytesListReg(box, 8)
     mint <- bytesReg(box, 9)
   } yield StdOffer(box, m, owner, terms.toSeq, policy, fractional.toSeq, metadata, mint)
+
+  def asLot(box: InputUTXO): Option[StdLot] = for {
+    m <- marketWhere(box.input.getErgoTree, _.lotAuction)
+    seller <- bytesReg(box, 4) if seller.length == 32
+    terms <- longsReg(box, 5) if terms.length == 6
+  } yield StdLot(box, m, seller, terms.toSeq)
 
   /** A short name for a script this client knows, for transaction summaries. */
   def nameOf(tree: ErgoTree): Option[String] =
@@ -327,7 +449,7 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
   def namedScriptRegister(tree: ErgoTree): Option[Int] =
     if (orderMarket(tree).isDefined) Some(6)
     else if (bondMarket(tree).isDefined) Some(5)
-    else if (Seq[MarketContracts => Contract](_.offer, _.saleOrder, _.pricedAsk).exists(marketWhere(tree, _).isDefined)) Some(4)
+    else if (Seq[MarketContracts => Contract](_.offer, _.saleOrder, _.pricedAsk, _.lotAuction).exists(marketWhere(tree, _).isDefined)) Some(4)
     else if (isShareMint(tree)) Some(7)
     else None
 
@@ -380,10 +502,31 @@ object StandardProtocol {
   val MinBatchingFee: Long = 2000000L
 
   /**
-   * The margin of a guarded fixed-price ask: a NAV ask priced at a hundredth of a percent of accrued value, so its
-   * floor, the fixed price, is what a buyer pays, and the guarded expression still holds the sale to its cover.
+   * The yield of a guarded fixed-price ask: so large that the yield price is next to nothing, so its floor, the
+   * fixed price, is what a buyer pays, and the guarded expression still holds the sale to its cover.
    */
-  val GuardedFixedMargin: Long = -9999L
+  val GuardedFixedYield: Long = 1000000000000000L
+
+  /** One year of 2-minute blocks times the basis-point denominator, as every yield test uses it. */
+  val Year: BigInt = BigInt(2628000000L)
+
+  /** Yield-curve points a lend offer may carry. */
+  val MaxCurvePoints: Int = 20
+
+  /** Where a lend offer's yield curve starts in R5: after the fixed terms of its market. */
+  def offerBase(m: Market): Int = if (m.token.isEmpty) 11 else 15
+
+  def offerTermsShape(m: Market, size: Int): Boolean = {
+    val base = offerBase(m)
+    size >= base && size <= base + 2 * MaxCurvePoints && (size - base) % 2 == 0
+  }
+
+  /** A curve tail as (yield bps, blocks left) pairs. */
+  def curvePoints(tail: Seq[Long]): Seq[(Long, Long)] = tail.grouped(2).collect { case Seq(y, d) => (y, d) }.toSeq
+
+  /** Dutch-pair in-kind thresholds: Selective auctions only thin lots; Dutch auctions every lot. */
+  val SelectiveThreshold: Long = 100L
+  val DutchThreshold: Long = Long.MaxValue
 
   /** zcs1's maturity grid: fixed maturities are multiples of 21,600 blocks, about 30 days of 2-minute blocks. */
   val MaturityGrid: Long = 21600L

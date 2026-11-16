@@ -1,20 +1,22 @@
 {
-    // Standard lend offer (a yield bid).
-    // Holds a lender's capital and buys standard bonds that clear a minimum simple-interest yield:
-    // new ones, by filling a ZC_Standard_Order, and existing ones, from any ask that follows the ask
-    // convention below (ZC_Standard_SaleOrder, ZC_Standard_PricedAsk, or a later one). The lender is never assumed to
-    // be online after posting: any batcher matches the offer, for the fee the offer itself sets,
-    // and the bond unit is delivered to the lender or into a fractional request.
+    // Standard lend offer (a yield-curve bid).
+    // Holds a lender's capital and buys standard bonds that clear a simple-interest yield the lender
+    // sets per maturity: new ones, by filling a ZC_Standard_Order or ZC_Standard_PricedOrder, and
+    // existing ones, from any ask that follows the ask convention below (ZC_Standard_SaleOrder,
+    // ZC_Standard_PricedAsk, or a later one). The lender is never assumed to be online after posting:
+    // any batcher matches the offer, for the fee the offer itself sets, and the bond unit is
+    // delivered to the lender or into a fractional request.
     //
     // CONSTANTS (one offer address per repayment asset, under one shared template)
     // CONST_REPAYMENT_TOKEN: Coll[Byte] - the asset lent and repaid; EMPTY for ERG
     // CONST_ORDER_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Order tree for that asset
     // CONST_PRICED_ORDER_HASH: Coll[Byte] - accepted expression-priced issuing order tree hash
     // CONST_BOND_HASH: Coll[Byte] - blake2b256 of the ZC_Standard_Bond tree for that asset
-    // CONST_FRACTIONAL_MINT_HASH: Coll[Byte] - blake2b256 of ZC_Standard_FractionalMint. Used only to
-    //   verify shares being BOUGHT; where a delivery goes is the lender's choice in R9.
     // CONST_DUTCH_MINT_HASH: Coll[Byte] - blake2b256 of ZC_Standard_DutchAuctionMint compiled for this
-    //   repayment asset and CONST_BOND_HASH. Also used only to verify shares being bought.
+    //   repayment asset and CONST_BOND_HASH: the only mint whose shares this offer BUYS. Its in-kind
+    //   threshold is at least 100, so after a liquidation a token too thin to split pro rata is
+    //   auctioned, not paid in kind. Plain ZC_Standard_FractionalMint shares are not bought. Where a
+    //   delivery goes is still the lender's choice in R9.
     // No ask script is pinned: a new kind of ask needs no new offer.
     // The deployer must compile these consistently; the script cannot check one against another.
     //
@@ -24,8 +26,10 @@
     //
     // REGISTERS (R4 to R9, all present; all copied unchanged to the continuation)
     // R4: Coll[Byte] - blake2b256 of the owner script: may cancel, receives the bond unit or shares
-    // R5: Coll[Long] - terms, 11 for ERG, 15 for a token offer:
-    //   0 minimum yield, basis points of simple interest per 262800 blocks (one year of 2-minute blocks)
+    // R5: Coll[Long] - terms: 11 for ERG or 15 for a token offer, then the yield curve.
+    //   0 minimum yield, basis points of simple interest per 262800 blocks (one year of 2-minute
+    //     blocks), >= 0. The yield required at any maturity is never below it. With no curve
+    //     points it is the offer's one yield at every maturity.
     //   1 minimum and 2 maximum blocks left to maturity
     //   3 ERG batcher fee per fill, and expiry refund fee for either market, nanoERG. A fill needs at least 2000000
     //     (0.002 ERG), the floor every standard batching fee shares; an offer below it never fills,
@@ -35,9 +39,9 @@
     //     by the collateral policy expression
     //   6 expiry height; fills require HEIGHT < expiry, and from then on anyone may refund
     //   7 minimum price of one fill, in raw units of the repayment asset
-    //   9 minimum auction floor, basis points of the repayment, and 10 maximum auction length,
-    //     blocks: the worst auction terms on ZC_Standard_DutchAuctionMint shares this offer will buy.
-    //     A maximum length of 0 buys none. Bond units and standard shares ignore both.
+    //   9 minimum auction floor, basis points of the repayment, and 10 maximum auction expiry,
+    //     blocks from the auction's start: the worst terms on ZC_Standard_DutchAuctionMint shares this
+    //     offer will buy. A maximum expiry of 0 buys no shares. Bond units ignore both.
     //   Token offers additionally commit (unchanged through every continuation):
     //   11 original capital, raw token units, positive
     //   12 original total ERG spending budget, excluding 1000000 plus the expiry refund fee
@@ -47,6 +51,8 @@
     //   Smaller calculated fees reject the fill. Total ERG outflow, including box funding and
     //   new-bond reserve, is at most floor(R5(12) * price / R5(11)). Splitting cannot increase
     //   either allowance. The continuation retains 1000000 plus the expiry refund fee.
+    //   Then the yield curve, from index 11 (ERG) or 15 (token): 0 to 20 points, each two values
+    //   (yield bps, blocks left to maturity). Blocks left strictly increase from point to point.
     // R6: Coll[Byte] - policy hash (32 bytes), optionally followed by the predecessor offer id
     //   (32 bytes). Every fill's continuation must set that suffix to SELF.id. The policy is the
     //   whole risk decision: it names the liquidation rule a bond must carry, requires that rule to
@@ -55,16 +61,28 @@
     //   mint reads, 3..16 values in all; EMPTY delivers the bond unit itself
     // R8: Coll[Coll[Byte]] - share token EIP-4 (name, description, decimals); EMPTY when R7 is empty
     // R9: Coll[Byte] - blake2b256 of the mint request script a fractional delivery goes into:
-    //   ZC_Standard_FractionalMint, ZC_Standard_DutchAuctionMint (R7 then carries its three auction terms),
+    //   ZC_Standard_DutchAuctionMint (R7 then carries its five auction terms), ZC_Standard_FractionalMint,
     //   or any script that keeps their request layout. The lender's own choice of where the unit
     //   goes, so it is not pinned; a wrong hash strands the unit. EMPTY when R7 is empty.
     //
+    // THE YIELD CURVE
+    // The yield required for a bond with D blocks left is the curve's yield at D, and never less
+    // than R5(0). Between two neighbouring points it falls on the straight line joining them; below
+    // the first point it is the first point's yield, above the last the last's. R5(1) and R5(2)
+    // still decide which maturities are bought at all. With no points the yield is R5(0) alone.
+    // On a segment from (y1, D1) to (y2, D2) the yield is Y / L, with L = D2 - D1 and
+    // Y = y1 * L + (y2 - y1) * (D - D1), so the test below multiplies through by L: no division,
+    // no rounding. A flat yield has L = 1.
+    // Yields are simple, so one curve also expresses compounded rates: the lender states each
+    // maturity's simple equivalent. A badly made curve can only pay too much of this offer's own
+    // capital; points out of order are refused so every batcher reads a curve the same way.
+    //
     // THE YIELD TEST
     // Paying price P now for repayment R at maturity, with D blocks left, must satisfy
-    //   R * 10000 * 262800 >= P * (10000 * 262800 + yield * D).
+    //   R * 10000 * 262800 * L >= P * (10000 * 262800 * L + Y * D).
     // P is the principal of a new bond or what the seller's payout holds. For an ERG offer P includes
     // the batcher fee, so the yield is net of it; a token offer pays that fee in nanoERG outside the test.
-    // The price ceiling rises towards R as maturity approaches, so one number follows the bond's
+    // The price ceiling rises towards R as maturity approaches, so one curve follows the bond's
     // value with no updates. The yield is what the lender earns IF the bond is repaid; the collateral
     // policy covers the case where it is not.
     //
@@ -75,8 +93,8 @@
     // state box; 4 Coll[Byte] the serialized order box that minted the bond asset; 5 Int delivery
     // output index; 7 Int the seller's payout output index. The absence of var 2 selects a
     // new-bond fill, which also requires var 3 absent so a policy cannot select an unrelated state.
-    // Buying fractional shares adds: 6 Coll[Byte] the serialized mint request box that minted the
-    // shares, under ZC_Standard_FractionalMint or ZC_Standard_DutchAuctionMint.
+    // Buying shares adds: 6 Coll[Byte] the serialized mint request box that minted the shares,
+    // under ZC_Standard_DutchAuctionMint.
     //
     // THE ASK CONVENTION (what this offer expects of the box at var 2, whatever its script)
     // tokens(0) is the token for sale. R4: Coll[Byte] is blake2b256 of the seller script. A fill
@@ -106,16 +124,16 @@
     //
     // EXISTING SHARES (vars 2 and 6 present)
     // The same two checks, plus one more link in front of them. Var 6 hashes to the share id Y, so
-    // it is the request box whose spending minted Y, and its script is one of the two pinned mints.
+    // it is the request box whose spending minted Y, and its script is the pinned Dutch mint.
     // That proves 2N+1 shares exist for exactly the bond unit X the request held, with N read
     // from its R8. X is then verified by var 4 and the state box exactly as for a whole bond.
-    // Dutch auction shares must also clear the lender's auction bounds, read from the same R8:
-    // floor R8(4) >= R5(9) and length R8(5) <= R5(10). That mint wrote those terms into the vault
-    // and measured them against this bond's own repayment. So if the bond is liquidated, the vault
-    // ends with at least floor/10000 of the repayment in the repayment asset, unless an auction
-    // runs its whole length (at most R5(10) blocks from the pull) with no buyer; holders then take
-    // the collateral in kind. While the bond is live the auction has not begun, and a Dutch share
-    // claims the same u/N as a standard one.
+    // The auction terms must clear the lender's bounds, read from the same R8: floor R8(4) >= R5(9)
+    // and expiry R8(6) <= R5(10). That mint wrote those terms into the vault and measured them
+    // against this bond's own repayment. So if the bond is liquidated, holders end with at least
+    // floor/10000 of the repayment in the repayment asset, unless every collateral item cleared the
+    // mint's in-kind threshold (at least 100 raw units, so it splits pro rata) or an auction
+    // reached its expiry (at most R5(10) blocks from the pull) with no buyer; holders then take the
+    // collateral in kind. While the bond is live the auction has not begun, and a share claims u/N.
     // Buying u shares claims u/N of the repayment, so the yield test compares R * u with P * N.
     // The ask is paid for exactly the u shares delivered and may continue with the rest. While
     // the bond is live no share can have been redeemed, so all N are still outstanding.
@@ -145,8 +163,8 @@
     // - Best execution is not enforced. The offer never does worse than its terms, but a batcher
     //   chooses which ask it meets.
     // - Settled bonds cannot be bought, whole or as shares: only claims on a live bond.
-    // - Shares are bought only from the two pinned mints; another share mint needs a new offer.
-    // - Of a Dutch auction share's terms only the floor and the length are bounded. The opening
+    // - Shares are bought only from the pinned Dutch mint; another share mint needs a new offer.
+    // - Of a Dutch auction share's terms only the floor and the expiry are bounded. The opening
     //   price and the speed of the fall decide how far above the floor a sale lands, not the floor.
     // - A share's value ignores the fractional vault's own nanoERG and its pull fee.
     // - A fill always leaves a continuation; dust left in it comes back by cancelling or at expiry.
@@ -169,8 +187,11 @@
         val nextIndex = getVar[Int](0).get
         // Taken from the box so the compiler cannot fold the constant into the template.
         val lendsERG = CONST_REPAYMENT_TOKEN == SELF.id.slice(0, 0)
+        // Where the yield curve starts: after the fixed terms of this market.
+        val base = if (lendsERG) 11 else 15
 
-        if ((if (lendsERG) terms.size != 11 else terms.size != 15) || nextIndex < 0 || nextIndex >= OUTPUTS.size) {
+        if (terms.size < base || terms.size > base + 40 || (terms.size - base) % 2 != 0 ||
+            nextIndex < 0 || nextIndex >= OUTPUTS.size) {
             sigmaProp(false)
         } else if (HEIGHT.toLong >= terms(6)) {
             // Expiry refund, by anyone: everything goes back to the owner, less the batcher fee.
@@ -196,7 +217,7 @@
             val lender = bond.R9[Coll[Long]].get
             val principalTokens = bond.R7[Coll[(Coll[Byte], Long)]].get
 
-            // Shares are bought only from a sale order, and only when their mint request is supplied.
+            // Shares are bought only from an ask, and only when their mint request is supplied.
             val requestBytes = getVar[Coll[Byte]](6)
             val buysShares = !primary && requestBytes.isDefined
             // The mint request whose spending minted the shares. SELF stands in when none are bought.
@@ -241,15 +262,13 @@
                 val origin = Global.deserializeTo[Box](originBytes)
                 val tokenValid = if (buysShares) {
                     // The request box hashes to the share id, so the shares were minted by its
-                    // script: 2N+1 of them, for the one bond unit the request held.
-                    val mint = blake2b256(request.propositionBytes)
+                    // script: 2N+1 of them, for the one bond unit the request held. Only the Dutch
+                    // mint is accepted, and its auction terms must clear the lender's bounds. That
+                    // mint only runs with exactly 8 terms, so R8(4) and R8(6) exist.
                     val mintTerms = request.R8[Coll[Long]].get
-                    // A Dutch auction share's worth after a liquidation rests on its auction terms,
-                    // so they must clear the lender's bounds. That mint only runs with exactly 6.
-                    val mintAccepted = mint == CONST_FRACTIONAL_MINT_HASH || (
-                        mint == CONST_DUTCH_MINT_HASH &&
-                        mintTerms(4) >= terms(9) && mintTerms(5) <= terms(10)
-                    )
+                    val mintAccepted =
+                        blake2b256(request.propositionBytes) == CONST_DUTCH_MINT_HASH &&
+                        mintTerms(4) >= terms(9) && mintTerms(6) <= terms(10)
                     blake2b256(requestBytes.get) == traded && mintAccepted &&
                     request.tokens.size == 1 && request.tokens(0)._1 == asset &&
                     wholeUnits >= 1L && units >= 1L && units <= wholeUnits
@@ -272,18 +291,42 @@
                 bond.tokens(0)._2 == 2L
             }
 
-            val remaining = lender(2) - HEIGHT.toLong
-            val year = 2628000000L // 10000 basis points * 262800 blocks
-            val cost = if (lendsERG) price + batcherFee else price
             // Fills run only before the expiry, R5(6): from then on this box can only be refunded.
+            val remaining = lender(2) - HEIGHT.toLong
+            val year = 2628000000L.toBigInt // 10000 basis points * 262800 blocks
+            val cost = if (lendsERG) price + batcherFee else price
+
+            // The yield curve: points of (yield bps, blocks left) after the fixed terms.
+            val curve = terms.slice(base, terms.size)
+            val points = curve.size / 2
+            // Blocks left strictly increase from point to point (odd positions hold them).
+            val ordered = curve.indices.forall { (j: Int) => j % 2 == 0 || j < 3 || curve(j) > curve(j - 2) }
+            // How many points lie at or below the bond's blocks left: the segment it falls on.
+            val below = curve.indices.filter { (j: Int) => j % 2 == 1 && curve(j) <= remaining }.size
+            val flat = points == 0 || below == 0 || below == points
+            // The required yield as rate / span, exactly. Flat ends and an empty curve have span 1.
+            val span = if (flat) 1L.toBigInt else (curve(2 * below + 1) - curve(2 * below - 1)).toBigInt
+            val rate = if (points == 0) {
+                terms(0).toBigInt
+            } else if (below == 0) {
+                curve(0).toBigInt
+            } else if (below == points) {
+                curve(curve.size - 2).toBigInt
+            } else {
+                val low = 2 * (below - 1)
+                curve(low).toBigInt * span +
+                    (curve(low + 2).toBigInt - curve(low).toBigInt) * (remaining - curve(low + 1)).toBigInt
+            }
+            val floorRate = terms(0).toBigInt * span
+            val required = if (rate < floorRate) floorRate else rate
+
             val termsValid =
-                terms(0) >= 0L && batcherFee >= 2000000L &&
+                terms(0) >= 0L && batcherFee >= 2000000L && ordered &&
                 remaining > 0L && remaining >= terms(1) && remaining <= terms(2) &&
                 price > 0L && price >= terms(7) &&
                 // u of N units claim u/N of the repayment; both sides are multiplied through by N.
-                borrower(0).toBigInt * units.toBigInt * year.toBigInt >=
-                    cost.toBigInt * wholeUnits.toBigInt *
-                    (year.toBigInt + terms(0).toBigInt * remaining.toBigInt)
+                borrower(0).toBigInt * units.toBigInt * year * span >=
+                    cost.toBigInt * wholeUnits.toBigInt * (year * span + required * remaining.toBigInt)
 
             // Shares are already fractional, so they always go straight to the owner.
             val plain = fractional.size == 0 || buysShares

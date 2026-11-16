@@ -7,7 +7,7 @@ import org.ergoplatform.appkit._
 import org.scalatest.propspec.AnyPropSpec
 import work.lithos.mutations.{Contract, Token, UTXO}
 
-/** Real interpreter checks for pricing, immutable terms and the actual principal record. */
+/** Real interpreter checks for two-point yield pricing, immutable terms and the actual principal record. */
 class ZcStandardPricedOrderSpec extends AnyPropSpec with ZcStandardSpecBase {
   import BondSpecBase._
   import ZcStandardSpecBase._
@@ -36,53 +36,59 @@ class ZcStandardPricedOrderSpec extends AnyPropSpec with ZcStandardSpecBase {
       fund = funding(base.ctx, base.holder, 1, data(1) + base.fee + slack, tokens))
   }
 
+  /** One yield, flat across the fill height `h`: (start height, start yield, end height, end yield). */
+  private def flat(yieldBps: Long, h: Long): Seq[Long] = Seq(h - 100L, yieldBps, h + 100L, yieldBps)
+
+  /** A bond repaying 110 against a 100 floor, filled half a year (131400 blocks) before its maturity. */
+  private def halfYear(ctx: BlockchainContext, kind: Kind): Flow = {
+    val reference = ctx.getHeight.toLong
+    val scale = if (kind == ErgBond) Parameters.OneErg else 100L
+    moveFill(flow(ctx, kind, principalValue = if (kind == ErgBond) 100L * scale else minBox,
+      principalAssets = if (kind == ErgBond) Seq.empty else Seq(Token(SigUSD, 100L * scale)),
+      repayment = 110L * scale, fixedMaturity = reference + 262800L, expiry = reference + 262799L),
+      (reference + 131400L).toInt)
+  }
+
   for (kind <- Seq[Kind](ErgBond, TokenBond)) {
-    property(s"priced order $kind: signed yield price margins apply before rounding and cannot defeat the principal floor") {
+    property(s"priced order $kind: the yield moves in a straight line between its two points, exact to one raw unit") {
       withCtx { ctx =>
-        val reference = ctx.getHeight.toLong
         val scale = if (kind == ErgBond) Parameters.OneErg else 100L
-        val base = moveFill(flow(ctx, kind, principalValue = if (kind == ErgBond) 100L * scale else minBox,
-          principalAssets = if (kind == ErgBond) Seq.empty else Seq(Token(SigUSD, 100L * scale)),
-          repayment = 110L * scale, fixedMaturity = reference + 262800L, expiry = reference + 262799L),
-          (reference + 131400L).toInt)
-        val cases = if (kind == ErgBond) Seq(200L -> 106857142858L, -200L -> 102666666667L)
-          else Seq(200L -> 10686L, -200L -> 10267L)
-        cases.foreach { case (margin, amount) =>
-          filled(priced(base, c(ctx, kind).yieldOrderPricing, Seq(1000L, margin), amount))
-          val under = priced(base, c(ctx, kind).yieldOrderPricing, Seq(1000L, margin), amount - 1L)
+        val base = halfYear(ctx, kind)
+        val h = base.height.toLong
+        // 10% over half a year: 110 / 1.05, rounded up.
+        val amount = if (kind == ErgBond) 104761904762L else 10477L
+        // Every line below is at 10% at the fill height: flat, rising and falling through it, before its start and
+        // after its end. So one exact price checks the interpolation and both clamps.
+        Seq(flat(1000L, h), Seq(h - 100L, 0L, h + 100L, 2000L), Seq(h - 100L, 2000L, h + 100L, 0L),
+          Seq(h + 10L, 1000L, h + 110L, 5000L), Seq(h - 110L, 5000L, h - 10L, 1000L)).foreach { payload =>
+          filled(priced(base, c(ctx, kind).yieldOrderPricing, payload, amount))
+          val under = priced(base, c(ctx, kind).yieldOrderPricing, payload, amount - 1L)
           rejectsAtSigning(under.holder, standardFillTx(under))
         }
-        filled(priced(base, c(ctx, kind).yieldOrderPricing, Seq(1000L, -9999L), 100L * scale))
-        filled(priced(base, c(ctx, kind).yieldOrderPricing, Seq(1000L, 1000000L), 110L * scale * 101L))
-        Seq(Seq(1000L), Seq(1000L, -10000L), Seq(1000L, 1000001L)).foreach { payload =>
+        // A huge yield prices under the floor, which then binds.
+        filled(priced(base, c(ctx, kind).yieldOrderPricing, flat(1000000L, h), 100L * scale))
+        val floor = priced(base, c(ctx, kind).yieldOrderPricing, flat(1000000L, h), 100L * scale - 1L)
+        rejectsAtSigning(floor.holder, standardFillTx(floor))
+        // Malformed: a short payload, negative yields, and an end not after the start.
+        Seq(Seq(1000L), Seq(1000L, 0L), Seq(h - 100L, -1L, h + 100L, 1000L), Seq(h - 100L, 1000L, h + 100L, -1L),
+          Seq(h, 1000L, h, 1000L), Seq(h + 100L, 1000L, h - 100L, 1000L)).foreach { payload =>
           val bad = priced(base, c(ctx, kind).yieldOrderPricing, payload, 110L * scale)
           rejectsAtSigning(bad.holder, standardFillTx(bad))
         }
       }
     }
 
-    property(s"priced order $kind: NAV and yield give distinct exact halfway prices, repayment stays fixed") {
+    property(s"priced order $kind: an exact yield price, overpayment recorded, repayment and other terms fixed") {
       withCtx { ctx =>
-        val scale = if (kind == ErgBond) Parameters.OneErg else 100L
-        val reference = ctx.getHeight.toLong
-        val base = moveFill(flow(ctx, kind, principalValue = if (kind == ErgBond) 100L * scale else minBox,
-          principalAssets = if (kind == ErgBond) Seq.empty else Seq(Token(SigUSD, 100L * scale)),
-          repayment = 110L * scale, fixedMaturity = reference + 262800L, expiry = reference + 262799L),
-          (reference + 131400L).toInt)
-        val nav = priced(base, c(ctx, kind).navOrderPricing, Seq(reference, 0L), 105L * scale)
+        val base = halfYear(ctx, kind)
+        val payload = flat(1000L, base.height.toLong)
         val yieldAmount = if (kind == ErgBond) 104761904762L else 10477L
-        val byYield = priced(base, c(ctx, kind).yieldOrderPricing, Seq(1000L, 0L), yieldAmount)
-        Seq(nav, byYield).foreach { f =>
-          filled(f)
-          rejectsAtSigning(f.holder, standardFillTx(f, principal =
-            if (kind == ErgBond) f.principal.subValue(1L) else f.principal.removeToken(SigUSD, 1L)))
-          val short = priced(base, if (f == nav) c(ctx, kind).navOrderPricing else c(ctx, kind).yieldOrderPricing,
-            if (f == nav) Seq(reference, 0L) else Seq(1000L, 0L),
-            (if (f == nav) 105L * scale else yieldAmount) - 1L)
-          rejectsAtSigning(short.holder, standardFillTx(short))
-        }
+        val byYield = priced(base, c(ctx, kind).yieldOrderPricing, payload, yieldAmount)
+        filled(byYield)
+        rejectsAtSigning(byYield.holder, standardFillTx(byYield, principal =
+          if (kind == ErgBond) byYield.principal.subValue(1L) else byYield.principal.removeToken(SigUSD, 1L)))
         // More principal is allowed, and must be recorded; an unpaid inflated record is rejected.
-        val better = priced(base, c(ctx, kind).yieldOrderPricing, Seq(1000L, 0L), yieldAmount + 1L)
+        val better = priced(base, c(ctx, kind).yieldOrderPricing, payload, yieldAmount + 1L)
         filled(better)
         rejectsAtSigning(byYield.holder, standardFillTx(byYield, bond = better.bond))
         // No expression may change a non-price borrower term, even if its own logic would allow it.
@@ -96,34 +102,26 @@ class ZcStandardPricedOrderSpec extends AnyPropSpec with ZcStandardSpecBase {
       }
     }
 
-    property(s"priced order $kind: NAV and yield both support on-close maturity") {
+    property(s"priced order $kind: yield pricing supports on-close maturity, with a constant duration") {
       withCtx { ctx =>
         val base = flow(ctx, kind, OnClose, duration = 262800L)
+        val h = base.height.toLong
         val amount = if (kind == ErgBond) ceilDiv(BigInt(base.data(0)) * 10L, 11L) else 637L
-        val y = priced(base, c(ctx, kind).yieldOrderPricing, Seq(1000L, 0L), amount)
-        filled(y)
-        val nav = priced(base, c(ctx, kind).navOrderPricing, Seq(ctx.getHeight.toLong, 0L), base.data(0))
-        filled(nav)
-        val negative = priced(base, c(ctx, kind).yieldOrderPricing, Seq(-1L, 0L), amount)
+        filled(priced(base, c(ctx, kind).yieldOrderPricing, flat(1000L, h), amount))
+        val short = priced(base, c(ctx, kind).yieldOrderPricing, flat(1000L, h), amount - 1L)
+        rejectsAtSigning(short.holder, standardFillTx(short))
+        val negative = priced(base, c(ctx, kind).yieldOrderPricing, flat(-1L, h), amount)
         rejectsAtSigning(negative.holder, standardFillTx(negative))
-      }
-    }
 
-    property(s"priced order $kind: on-close NAV follows the moving endpoint while yield retains a constant duration") {
-      withCtx { ctx =>
+        // Filled half a year after posting, an on-close bond still runs its full duration: 10% over a year.
         val reference = ctx.getHeight.toLong
         val scale = if (kind == ErgBond) Parameters.OneErg else 100L
-        val base = moveFill(flow(ctx, kind, OnClose, duration = 262800L,
+        val late = moveFill(flow(ctx, kind, OnClose, duration = 262800L,
           principalValue = if (kind == ErgBond) 100L * scale else minBox,
           principalAssets = if (kind == ErgBond) Seq.empty else Seq(Token(SigUSD, 100L * scale)),
           repayment = 110L * scale, expiry = reference + 500000L), (reference + 131400L).toInt)
-        val navAmount = if (kind == ErgBond) 103333333334L else 10334L
-        val nav = priced(base, c(ctx, kind).navOrderPricing, Seq(reference, 0L), navAmount)
-        filled(nav)
-        val short = priced(base, c(ctx, kind).navOrderPricing, Seq(reference, 0L), navAmount - 1L)
-        rejectsAtSigning(short.holder, standardFillTx(short))
-        filled(priced(base, c(ctx, kind).yieldOrderPricing, Seq(1000L, 0L), 100L * scale))
-        base.maturity - base.start shouldBe 262800L
+        filled(priced(late, c(ctx, kind).yieldOrderPricing, flat(1000L, late.height.toLong), 100L * scale))
+        late.maturity - late.start shouldBe 262800L
       }
     }
   }
@@ -137,8 +135,9 @@ class ZcStandardPricedOrderSpec extends AnyPropSpec with ZcStandardSpecBase {
       rejectsAtSigning(under.holder, standardFillTx(under))
       val guarded = priced(base, alwaysTrue(ctx), Seq.empty, base.data(1), Some(neverTrue(ctx)))
       rejectsAtSigning(guarded.holder, standardFillTx(guarded))
-      val original = priced(base, c(ctx, ErgBond).navOrderPricing, Seq(ctx.getHeight.toLong + 1L, 0L), base.data(0))
-      rejectsAtSigning(original.holder, standardFillTx(original))
+      // A yield order with a malformed line never fills, whatever it pays.
+      val malformed = priced(base, c(ctx, ErgBond).yieldOrderPricing, Seq(base.height + 1L, 0L, base.height - 1L, 0L), base.data(0))
+      rejectsAtSigning(malformed.holder, standardFillTx(malformed))
     }
   }
 

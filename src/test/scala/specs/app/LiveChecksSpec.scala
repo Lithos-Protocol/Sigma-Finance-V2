@@ -20,7 +20,7 @@ class LiveChecksSpec extends AnyPropSpec with StandardSpecSupport {
       val bond = ErgoId.create("cc" * 32)
       def vault(state: Byte, shares: Long) = w.seed(UTXO(protocol.contracts.dutchVault, MinBox,
         Seq(Token(share, 100000001L)), Seq(bytesValue(bond.getBytes), longsValue(100000000L, shares, 5000000L),
-          ErgoValue.of(state), longsValue(120000000L, 30000L, 25000L, 20L, w.h.toLong), bytesValue(Array.empty[Byte]))))
+          ErgoValue.of(state), longsValue(120000000L, 30000L, 25000L, 20L, 30L, Long.MaxValue, w.h.toLong), bytesValue(Array.empty[Byte]))))
       val opened = vault(1, 100000000L)
       val sold = vault(2, 100000000L)
       val partial = vault(2, 70000000L)

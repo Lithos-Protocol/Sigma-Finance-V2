@@ -58,15 +58,21 @@ class SigmaFiCliSpec extends AnyPropSpec with Matchers {
     Args.parse(Seq("repay", "id", "--send")).withDefaults(launch).flag("send") shouldBe true
   }
 
-  property("the share, ask, offer and batch options parse, including a negative margin") {
-    val offer = Args.parse(Args.tokenize("create-offer --capital 10 --yield 5 --collateral-floor 130 " +
-      "--deliver-shares --shares 100 --dutch --auction-opening 150 --auction-floor 90 --auction-length 500 --min-auction-floor 80 " +
-      "--max-auction-length 1000 --batcher-fee 0.005 --fees 0.5 --min-price 1 --min-blocks 10 --max-blocks 20"))
-    offer.flag("dutch") shouldBe true
+  property("the share, ask, offer, lot and batch options parse, including a moving yield and a curve") {
+    val offer = Args.parse(Args.tokenize("create-offer --capital 10 --yield 5 --curve 8:21600,10:131400 --collateral-floor 130 " +
+      "--deliver-shares --shares 100 --vault dutch --auction-opening 150 --auction-floor 90 --auction-length 500 " +
+      "--auction-expiry 600 --min-auction-floor 80 --max-auction-expiry 1000 --batcher-fee 0.005 --fees 0.5 --min-price 1 " +
+      "--min-blocks 10 --max-blocks 20"))
+    offer.opt("vault") shouldBe Some("dutch")
     offer.opt("auction-floor") shouldBe Some("90")
-    val ask = Args.parse(Args.tokenize("sell abc --amount 60 --nav --margin -2.5 --min-fill 5 --refund-fee 0.002"))
-    ask.flag("nav") shouldBe true
-    ask.opt("margin") shouldBe Some("-2.5")
+    offer.opt("curve") shouldBe Some("8:21600,10:131400")
+    val ask = Args.parse(Args.tokenize("sell abc --amount 60 --yield 5 --end-yield 7.5 --end-in 100 --min-fill 5 --refund-fee 0.002"))
+    ask.opt("end-yield") shouldBe Some("7.5")
+    ask.opt("end-in") shouldBe Some("100")
+    val lot = Args.parse(Args.tokenize("sell-lot --token a:1 --token b:2 --erg 1 --opening 5 --floor 2 --falls-for 10 --holds-for 20"))
+    lot.opts("token") shouldBe Seq("a:1", "b:2")
+    intercept[CliError](Args.parse(Args.tokenize("sell abc --amount 1 --nav"))).getMessage should include("unknown option --nav")
+    intercept[CliError](Args.parse(Args.tokenize("sell abc --amount 1 --yield 5 --margin 1"))).getMessage should include("unknown option --margin")
     Args.parse(Args.tokenize("match-offer o --ask a --amount 40")).opt("ask") shouldBe Some("a")
     Args.parse(Args.tokenize("batch --run --send")).flags shouldBe Set("run", "send")
   }

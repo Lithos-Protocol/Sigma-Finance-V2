@@ -76,17 +76,19 @@ object StandardMetadata {
 
   /**
    * Shares' (name, description, decimals): naming the bond when the writer knows it, as `fractionalize` does,
-   * and without it when the writer does not, as a lend offer posted before it buys anything. Standard and
-   * Dutch auction shares share a name; the description's `type` and `auction` tell them apart.
+   * and without it when the writer does not, as a lend offer posted before it buys anything. Plain, Selective
+   * and Dutch shares share a name; the description's `type` and `auction` tell them apart: "selective shares"
+   * carry the auction's in-kind `threshold`, "auction shares" (Dutch) always auction.
    */
   def shares(m: Market, auction: Option[AuctionTerms], bond: Option[BondFacts]): Seq[String] = {
     val whole = plain(BigDecimal(ShareCount) / BigDecimal(10).pow(ShareDecimals.toInt))
-    val head = Seq("zcs" -> Version, "type" -> str(if (auction.isDefined) "auction shares" else "shares"),
-      "shares" -> whole)
+    val kind = auction.fold("shares")(a => if (a.selective) "selective shares" else "auction shares")
+    val head = Seq("zcs" -> Version, "type" -> str(kind), "shares" -> whole)
     val what = bond.fold(Seq("market" -> str(m.name), "via" -> str("lend offer")))(b =>
       Seq("bond" -> str(id6(b.asset)), "market" -> str(m.name)) ++ terms(b))
     val sale = auction.toSeq.map(a => "auction" ->
-      json(Seq("from" -> percent(a.openingBps), "to" -> percent(a.floorBps), "blocks" -> a.length.toString)))
+      json(Seq("from" -> percent(a.openingBps), "to" -> percent(a.floorBps), "blocks" -> a.length.toString,
+        "expiry" -> a.expiry.toString) ++ (if (a.selective) Seq("threshold" -> a.threshold.toString) else Seq.empty)))
     Seq(
       "ZCS-Bond-Shares" + bond.fold("")(b => s"-${id6(b.asset)}"),
       json(head ++ what ++ sale ++ Seq("note" -> str(Verify))),

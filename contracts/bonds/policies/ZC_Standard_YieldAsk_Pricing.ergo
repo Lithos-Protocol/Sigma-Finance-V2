@@ -1,28 +1,40 @@
 {
-    // PricedAsk block-yield policy, var 2; ask R5(4)=reference buyer yield bps per 262800 blocks.
-    // R5(5)=units per bond, R5(6)=signed price margin bps, R7=bond asset, var 3=live bond data input.
-    // paid*N*(B+yield*D)*10000 >= sold*R*B*(10000+margin), B=2628000000, D=maturity-HEIGHT.
-    // Simple block yield, conditional on full repayment at maturity, excluding fees.
+    // PricedAsk var 2: sells a live bond's unit or shares at a simple block yield to maturity that
+    // moves in a straight line between two points in time, so an ask can rise or fall without updates.
+    // Ask R5: 4 N, units per bond (1 for a bond unit, the share count for shares),
+    //   5 start height, 6 start yield, 7 end height, 8 end yield; yields in bps per 262800 blocks,
+    //   >= 0, and end height > start height. The yield is the start yield up to the start height, the
+    //   end yield from the end height on, and on the straight line between them in between. Equal
+    //   yields give one fixed rate. Clients put the end at or near the ask's expiry.
+    // R7 = bond asset id; var 3 = data-input index of the live bond's state box.
+    // With D = maturity - HEIGHT, L = end - start, at = HEIGHT clamped to [start, end], and the yield
+    // taken exactly as Y / L, Y = y0 * L + (y1 - y0) * (at - start):
+    //   paid * N * (B * L + Y * D) >= sold * R * B * L, B = 10000 * 262800.
+    // That is the price at which a buyer earns the yield if the bond is repaid. Exact: no division.
+    // Simple block yield, conditional on full repayment at maturity, excluding fees. The shell's
+    // fixed floor still binds.
     val terms = SELF.R5[Coll[Long]].get
     val payoutIndex = getVar[Int](0).get
     val nextIndex = getVar[Int](1)
     val stateIndex = getVar[Int](3).get
 
-    if (terms.size < 7 || SELF.tokens.size != 1 ||
+    if (terms.size < 9 || SELF.tokens.size != 1 ||
         payoutIndex < 0 || payoutIndex >= OUTPUTS.size ||
         stateIndex < 0 || stateIndex >= CONTEXT.dataInputs.size) {
         sigmaProp(false)
     } else {
-        val yieldBps = terms(4)
-        val wholeUnits = terms(5)
-        val margin = terms(6)
+        val wholeUnits = terms(4)
+        val start = terms(5)
+        val startYield = terms(6)
+        val end = terms(7)
+        val endYield = terms(8)
         val asset = SELF.R7[Coll[Byte]].get
         val state = CONTEXT.dataInputs(stateIndex)
         val isBond =
             blake2b256(state.propositionBytes) == CONST_BOND_HASH &&
             state.tokens.size > 0 && state.tokens(0)._1 == asset && state.tokens(0)._2 == 2L
 
-        if (!isBond || yieldBps < 0L || margin <= -10000L || margin > 1000000L ||
+        if (!isBond || startYield < 0L || endYield < 0L || end <= start ||
             wholeUnits < 1L || wholeUnits > 1000000000L) {
             sigmaProp(false)
         } else {
@@ -45,10 +57,14 @@
             if (repayment <= 0L || blocksLeft <= 0L || sold < 1L) {
                 sigmaProp(false)
             } else {
+                val now = HEIGHT.toLong
+                val at = if (now < start) start else if (now > end) end else now
+                val span = (end - start).toBigInt
+                val rate = startYield.toBigInt * span + (endYield.toBigInt - startYield.toBigInt) * (at - start).toBigInt
                 val scale = 2628000000L.toBigInt
                 sigmaProp(
-                    paid.toBigInt * wholeUnits.toBigInt * (scale + yieldBps.toBigInt * blocksLeft.toBigInt) * 10000L.toBigInt >=
-                        sold.toBigInt * repayment.toBigInt * scale * (10000L + margin).toBigInt
+                    paid.toBigInt * wholeUnits.toBigInt * (scale * span + rate * blocksLeft.toBigInt) >=
+                        sold.toBigInt * repayment.toBigInt * scale * span
                 )
             }
         }

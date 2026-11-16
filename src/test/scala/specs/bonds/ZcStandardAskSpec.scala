@@ -7,7 +7,7 @@ import org.scalatest.propspec.AnyPropSpec
 import work.lithos.mutations.{Contract, InputUTXO, Token, UTXO}
 
 /**
- * ZC_Standard_SaleOrder, ZC_Standard_PricedAsk with ZC_Standard_AccruedValue_Pricing, and the shared
+ * ZC_Standard_SaleOrder, ZC_Standard_PricedAsk with ZC_Standard_YieldAsk_Pricing, and the shared
  * templates of every contract compiled per asset. The seller is `other`; buyers are the executor.
  */
 class ZcStandardAskSpec extends AnyPropSpec with ZcStandardSpecBase {
@@ -42,12 +42,12 @@ class ZcStandardAskSpec extends AnyPropSpec with ZcStandardSpecBase {
       val e = exchange(ctx)
       e.dutchVault.ergoTree.version shouldBe 3
       Seq(e.erg, e.token).foreach { m =>
-        Seq(m.offer, m.saleOrder, m.pricedAsk, m.pricing, m.policy, m.dutchMint).foreach(_.ergoTree.version shouldBe 3)
+        Seq(m.offer, m.saleOrder, m.pricedAsk, m.yieldPricing, m.policy, m.dutchMint, m.lotAuction).foreach(_.ergoTree.version shouldBe 3)
       }
       // An indexed node lists every market of a contract by template hash. The expressions run through
-      // executeFromVar are not trees anyone lists, so only the four box scripts are checked.
+      // executeFromVar are not trees anyone lists, so only the box scripts are checked.
       Seq(e.erg.offer -> e.token.offer, e.erg.saleOrder -> e.token.saleOrder, e.erg.pricedAsk -> e.token.pricedAsk,
-        e.erg.dutchMint -> e.token.dutchMint).foreach { case (erg, token) =>
+        e.erg.dutchMint -> e.token.dutchMint, e.erg.lotAuction -> e.token.lotAuction).foreach { case (erg, token) =>
         erg.ergoTree.bytes should not be token.ergoTree.bytes
         erg.ergoTree.template shouldBe token.ergoTree.template
         erg.ergoTree.constants.size shouldBe token.ergoTree.constants.size
@@ -141,40 +141,52 @@ class ZcStandardAskSpec extends AnyPropSpec with ZcStandardSpecBase {
     }
   }
 
-  // ═══ NAV ASK ══════════════════════════════════════════════════════════════
+  // ═══ YIELD ASK ════════════════════════════════════════════════════════════
 
-  private case class Nav(f: Flow, state: InputUTXO, height: Int) {
-    def term: Long = f.maturity - f.start
-    def elapsed: Long = height - f.start
-    def principal: Long = if (f.kind == ErgBond) f.data(1) else 600L
+  /** A yield line: the start yield up to `start`, the end yield from `end`, a straight line between. */
+  private case class Line(start: Long, y0: Long, end: Long, y1: Long) {
+    def longs: Seq[Long] = Seq(start, y0, end, y1)
+    /** The yield at `h`, exactly rate / span bps. */
+    def at(h: Long): (BigInt, BigInt) = {
+      val c = math.min(math.max(h, start), end)
+      (BigInt(y0) * (end - start) + (BigInt(y1) - y0) * (c - start), BigInt(end - start))
+    }
+  }
+
+  private case class Live(f: Flow, state: InputUTXO, height: Int) {
     def repayment: Long = f.data(0)
-    /** The least a fill of `sold` raw units may pay, from the pricing expression's own inequality. */
-    def owed(sold: Long, wholeUnits: Long, margin: Long): Long = {
-      val accrued = BigInt(principal) * (term - elapsed) + BigInt(repayment) * elapsed
-      ceilDiv(BigInt(sold) * accrued * (10000L + margin), BigInt(wholeUnits) * term * 10000L)
+    /** The least a fill of `sold` raw units may pay at `h`, from the pricing expression's own inequality. */
+    def owed(sold: Long, wholeUnits: Long, line: Line, h: Int = height): Long = {
+      val (rate, span) = line.at(h)
+      val year = BigInt(2628000000L)
+      ceilDiv(BigInt(sold) * repayment * year * span, BigInt(wholeUnits) * (year * span + rate * (f.maturity - h)))
     }
   }
 
   /** A live bond, filled, and a height 300 blocks into its term. */
-  private def nav(ctx: BlockchainContext, kind: Kind): Nav = {
+  private def live(ctx: BlockchainContext, kind: Kind): Live = {
     val f = flow(ctx, kind)
-    Nav(f, spendOutput(filled(f), 1), f.height + 300)
+    Live(f, spendOutput(filled(f), 1), f.height + 300)
   }
 
-  private def navBox(n: Nav, token: ErgoId, amount: Long, wholeUnits: Long, margin: Long,
-                     floor: (Long, Long) = (1L, 1000000000L), minFill: Long = 1L, expiry: Long = -1L,
-                     value: Long = minBox, pricing: Contract = null): UTXO = {
+  /** Rising from 10% to 30% across the live height, so the yield there is 20%. */
+  private def rising(n: Live): Line = Line(n.height - 100L, 1000L, n.height + 100L, 3000L)
+
+  private def yieldBox(n: Live, token: ErgoId, amount: Long, wholeUnits: Long, line: Line,
+                       floor: (Long, Long) = (1L, 1000000000L), minFill: Long = 1L, expiry: Long = -1L,
+                       value: Long = minBox, pricing: Contract = null): UTXO = {
     val ctx = n.f.ctx
     UTXO(marketOf(ctx, n.f.kind).pricedAsk, value, Seq(Token(token, amount)),
       Seq(sellerHash(ctx),
-        longsValue(floor._1, floor._2, minFill, if (expiry < 0L) n.f.maturity + 100L else expiry, margin, wholeUnits),
-        bytesValue((if (pricing == null) marketOf(ctx, n.f.kind).pricing else pricing).hashedValueBytes),
+        longsValue((Seq(floor._1, floor._2, minFill, if (expiry < 0L) n.f.maturity + 100L else expiry, wholeUnits) ++
+          line.longs): _*),
+        bytesValue((if (pricing == null) marketOf(ctx, n.f.kind).yieldPricing else pricing).hashedValueBytes),
         bytesValue(n.f.asset.getBytes)))
   }
 
   /** Vars: 0 payout, 1 continuation (when anything is left), 2 the expression, 3 the state data input. */
-  private def navTx(n: Nav, ask: UTXO, sold: Long, paid: Long, next: UTXO = null, state: InputUTXO = null,
-                    expression: Contract = null, height: Int = -1): UnsignedTransaction = {
+  private def yieldTx(n: Live, ask: UTXO, sold: Long, paid: Long, next: UTXO = null, state: InputUTXO = null,
+                      expression: Contract = null, height: Int = -1): UnsignedTransaction = {
     val ctx = n.f.ctx
     val kind = n.f.kind
     val askIn = inputAt(ask, ctx, 0)
@@ -182,7 +194,7 @@ class ZcStandardAskSpec extends AnyPropSpec with ZcStandardSpecBase {
     val nextOut = if (next != null) next else if (left > 0L) ask.setTokens(Token(ask.tokens.head.id, left))
       .withRegNum(8, bytesValue(askIn.id.getBytes)) else null
     val base = askIn.withCtxVar(0.toByte, ErgoValue.of(0))
-      .withCtxVar(2.toByte, liqVar(if (expression == null) marketOf(ctx, kind).pricing else expression))
+      .withCtxVar(2.toByte, liqVar(if (expression == null) marketOf(ctx, kind).yieldPricing else expression))
       .withCtxVar(3.toByte, ErgoValue.of(0))
     val in = if (nextOut == null) base else base.withCtxVar(1.toByte, ErgoValue.of(1))
     val pay = payout(ctx, kind, askIn.id, sold, paid)
@@ -191,98 +203,84 @@ class ZcStandardAskSpec extends AnyPropSpec with ZcStandardSpecBase {
   }
 
   for (kind <- kinds) {
-    property(s"nav ask, $kind: a bond unit and shares are priced at accrued value plus the margin, to one raw unit") {
+    property(s"yield ask, $kind: a bond unit and shares are priced at the yield of the line, to one raw unit") {
       withCtx { ctx =>
-        val n = nav(ctx, kind)
-        Seq(0L, 250L, -250L).foreach { margin =>
-          val unit = navBox(n, n.f.asset, 1L, 1L, margin)
-          accepts(executor(ctx), navTx(n, unit, 1L, n.owed(1L, 1L, margin)))
-          rejectsAtSigning(executor(ctx), navTx(n, unit, 1L, n.owed(1L, 1L, margin) - 1L))
+        val n = live(ctx, kind)
+        val flat = Line(n.height - 100L, 2000L, n.height + 100L, 2000L)
+        val falling = Line(n.height - 100L, 3000L, n.height + 100L, 1000L)
+        Seq(flat, rising(n), falling).foreach { line =>
+          val unit = yieldBox(n, n.f.asset, 1L, 1L, line)
+          accepts(executor(ctx), yieldTx(n, unit, 1L, n.owed(1L, 1L, line)))
+          rejectsAtSigning(executor(ctx), yieldTx(n, unit, 1L, n.owed(1L, 1L, line) - 1L))
           // 7 of 1000 shares, leaving the rest for sale.
-          val shares = navBox(n, forSale, 1000L, 1000L, margin)
-          accepts(executor(ctx), navTx(n, shares, 7L, n.owed(7L, 1000L, margin)))
-          rejectsAtSigning(executor(ctx), navTx(n, shares, 7L, n.owed(7L, 1000L, margin) - 1L))
+          val shares = yieldBox(n, forSale, 1000L, 1000L, line)
+          accepts(executor(ctx), yieldTx(n, shares, 7L, n.owed(7L, 1000L, line)))
+          rejectsAtSigning(executor(ctx), yieldTx(n, shares, 7L, n.owed(7L, 1000L, line) - 1L))
         }
-        // The price rises as the bond accrues: a payment for one height is short at a later one.
-        val unit = navBox(n, n.f.asset, 1L, 1L, 0L)
-        rejectsAtSigning(executor(ctx), navTx(n, unit, 1L, n.owed(1L, 1L, 0L), height = n.height + 50))
+        // Before the start the start yield holds; after the end, the end yield.
+        val line = rising(n)
+        val unit = yieldBox(n, n.f.asset, 1L, 1L, line)
+        Seq(n.height - 150, n.height + 150).foreach { h =>
+          accepts(executor(ctx), yieldTx(n, unit, 1L, n.owed(1L, 1L, line, h), height = h))
+          rejectsAtSigning(executor(ctx), yieldTx(n, unit, 1L, n.owed(1L, 1L, line, h) - 1L, height = h))
+        }
+        // A falling yield raises the price: a payment for one height is short at a later one. The fall is steep so
+        // that it moves a small SigUSD price by more than one raw unit.
+        val down = Line(n.height - 100L, 1000000L, n.height + 100L, 0L)
+        n.owed(1L, 1L, down, n.height + 50) should be > n.owed(1L, 1L, down)
+        rejectsAtSigning(executor(ctx), yieldTx(n, yieldBox(n, n.f.asset, 1L, 1L, down), 1L, n.owed(1L, 1L, down),
+          height = n.height + 50))
       }
     }
   }
 
-  property("nav ask: it fills only against the live bond, before maturity") {
+  property("yield ask: it fills only against the live bond, before maturity, with valid yields") {
     withCtx { ctx =>
-      val n = nav(ctx, ErgBond)
-      val unit = navBox(n, n.f.asset, 1L, 1L, 0L)
-      val price = n.owed(1L, 1L, 0L)
-      accepts(executor(ctx), navTx(n, unit, 1L, price))
+      val n = live(ctx, ErgBond)
+      val unit = yieldBox(n, n.f.asset, 1L, 1L, rising(n))
+      val price = n.owed(1L, 1L, rising(n))
+      accepts(executor(ctx), yieldTx(n, unit, 1L, price))
       val bond = n.state.toUTXO
       val collateral = bond.tokens.drop(1)
       Seq(bond.setTokens(Token(otherBondAsset, 2L) +: collateral: _*),
         bond.setTokens(Token(n.f.asset, 1L) +: collateral: _*),
         bond.setContract(otherTree(ctx)),
         bond.setContract(bondOf(ctx, TokenBond))).foreach { fake =>
-        rejectsAtSigning(executor(ctx), navTx(n, unit, 1L, price, state = inputAt(fake, ctx, 30)))
+        rejectsAtSigning(executor(ctx), yieldTx(n, unit, 1L, price, state = inputAt(fake, ctx, 30)))
       }
       // Settled: the 2 units now sit in the vault.
       val vault = spendOutput(accepts(n.f.owner, standardRepayTx(n.f, repayInput(n.state))), 0)
-      rejectsAtSigning(executor(ctx), navTx(n, unit, 1L, price, state = vault))
+      rejectsAtSigning(executor(ctx), yieldTx(n, unit, 1L, price, state = vault))
       // At maturity the expression stops, whatever is paid.
-      rejectsAtSigning(executor(ctx), navTx(n, unit, 1L, 3L * price, height = n.f.maturity.toInt))
-    }
-  }
-
-  property("nav ask: the fixed floor binds, the expression is pinned, and a continuation keeps R4 to R7") {
-    withCtx { ctx =>
-      val n = nav(ctx, ErgBond)
-      val price = n.owed(7L, 1000L, 0L)
-      // A floor of 2x NAV per share: the expression passes but the floor does not.
-      val floored = navBox(n, forSale, 1000L, 1000L, 0L, floor = (2L * price, 7L))
-      rejectsAtSigning(executor(ctx), navTx(n, floored, 7L, price))
-      accepts(executor(ctx), navTx(n, floored, 7L, 2L * price))
-
-      val ask = navBox(n, forSale, 1000L, 1000L, 0L)
-      rejectsAtSigning(executor(ctx), navTx(n, ask, 7L, price, expression = alwaysTrue(ctx)))
-      val next = ask.setTokens(Token(forSale, 993L)).withRegNum(8, bytesValue(inputAt(ask, ctx, 0).id.getBytes))
-      accepts(executor(ctx), navTx(n, ask, 7L, price, next = next))
-      Seq(next.withRegNum(6, bytesValue(alwaysTrue(ctx).hashedValueBytes)),
-        next.withRegNum(7, bytesValue(otherBondAsset.getBytes)),
-        next.withRegNum(5, longsValue(1L, 1000000000L, 1L, n.f.maturity + 100L, -9000L, 1000L)),
-        next.subValue(1L)).foreach { bad =>
-        rejectsAtSigning(executor(ctx), navTx(n, ask, 7L, price, next = bad))
+      rejectsAtSigning(executor(ctx), yieldTx(n, unit, 1L, 2L * price, height = n.f.maturity.toInt))
+      // A negative yield, or an end not after the start, never fills.
+      Seq(Line(n.height - 100L, -1L, n.height + 100L, 1000L), Line(n.height - 100L, 1000L, n.height + 100L, -1L),
+        Line(n.height + 100L, 1000L, n.height + 100L, 1000L), Line(n.height + 100L, 1000L, n.height - 100L, 1000L)).foreach { bad =>
+        rejectsAtSigning(executor(ctx), yieldTx(n, yieldBox(n, n.f.asset, 1L, 1L, bad), 1L, price))
       }
     }
   }
 
-  for (kind <- kinds) {
-    property(s"yield-priced ask $kind: units and partial shares enforce the exact block-yield price, floor and expiry") {
-      withCtx { ctx =>
-        val n = nav(ctx, kind)
-        val m = if (kind == ErgBond) ksingh.sigmabonds.standard.Market.Erg else ksingh.sigmabonds.standard.Market.SigUsd
-        val expression = ZcStandardSpecBase.compiled(ctx).market(m).yieldPricing
-        Seq((n.f.asset, 1L, 1L), (forSale, 1000L, 7L)).foreach { case (token, whole, sold) =>
-          for (margin <- Seq(-250L, 0L, 250L)) {
-            val rate = 1000L
-            val amount = ceilDiv(BigInt(n.repayment) * sold * 2628000000L * (10000L + margin),
-              BigInt(whole) * (BigInt(2628000000L) + BigInt(rate) * (n.f.maturity - n.height)) * 10000L)
-            val base = navBox(n, token, whole, whole, rate, pricing = expression)
-            val ask = base.withRegNum(5, longsValue((base.parseCollReg[Long](1).toSeq :+ margin): _*))
-            accepts(executor(ctx), navTx(n, ask, sold, amount, expression = expression))
-            rejectsAtSigning(executor(ctx), navTx(n, ask, sold, amount - 1L, expression = expression))
-            rejectsAtSigning(executor(ctx), navTx(n, ask, sold, amount, expression = alwaysTrue(ctx)))
-            rejectsAtSigning(executor(ctx), navTx(n, ask, sold, amount * 2L, expression = expression, height = n.f.maturity.toInt))
-            val floor = ask.withRegNum(5, longsValue(Seq(amount + 1L, sold, 1L, n.f.maturity + 100L, rate, whole, margin): _*))
-            rejectsAtSigning(executor(ctx), navTx(n, floor, sold, amount, expression = expression))
-            accepts(executor(ctx), navTx(n, floor, sold, amount + 1L, expression = expression))
-            val negative = ask.withRegNum(5, longsValue(Seq(1L, 1000000000L, 1L, n.f.maturity + 100L, -1L, whole, margin): _*))
-            rejectsAtSigning(executor(ctx), navTx(n, negative, sold, amount, expression = expression))
-          }
-          Seq(-10000L, 1000001L).foreach { invalidMargin =>
-            val raw = navBox(n, token, whole, whole, 1000L, pricing = expression)
-            val bad = raw.withRegNum(5, longsValue((raw.parseCollReg[Long](1).toSeq :+ invalidMargin): _*))
-            rejectsAtSigning(executor(ctx), navTx(n, bad, sold, n.repayment * 2L, expression = expression))
-          }
-        }
+  property("yield ask: the fixed floor binds, the expression is pinned, and a continuation keeps R4 to R7") {
+    withCtx { ctx =>
+      val n = live(ctx, ErgBond)
+      val line = rising(n)
+      val price = n.owed(7L, 1000L, line)
+      // A floor of 2x the yield price: the expression passes but the floor does not.
+      val floored = yieldBox(n, forSale, 1000L, 1000L, line, floor = (2L * price, 7L))
+      rejectsAtSigning(executor(ctx), yieldTx(n, floored, 7L, price))
+      accepts(executor(ctx), yieldTx(n, floored, 7L, 2L * price))
+
+      val ask = yieldBox(n, forSale, 1000L, 1000L, line)
+      rejectsAtSigning(executor(ctx), yieldTx(n, ask, 7L, price, expression = alwaysTrue(ctx)))
+      val next = ask.setTokens(Token(forSale, 993L)).withRegNum(8, bytesValue(inputAt(ask, ctx, 0).id.getBytes))
+      accepts(executor(ctx), yieldTx(n, ask, 7L, price, next = next))
+      Seq(next.withRegNum(6, bytesValue(alwaysTrue(ctx).hashedValueBytes)),
+        next.withRegNum(7, bytesValue(otherBondAsset.getBytes)),
+        next.withRegNum(5, longsValue((Seq(1L, 1000000000L, 1L, n.f.maturity + 100L, 1000L) ++
+          Line(n.height - 100L, 9000L, n.height + 100L, 9000L).longs): _*)),
+        next.subValue(1L)).foreach { bad =>
+        rejectsAtSigning(executor(ctx), yieldTx(n, ask, 7L, price, next = bad))
       }
     }
   }
@@ -291,21 +289,21 @@ class ZcStandardAskSpec extends AnyPropSpec with ZcStandardSpecBase {
 
   property("asks: fills stop at expiry, and from expiry on anyone refunds the tokens to the seller") {
     withCtx { ctx =>
-      val n = nav(ctx, ErgBond)
+      val n = live(ctx, ErgBond)
       val expiry = n.height + 20
-      val price = n.owed(1L, 1L, 0L)
-      def navAt(value: Long): UTXO = navBox(n, n.f.asset, 1L, 1L, 0L, expiry = expiry, value = value)
+      val line = rising(n)
+      val price = n.owed(1L, 1L, line)
+      def yieldAt(value: Long): UTXO = yieldBox(n, n.f.asset, 1L, 1L, line, expiry = expiry, value = value)
       def saleAt(value: Long): UTXO = saleBox(ctx, ErgBond, expiry = expiry, value = value)
-      val late = n.copy(height = expiry - 1)
-      accepts(executor(ctx), navTx(late, navAt(minBox), 1L, late.owed(1L, 1L, 0L)))
-      rejectsAtSigning(executor(ctx), navTx(n, navAt(minBox), 1L, 2L * price, height = expiry))
+      accepts(executor(ctx), yieldTx(n, yieldAt(minBox), 1L, n.owed(1L, 1L, line, expiry - 1), height = expiry - 1))
+      rejectsAtSigning(executor(ctx), yieldTx(n, yieldAt(minBox), 1L, 2L * price, height = expiry))
       accepts(executor(ctx), saleTx(ctx, ErgBond, saleAt(minBox), 3L, height = expiry - 1))
       rejectsAtSigning(executor(ctx), saleTx(ctx, ErgBond, saleAt(minBox), 3L, height = expiry))
 
       def refundTx(ask: UTXO, out: UTXO, height: Int = expiry): UnsignedTransaction =
         buildAt(ctx, height, Seq(inputAt(ask, ctx, 0).withCtxVar(0.toByte, ErgoValue.of(0)),
           funding(ctx, executor(ctx), 9)), Seq(out), executor(ctx).getAddress)
-      Seq[Long => UTXO](navAt, saleAt).foreach { make =>
+      Seq[Long => UTXO](yieldAt, saleAt).foreach { make =>
         val ask = make(3L * minBox)
         val id = inputAt(ask, ctx, 0).id
         val refund = tagged(otherTree(ctx), minBox, id, ask.tokens)
@@ -328,8 +326,8 @@ class ZcStandardAskSpec extends AnyPropSpec with ZcStandardSpecBase {
 
   property("asks: the seller cancels at any height and nobody else can") {
     withCtx { ctx =>
-      val n = nav(ctx, ErgBond)
-      Seq(saleBox(ctx, ErgBond), navBox(n, n.f.asset, 1L, 1L, 0L)).foreach { ask =>
+      val n = live(ctx, ErgBond)
+      Seq(saleBox(ctx, ErgBond), yieldBox(n, n.f.asset, 1L, 1L, rising(n))).foreach { ask =>
         def cancel(by: ErgoProver, height: Int): UnsignedTransaction =
           buildAt(ctx, height, Seq(inputAt(ask, ctx, 0), funding(ctx, by, 9)),
             Seq(UTXO(contractOf(by), ask.value, ask.tokens)), by.getAddress)

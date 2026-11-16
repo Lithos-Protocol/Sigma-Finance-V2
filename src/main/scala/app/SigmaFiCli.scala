@@ -73,9 +73,12 @@ object SigmaFiCli {
       |      The order expires after --expires-in blocks (default 5040, or half a fixed maturity's term if
       |      less); then anyone may return it to you for the --expiry-fee (default 0.005 ERG, at least 0.002),
       |      which a fill refunds to you instead.
-      |      Optional --nav [--margin <percent>] or --yield <percent> [--margin <percent>] creates a PricedOrder.
-      |      Repayment stays fixed; --principal is its floor (and NAV anchor). Both support fixed or on-close maturity.
-      |      Yield uses simple return per 262800 blocks; no calendar clock or compounding, fees excluded.
+      |      Optional --yield <percent> [--end-yield <percent>] [--end-height <h> | --end-in <blocks>] creates a
+      |      PricedOrder: the principal a lender pays is the repayment discounted at that simple yield per 262800
+      |      blocks, never under --principal. With --end-yield the yield moves in a straight line from --yield now
+      |      to --end-yield at the end (default: the order's expiry), so an order can rise or fall. Repayment stays
+      |      fixed; fixed or on-close maturity. No calendar clock or compounding; fees excluded, so quote a little
+      |      above a lend offer's yield.
       |  cancel-order <order box id>
       |  repay <bond box id> [--from-collateral]
       |      --from-collateral repays out of the bond's own ERG or repayment token, as far as it holds them
@@ -91,15 +94,22 @@ object SigmaFiCli {
       |  Anyone:
       |  liquidate <bond box id> [...]       keeps each bond's fee reserve
       |  refund-order <order box id>        return an expired order to its borrower; keeps its expiry fee
-      |  pack <box id> [...]                refund expired orders, offers and asks and liquidate bonds, any mix,
-      |                                     in one transaction with one miner fee; keeps every fee
+      |  pack <box id> [...]                refund expired orders, offers, asks and lots and liquidate bonds, any
+      |                                     mix, in one transaction with one miner fee; keeps every fee
       |
-      |  Shares (fractional, or with a Dutch auction of a liquidated bond's collateral):
+      |  Shares (Selective or Dutch: a liquidated bond's collateral is auctioned for its repayment asset):
       |  shares [--mine]                    share requests and vaults, with any open auction's price
       |  fractionalize <bond asset id> [--shares <N>] [--share-name <s>] [--share-description <s>]
-      |               [--decimals <d>] [--pull-fee <ERG>] [--mint-fee <ERG>]
-      |               [--dutch --auction-opening <percent> --auction-floor <percent> --auction-length <blocks>]
+      |               --auction-opening <percent> --auction-floor <percent> [--auction-length <blocks>]
+      |               [--auction-expiry <blocks>] [--decimals <d>] [--pull-fee <ERG>] [--mint-fee <ERG>]
+      |               [--vault selective|dutch | --dutch]
       |      deposits a bond unit you hold; any batcher mints the shares to you. Fees default to 0.005 ERG.
+      |      --vault selective (the default) auctions a liquidated bond's collateral only if some item holds
+      |      fewer than 100 raw units (an NFT, or a token too thin to split); otherwise holders are paid in kind.
+      |      --vault dutch always auctions it. The auction falls from --auction-opening to --auction-floor
+      |      percent of the repayment (both yours to choose) over --auction-length blocks (default 720), then
+      |      holds at the floor until --auction-expiry blocks after it opened (default 2160); only then can
+      |      holders take an unsold lot in kind. Lend offers buy only Selective and Dutch shares.
       |      zcs1 defaults: 100000000 shares with 6 decimals (1.000000 = 1% of the bond), and a name and
       |      description built from the bond, such as ZCS-Bond-Shares-3fa2c1. Overriding any of them is nonstandard.
       |  mint-shares <request box id>       anyone: mint a request's shares; keeps the mint fee
@@ -108,15 +118,29 @@ object SigmaFiCli {
       |  buy-lot <Dutch vault box id>       anyone: buy an open auction's lot at its current price
       |  claim-shares <share id> [--amount <n>]   all outstanding shares make a final claim
       |
+      |  Lots (sell a basket of tokens, and for a token market ERG too, in one Dutch auction):
+      |  lots [--mine]
+      |  sell-lot --token <token id>:<raw units> [...] [--erg <ERG>] [--market ERG|SigUSD]
+      |               --opening <total> --floor <total> [--starts-in <blocks>] [--falls-for <blocks>]
+      |               [--holds-for <blocks>] [--refund-fee <ERG>]
+      |      the price is --opening until --starts-in blocks from now (default 0), falls in a straight line to
+      |      --floor over --falls-for blocks (default 720) and holds there for --holds-for blocks (default 2160);
+      |      then anyone may return the lot to you for the --refund-fee (default 0.002 ERG). Sold whole to the
+      |      first buyer. --erg sells ERG beside the tokens in a token market; an ERG lot sells tokens only.
+      |  take-lot <lot box id>              buy a lot at its current price
+      |  cancel-lot <lot box id>
+      |  refund-lot <lot box id>            anyone, after expiry; keeps the refund fee
+      |
       |  Asks (sell any token, paid in a market's asset):
       |  asks [--mine]
-      |  sell <token id> --amount <n> [--market ERG|SigUSD] (--price <total> | --nav [--margin <percent>] | --yield <percent> [--margin <percent>]
-      |               [--price <floor total>]) [--min-fill <n>] [--expires-in <blocks>] [--refund-fee <ERG>]
+      |  sell <token id> --amount <n> [--market ERG|SigUSD] (--price <total> | --yield <percent>
+      |               [--end-yield <percent>] [--end-height <h> | --end-in <blocks>] [--price <floor total>])
+      |               [--min-fill <n>] [--expires-in <blocks>] [--refund-fee <ERG>]
       |               [--min-cover <percent> [--oracle-age <blocks>]]
-      |      --nav prices a bond unit or its shares at the bond's accrued value plus --margin (may be negative).
-      |      --yield uses a PricedAsk at a simple buyer yield per 262800 blocks, fees excluded.
-      |      Both policies accept signed --margin on the calculated price; this changes the resulting yield.
-      |      With --nav or --yield, --price is an optional floor for the total amount.
+      |      --yield prices a bond unit or its shares with a PricedAsk at a simple buyer yield to maturity per
+      |      262800 blocks, fees excluded. With --end-yield it moves in a straight line from --yield now to
+      |      --end-yield at the end (default: the ask's expiry). With --yield, --price is an optional floor for
+      |      the total amount.
       |      Shares' --min-fill defaults to the least lot that claims a raw unit of the repayment.
       |      --min-cover adds a sale guard to a bond unit or its shares, at either price: the ask sells only
       |      while the bond's collateral is worth at least that share of its repayment at an oracle price at
@@ -126,14 +150,19 @@ object SigmaFiCli {
       |  cancel-ask <ask box id>
       |  refund-ask <ask box id>            anyone, after expiry; keeps the refund fee
       |
-      |  Lend offers (a yield bid that batchers fill from orders and asks):
+      |  Lend offers (a yield-curve bid that batchers fill from orders and asks):
       |  offers [--mine]
-      |  create-offer --capital <amount> --yield <percent per 262800 blocks> --collateral-floor <percent>
+      |  create-offer --capital <amount> (--yield <percent> | --curve <percent>:<blocks>,...) --collateral-floor <percent>
       |               [--market ERG|SigUSD] [--min-blocks <n>] [--max-blocks <n>] [--min-price <amount>]
       |               [--batcher-budget <ERG>] [--min-fill-percent <percent>] [--refund-fee <ERG>] (token offers)
       |               [--batcher-fee <ERG>] [--fee-reserve <ERG>] [--oracle-age <blocks>] [--expires-in <blocks>]
-      |               [--fees <ERG>] [--min-auction-floor <percent> --max-auction-length <blocks>]
-      |               [--deliver-shares [share and --dutch options as for fractionalize]]
+      |               [--fees <ERG>] [--min-auction-floor <percent> --max-auction-expiry <blocks>]
+      |               [--deliver-shares [share and vault options as for fractionalize]]
+      |      --curve lists up to 20 points of simple yield per 262800 blocks and blocks left to maturity, e.g.
+      |      8:21600,10:131400,12:262800: a bond is bought at the yield on the straight line between the points
+      |      around its maturity (flat beyond the ends). --yield is the minimum at every maturity, and with no
+      |      curve the offer's one yield. Shares are bought only from Selective or Dutch vaults whose auction
+      |      floor is at least --min-auction-floor and expiry at most --max-auction-expiry (default 0: none).
       |      Buys only bonds with the oracle liquidation rule: its policy measures their collateral. --fees is the
       |      ERG a SigUSD offer carries for fees and box minimums (default 0.5). --deliver-shares has a batcher
       |      mint each bond unit into shares for you; their zcs1 name leaves the bond out (ZCS-Bond-Shares),
@@ -362,7 +391,7 @@ case class Args(command: Option[String], positional: Seq[String], options: Map[S
 }
 
 object Args {
-  val Flags: Set[String] = Set("send", "mine", "liquidatable", "help", "old", "from-collateral", "dutch", "nav", "run",
+  val Flags: Set[String] = Set("send", "mine", "liquidatable", "help", "old", "from-collateral", "dutch", "run",
     "deliver-shares", "exact-maturity", "mempool", "allow-liquidatable", "no-fill-guard")
   val SessionOptions: Set[String] = Set("node", "api-key", "wallet-pass", "address", "fee")
   val Options: Set[String] = SessionOptions ++ Set(
@@ -370,10 +399,11 @@ object Args {
     "liquidation", "maturity", "term", "duration",
     "market", "ratio", "oracle-age", "fill-ratio", "min-cover", "expires-in", "expiry-fee", "fee-reserve", "add-erg", "add-token",
     "shares", "share-name", "share-description", "decimals", "pull-fee", "mint-fee",
-    "auction-opening", "auction-floor", "auction-length", "amount",
-    "price", "margin", "min-fill", "refund-fee",
-    "capital", "fees", "yield", "min-blocks", "max-blocks", "batcher-fee", "batcher-budget", "min-fill-percent", "collateral-floor", "min-price",
-    "min-auction-floor", "max-auction-length", "order", "ask")
+    "vault", "auction-opening", "auction-floor", "auction-length", "auction-expiry", "amount",
+    "price", "min-fill", "refund-fee", "end-yield", "end-height", "end-in",
+    "capital", "fees", "yield", "curve", "min-blocks", "max-blocks", "batcher-fee", "batcher-budget", "min-fill-percent",
+    "collateral-floor", "min-price", "min-auction-floor", "max-auction-expiry", "order", "ask",
+    "token", "erg", "opening", "floor", "starts-in", "falls-for", "holds-for")
 
   /** Splits a shell line on whitespace, keeping "double" or 'single' quoted text together. */
   def tokenize(line: String): Seq[String] = {

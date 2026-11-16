@@ -1,24 +1,34 @@
 {
-    // PricedAsk block-yield policy, var 2; ask R5(4)=reference buyer yield bps per 262800 blocks.
-    // R5(5)=units per bond, R5(6)=signed price margin bps, R7=bond asset, var 3=live bond data input.
-    // paid*N*(B+yield*D)*10000 >= sold*R*B*(10000+margin), B=2628000000, D=maturity-HEIGHT.
-    // Simple block yield, conditional on full repayment at maturity, excluding fees.
-    // R5(7..8)=minimum cover and oracle age; the independent sale guard matches GuardedNav.
+    // PricedAsk var 2: ZC_Standard_YieldAsk_Pricing with a sale guard. The same two-point yield price,
+    // plus a minimum collateral cover at a fresh oracle, so a resting ask never sells a bond that is
+    // under (or just over) its liquidation ratio to a buyer who would liquidate it at once.
+    // Ask R5: 4 N, 5 start height, 6 start yield, 7 end height, 8 end yield, as YieldAsk_Pricing;
+    //   9 minimum cover in bps of the repayment (> 0), 10 maximum oracle age in blocks (1..100000).
+    // R7 = bond asset id; var 3 = data-input index of the live bond's state box. The USD Oracle v2
+    // pool is found among the data inputs by its NFT, at any index, exactly once.
+    // Price: paid * N * (B * L + Y * D) >= sold * R * B * L, B = 10000 * 262800 (see YieldAsk_Pricing).
+    // Cover, measured as ZC_Standard_ERG_SigUSD_Liquidation does (SigUSD at $1, other tokens at zero,
+    // the lender's fee reserve excluded):
+    //   (100 * collateral nanoERG + rate * collateral SigUSD) * 10000 >= debt * min cover,
+    //   debt = 100 * repayment nanoERG, or rate * repayment SigUSD.
+    // A very large yield prices near zero, so the shell's floor binds: a guarded fixed price.
     val terms = SELF.R5[Coll[Long]].get
     val payoutIndex = getVar[Int](0).get
     val nextIndex = getVar[Int](1)
     val stateIndex = getVar[Int](3).get
 
-    if (terms.size < 9 || SELF.tokens.size != 1 ||
+    if (terms.size < 11 || SELF.tokens.size != 1 ||
         payoutIndex < 0 || payoutIndex >= OUTPUTS.size ||
         stateIndex < 0 || stateIndex >= CONTEXT.dataInputs.size) {
         sigmaProp(false)
     } else {
-        val yieldBps = terms(4)
-        val wholeUnits = terms(5)
-        val margin = terms(6)
-        val minBps = terms(7)
-        val maxAge = terms(8)
+        val wholeUnits = terms(4)
+        val start = terms(5)
+        val startYield = terms(6)
+        val end = terms(7)
+        val endYield = terms(8)
+        val minBps = terms(9)
+        val maxAge = terms(10)
         val asset = SELF.R7[Coll[Byte]].get
         val state = CONTEXT.dataInputs(stateIndex)
         val isBond =
@@ -30,7 +40,7 @@
             b.tokens.exists { (t: (Coll[Byte], Long)) => t._1 == oracleNFT && t._2 == 1L }
         }
 
-        if (!isBond || yieldBps < 0L || margin <= -10000L || margin > 1000000L ||
+        if (!isBond || startYield < 0L || endYield < 0L || end <= start ||
             wholeUnits < 1L || wholeUnits > 1000000000L ||
             minBps <= 0L || maxAge < 1L || maxAge > 100000L || pools.size != 1) {
             sigmaProp(false)
@@ -63,6 +73,10 @@
                 !supported || !fresh || price <= 0L || epoch < 0 || fee < 0L || fee > state.value) {
                 sigmaProp(false)
             } else {
+                val now = HEIGHT.toLong
+                val at = if (now < start) start else if (now > end) end else now
+                val span = (end - start).toBigInt
+                val rate = startYield.toBigInt * span + (endYield.toBigInt - startYield.toBigInt) * (at - start).toBigInt
                 val scale = 2628000000L.toBigInt
                 val collateralUSD = state.tokens.slice(1, state.tokens.size).fold(0L, { (a: Long, t: (Coll[Byte], Long)) =>
                     if (t._1 == sigUSD) a + t._2 else a
@@ -72,8 +86,8 @@
                 val debtValue = if (repaysERG) repayment.toBigInt * 100L.toBigInt
                     else price.toBigInt * repayment.toBigInt
                 sigmaProp(
-                    paid.toBigInt * wholeUnits.toBigInt * (scale + yieldBps.toBigInt * blocksLeft.toBigInt) * 10000L.toBigInt >=
-                        sold.toBigInt * repayment.toBigInt * scale * (10000L + margin).toBigInt &&
+                    paid.toBigInt * wholeUnits.toBigInt * (scale * span + rate * blocksLeft.toBigInt) >=
+                        sold.toBigInt * repayment.toBigInt * scale * span &&
                     collateralValue * 10000L.toBigInt >= debtValue * minBps.toBigInt
                 )
             }

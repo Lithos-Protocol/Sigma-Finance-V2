@@ -1,0 +1,102 @@
+{
+    // Standard lot auction (a Dutch-priced ask for a basket).
+    // Sells everything this box holds, tokens and (for a token currency) ERG together, as one lot
+    // to one buyer, for one currency. The price falls in a straight line from an opening to a
+    // floor and then holds at the floor until the expiry. It is for a holder paid collateral in
+    // kind (a Selective vault whose collateral split pro rata, a Dutch vault after its expiry, or
+    // several bonds' collateral at once) who wants the repayment currency back without staying
+    // online. It does not follow the ask convention, because it sells a basket rather than one
+    // token, so ZC_Standard_LendOffer never buys from it.
+    //
+    // CONSTANTS
+    // CONST_PAYMENT_TOKEN: Coll[Byte] - the currency the seller is paid in; EMPTY for ERG. One address
+    //   per currency under one shared template, as for ZC_Standard_SaleOrder.
+    //
+    // THE LOT
+    // ERG currency: every token. The box's nanoERG is not sold; it goes back to the seller with the
+    //   payment.
+    // Token currency: every token and all of the nanoERG. The box must hold none of the currency
+    //   token itself: a lot holding its own currency could be used to pay for itself.
+    //
+    // REGISTERS
+    // R4: Coll[Byte] - blake2b256 of the seller script: is paid, may cancel
+    // R5: Coll[Long] - exactly 6:
+    //   0 opening price and 1 floor price, raw units of the currency, 1 <= floor <= opening
+    //   2 start height and 3 end of the fall, start < end
+    //   4 expiry height, end <= expiry. Buys require HEIGHT < expiry; from then on anyone may refund.
+    //   5 refund fee, nanoERG, paid only by an expiry refund
+    //   The price is the opening up to the start height, the floor from the end height on, and on
+    //   the straight line between them in between. It only falls, so a purchase built at one height
+    //   stays valid at any later height before the expiry.
+    //
+    // BUY (anyone, before expiry)
+    // Context var 0: Int payout index. The payout is at the seller script with R4 = SELF.id, so one
+    // payout cannot pay for two lots, and holds the price:
+    //   ERG currency: at least this box's value plus the price, in nanoERG.
+    //   Token currency: tokens(0) = (currency, at least the price); the buyer funds its nanoERG.
+    // The buyer takes the lot: no other output is constrained. Checked without division, with
+    // L = end - start and at = HEIGHT clamped to [start, end]:
+    //   paid * L >= opening * L - (opening - floor) * (at - start).
+    //
+    // EXPIRY REFUND (anyone, once HEIGHT >= expiry)
+    // Context var 0: Int refund index. The refund is at the seller script with R4 = SELF.id, every
+    // token of this box, and at least this value less the refund fee R5(5). The tag lets a seller
+    // that is a contract, which cannot co-sign a cancel, recognise its lot.
+    //
+    // CANCEL
+    // A co-spent box guarded by the seller script releases this box at any height.
+    //
+    // ASSUMPTIONS AND LIMITS
+    // - The lot is sold whole. A basket split pro rata would round its thinnest tokens away.
+    // - Prices are absolute. A client may set them from an oracle at listing; nothing here reads one.
+    // - The buyer pays its own batcher, if any. The lot pays none on a buy.
+    // - Storage rent, serialization and maximum cost are unverified.
+
+    val sellerHash = SELF.R4[Coll[Byte]].get
+    val sellerAuth = INPUTS.exists { (b: Box) =>
+        b.id != SELF.id && blake2b256(b.propositionBytes) == sellerHash
+    }
+
+    if (sellerAuth) {
+        sigmaProp(true)
+    } else {
+        val terms = SELF.R5[Coll[Long]].get
+        val payoutIndex = getVar[Int](0).get
+        if (terms.size != 6 || payoutIndex < 0 || payoutIndex >= OUTPUTS.size) {
+            sigmaProp(false)
+        } else {
+            val payout = OUTPUTS(payoutIndex)
+            val toSeller =
+                blake2b256(payout.propositionBytes) == sellerHash &&
+                payout.R4[Coll[Byte]].get == SELF.id
+            if (HEIGHT.toLong >= terms(4)) {
+                // Expiry refund, by anyone: the whole lot goes back to the seller, less the fee.
+                sigmaProp(toSeller && payout.tokens == SELF.tokens && payout.value >= SELF.value - terms(5))
+            } else {
+                val opening = terms(0)
+                val floor = terms(1)
+                val start = terms(2)
+                val end = terms(3)
+                // An empty collection taken from the box, not a literal: testing the constant alone
+                // is folded at compile time and would give each currency a different template.
+                val paysERG = CONST_PAYMENT_TOKEN == SELF.id.slice(0, 0)
+                val paid = if (paysERG) {
+                    payout.value - SELF.value
+                } else if (payout.tokens.size > 0 && payout.tokens(0)._1 == CONST_PAYMENT_TOKEN) {
+                    payout.tokens(0)._2
+                } else 0L
+                val holdsCurrency = !paysERG && SELF.tokens.exists { (t: (Coll[Byte], Long)) =>
+                    t._1 == CONST_PAYMENT_TOKEN
+                }
+                val now = HEIGHT.toLong
+                val at = if (now < start) start else if (now > end) end else now
+                val span = (end - start).toBigInt
+                sigmaProp(
+                    toSeller && !holdsCurrency &&
+                    floor >= 1L && floor <= opening && start < end && end <= terms(4) &&
+                    paid.toBigInt * span >= opening.toBigInt * span - (opening - floor).toBigInt * (at - start).toBigInt
+                )
+            }
+        }
+    }
+}

@@ -45,8 +45,6 @@ object StandardCommands {
   // ═══ ARGUMENTS ════════════════════════════════════════════════════════════
 
   private def loan(a: Args, app: StandardApp): StdLoan = {
-    if (a.flag("nav") && a.opt("yield").isDefined) throw CliError("choose --nav or --yield, not both")
-    if (a.opt("margin").isDefined && !a.flag("nav") && a.opt("yield").isEmpty) throw CliError("--margin needs --nav or --yield")
     if (a.opt("principal-token").isDefined)
       throw CliError("a ZC Standard loan is lent in its market's asset: use --market SigUSD --principal <amount>")
     val market = a.opt("market").map(n => Market.named(n).getOrElse(
@@ -101,8 +99,10 @@ object StandardCommands {
       },
       allowLiquidatable = a.flag("allow-liquidatable"),
       fillRatio = fillRatio,
-      price = if (a.flag("nav")) Some(NavOrderPrice(ExchangeCommands.signedBps(a.opt("margin").getOrElse("0"))))
-        else a.opt("yield").map(s => YieldOrderPrice(ExchangeCommands.nonNegativeBps(s), ExchangeCommands.signedBps(a.opt("margin").getOrElse("0")))))
+      price = {
+        val (endBps, endHeight) = ExchangeCommands.yieldEnd(app, a)
+        a.opt("yield").map(s => YieldOrderPrice(ExchangeCommands.nonNegativeBps(s), endBps, endHeight))
+      })
   }
 
   /** "150" or "150.5" percent as basis points, for the option `key`. */
@@ -147,9 +147,12 @@ object StandardCommands {
       println(s"  borrow:      ${Units.amount(o.principal, m)}; repay ${Units.amount(o.repayment, m)}")
       if (o.priced) {
         val quote = Try(app.orderPrincipal(o, app.height.toLong + 3L, app.height.toLong))
-          .map(p => Units.amount(p, m)).getOrElse("unavailable (unknown or invalid policy, expired curve, or maturity too near)")
-        val label = Try(app.protocol.orderPricingOf(o)).map(_ => if (app.protocol.yieldOrder(o)) "block yield" else "NAV").getOrElse("UNKNOWN")
-        println(s"  PricedOrder: $label; quoted principal above is its floor; fill principal now: $quote")
+          .map(p => Units.amount(p, m)).getOrElse("unavailable (unknown or invalid policy, or maturity too near)")
+        val label = app.protocol.orderYieldLine(o).filter(_ => Try(app.protocol.orderPricingOf(o)).isSuccess).fold("UNKNOWN pricing") { l =>
+          s"${Units.percent(l.bpsAt(app.height.toLong))} simple yield now" +
+            (if (l.fixed) "" else s", moving to ${Units.percent(l.endBps)} at height ${l.end}")
+        }
+        println(s"  PricedOrder: $label; the principal above is its floor; fill principal now: $quote")
       }
       println("  maturity:    " + (if (o.onClose) s"${o.terms(3)} blocks after the fill"
         else s"height ${o.terms(3)} (${o.terms(3) - app.height} blocks from now)"))

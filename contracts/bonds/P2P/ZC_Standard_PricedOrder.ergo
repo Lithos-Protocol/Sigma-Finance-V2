@@ -3,14 +3,14 @@
     // Constants, collateral, expiry, mint supply (3: 2 state + 1 circulating), start/maturity,
     // cancellation and refund conventions are identical to ZC_Standard_Order.
     // CONST_BOND_HASH: standard bond tree hash; CONST_REPAYMENT_TOKEN: empty for ERG, else its token.
-    // R4: Coll[Long], 7..64 borrower terms as in Order. R4(1) is the minimum principal nanoERG
-    //   (and NAV anchor for ERG). Every term except the resolved ERG principal is copied unchanged.
-    // R5: Coll[(Coll[Byte],Long)], minimum principal tokens (and NAV anchor for a token loan).
+    // R4: Coll[Long], 7..64 borrower terms as in Order. R4(1) is the minimum principal nanoERG.
+    //   Every term except the resolved ERG principal is copied unchanged.
+    // R5: Coll[(Coll[Byte],Long)], minimum principal tokens.
     // R6: borrower script hash; R7: liquidation expression hash, both copied as in Order.
     // R8: Coll[Coll[Byte]], exactly (pricing expression hash, fill guard hash or empty bytes).
     // R9: Coll[Long], 0..64 pricing payload values, interpreted only by the pricing expression.
-    //   NavOrder_Pricing: (reference height, margin bps). Fixed or on-close maturity.
-    //   YieldOrder_Pricing: (yield bps per 262800 blocks, price margin bps). Fixed or on-close maturity.
+    //   YieldOrder_Pricing: (start height, start yield, end height, end yield), yields in bps per
+    //   262800 blocks, moving in a straight line between the two heights. Fixed or on-close maturity.
     // Fill context: 1 optional guard bytes, 2 mandatory pricing bytes. Each runs with ORDER as SELF.
     // OUTPUTS(0) unit, OUTPUTS(1) bond, OUTPUTS(2) borrower payout. The bond records the actual
     //   principal: R6(1) for ERG, R7(0)._2 for a token. Payout ERG less expiry refund equals R6(1),
@@ -19,7 +19,7 @@
     // Price expressions add a minimum payment; they cannot change repayment, maturity rules,
     //   collateral, borrower, liquidation expression, fees or mint supply. Overpayment is allowed
     //   only when the resolved principal records it. No future accrued value starts from a stale P.
-    // NAV/yield quotes are conditional on repayment; neither values collateral nor guarantees return.
+    // Yield quotes are conditional on repayment; they neither value collateral nor guarantee return.
     // A borrower chooses the pricing/guard expressions; hashes commit to bytes, not their safety.
     // Refund/cancel paths deliberately do not read pricing/guard registers, including malformed ones.
 

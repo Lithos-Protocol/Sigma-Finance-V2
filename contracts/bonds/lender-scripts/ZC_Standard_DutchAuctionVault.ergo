@@ -4,6 +4,8 @@
     // when the bond it holds a unit of was LIQUIDATED, the collateral pulled in is sold as one lot
     // in a Dutch auction for the bond's repayment asset, and share holders are then paid pro rata
     // in that one currency. When the bond was REPAID it behaves exactly like the standard vault.
+    // The in-kind threshold decides which liquidations auction: Selective (100) auctions only a lot
+    // with some item too thin to split pro rata; Dutch (Long max) auctions every lot.
     // The auction lives here, on the lender's side, so the bond and its liquidation expression are
     // unchanged. It sells collateral the lender side already owns: it returns no surplus to the
     // borrower, which stays a matter for the bond's liquidation expression.
@@ -22,8 +24,9 @@
     //   place to carry R7 and R8; no path reads it before the pull. After the pull:
     //   0 repaid; 1 auction open; 2 lot sold, nothing to sell, or the floor already held;
     //   3 paid out in kind
-    // R7: Coll[Long] - (repayment, opening bps, floor bps, length in blocks, auction start height).
-    //   The first four are fixed at the mint. The start height is 0 until a liquidated pull sets it.
+    // R7: Coll[Long] - (repayment, opening bps, floor bps, length in blocks, expiry in blocks from the
+    //   start, in-kind threshold in raw units, auction start height). The first six are fixed at the
+    //   mint. The start height is 0 until a liquidated pull sets it.
     // R8: Coll[Byte] - the auction currency: the bond's repayment token, EMPTY for ERG
     //
     // THE AUCTION
@@ -42,26 +45,32 @@
     // target, repayment * floor / 10000. Otherwise holders already have the floor and are paid the
     // rest in kind. This keeps the lot's price above zero for the whole auction, so it is never
     // given away. A floor of 0 therefore never opens an auction.
+    // It also opens only when some lot item holds fewer raw units than the in-kind threshold:
+    // a lot token, or for a token currency the lot's nanoERG. Otherwise every item splits pro
+    // rata, and holders are paid in kind.
+    // The target stays at the floor from the end of the fall until the expiry; claims wait for it.
     // After a liquidation, the vault holds at least repayment * floor / 10000 of the currency,
-    // unless an auction ran its whole length with no buyer; then holders take the lot in kind.
+    // unless every lot item cleared the threshold, or an auction reached its expiry with no buyer;
+    // in both cases holders take the lot in kind.
     //
     // PATHS, selected by the shares burned = transaction-wide share inputs minus share outputs
     // PULL (burned = 0, still holding the bond unit; anyone). Context var 0: Int continuation index.
     //   As the standard vault: spends this box with the settled ZC_Standard_BondVault, burns all 3
     //   bond units, takes all of its tokens(1..) and value, and may keep up to the pull fee.
     //   It sets the state from the bond vault's path: 0 if repaid; if liquidated, 1 when there is
-    //   a lot to sell and the currency held is short of the floor target, else 2. For an ERG
-    //   currency the currency held is the continuation's whole value. Opening an auction records
-    //   its start height, within 8 blocks of HEIGHT, since a script cannot pin HEIGHT exactly.
+    //   a lot to sell, the currency held is short of the floor target and some lot item is under
+    //   the threshold, else 2. For an ERG currency the currency held is the continuation's whole
+    //   value. Opening an auction records its start height, within 8 blocks of HEIGHT, since a
+    //   script cannot pin HEIGHT exactly.
     // SALE (burned = 0, after the pull, state 1; anyone). Context var 0: Int continuation index.
     //   Brings the vault's currency up to at least the current target, takes no currency, and
     //   takes the lot. The state becomes 2.
     // PARTIAL CLAIM (0 < burned < outstanding, after the pull).
     //   Context var 0: Int continuation index; 1: Int payout index, distinct.
     //   As the standard vault, floor(balance * burned / outstanding) of nanoERG and of each token.
-    //   Allowed in states 0, 2 and 3 at once. In state 1 it waits until the auction has run its
-    //   full length; a claim then takes the unsold collateral in kind, sets state 3, and closes
-    //   the auction for good, so an unsold lot never locks the vault.
+    //   Allowed in states 0, 2 and 3 at once. In state 1 it waits until the auction's expiry; a
+    //   claim then takes the unsold collateral in kind, sets state 3, and closes the auction for
+    //   good, so an unsold lot never locks the vault.
     // FINAL CLAIM (burned = outstanding + N + 1). Context var 1: Int payout index.
     //   Every outstanding share and the reserve are burned; the payout takes everything. Allowed in
     //   any state: before the pull it returns the bond unit, during an auction it takes the lot.
@@ -69,10 +78,14 @@
     //
     // ASSUMPTIONS AND LIMITS
     // - The lot is sold whole, to one buyer. There are no partial purchases.
-    // - Share holders wait out the auction's length before they can claim in kind. After it, the
+    // - Share holders wait out the auction's expiry before they can claim in kind. After it, the
     //   lot can still be bought at the floor until the first partial claim.
     // - The terms are the minter's choice; a share buyer must read them. A low floor lets the lot
     //   go cheaply; a floor of 0 means no auction at all.
+    // - The threshold reads raw units, not value: a 100-unit token clears it however little each
+    //   unit is worth, and pro rata claims under 1/100 of the shares still round it down.
+    // - When the vault already holds the floor target, a thin item is paid in kind: an auction
+    //   would have to give the lot away, because the currency held already meets the target.
     // - For an ERG currency, the vault's own box minimum and any pull fee left in it count as
     //   currency held. A puller may add nanoERG to lift the vault over the floor target and skip
     //   the auction; that only gives holders more of the currency.
@@ -111,7 +124,7 @@
     val burned = numTokenInInputs(shareId) - numTokenInOutputs(shareId)
 
     if (supply.size != 3 || supply(0) < 1L || supply(0) > 1000000000L || reserve != supply(0) + 1L ||
-        supply(1) < 1L || supply(1) > supply(0) || auction.size != 5 || burned < 0L) {
+        supply(1) < 1L || supply(1) > supply(0) || auction.size != 7 || burned < 0L) {
         sigmaProp(false)
     } else {
         val outstanding = supply(1)
@@ -128,7 +141,7 @@
                     next.propositionBytes == SELF.propositionBytes &&
                     next.R4[Coll[Byte]].get == bondAsset &&
                     next.R5[Coll[Long]].get == supply &&
-                    nextAuction.size == 5 && nextAuction.slice(0, 4) == auction.slice(0, 4) &&
+                    nextAuction.size == 7 && nextAuction.slice(0, 6) == auction.slice(0, 6) &&
                     next.R8[Coll[Byte]].get == currency
 
                 if (holding) {
@@ -143,9 +156,11 @@
                         val source = sources(0)
                         val proceeds = source.tokens.slice(1, source.tokens.size)
                         val liquidated = source.R5[Byte].get != 0.toByte
-                        // With an ERG currency only tokens are sold; with a token currency the
-                        // nanoERG is sold too, so there is always a lot.
-                        val hasLot = !paysERG || proceeds.size > 0
+                        // With an ERG currency only tokens are sold (the empty currency id matches
+                        // no token); with a token currency the nanoERG above the box minimum too.
+                        val lotTokens = proceeds.filter { (t: (Coll[Byte], Long)) => t._1 != currency }
+                        val lotERG = if (paysERG) 0L else next.value - 1000000L
+                        val hasLot = lotTokens.size > 0 || lotERG > 0L
                         // Currency the vault holds once the pull is done.
                         val held = if (paysERG) next.value else proceeds.fold(0L, {
                             (a: Long, t: (Coll[Byte], Long)) => if (t._1 == currency) a + t._2 else a
@@ -153,8 +168,12 @@
                         // An auction opens only if the currency held is still short of the floor.
                         // At or above it, holders already have the floor and take the rest in kind.
                         val short = held.toBigInt * 10000L.toBigInt < auction(0).toBigInt * auction(2).toBigInt
-                        val state = if (!liquidated) 0.toByte else if (hasLot && short) 1.toByte else 2.toByte
-                        val began = nextAuction(4)
+                        // ...and only if some lot item is too thin to split: under the threshold.
+                        val threshold = auction(5)
+                        val thin = lotTokens.exists { (t: (Coll[Byte], Long)) => t._2 < threshold } ||
+                            (!paysERG && lotERG < threshold)
+                        val state = if (!liquidated) 0.toByte else if (hasLot && short && thin) 1.toByte else 2.toByte
+                        val began = nextAuction(6)
                         val clock = if (state == 1.toByte) {
                             began >= 1L && began <= HEIGHT.toLong && began >= HEIGHT.toLong - 8L
                         } else began == 0L
@@ -177,7 +196,7 @@
                         val openingBps = auction(1)
                         val floorBps = auction(2)
                         val length = auction(3)
-                        val began = auction(4)
+                        val began = auction(6)
                         val sinceRaw = HEIGHT.toLong - began
                         val since = if (sinceRaw < 0L) 0L else if (sinceRaw > length) length else sinceRaw
                         // The target times 10000 * length, so the comparison needs no division.
@@ -196,7 +215,7 @@
                         val onlyCurrencyLeft = if (paysERG) next.tokens.size == 1
                             else next.tokens.size == 2 && next.value >= 1000000L
                         sigmaProp(
-                            carried && nextAuction(4) == began &&
+                            carried && nextAuction(6) == began &&
                             next.tokens(0) == SELF.tokens(0) && onlyCurrencyLeft &&
                             next.R6[Byte].get == 2.toByte &&
                             length >= 1L && after >= before &&
@@ -224,9 +243,9 @@
                     } else {
                         val next = OUTPUTS(nextIndex)
                         val state = SELF.R6[Byte].get
-                        // An open auction blocks claims until it has run its full length. A claim
-                        // made after that takes the unsold lot in kind and closes the auction.
-                        val ended = HEIGHT.toLong >= auction(4) + auction(3)
+                        // An open auction blocks claims until its expiry. A claim made after that
+                        // takes the unsold lot in kind and closes the auction.
+                        val ended = HEIGHT.toLong >= auction(6) + auction(4)
                         val claimable = state != 1.toByte || ended
                         val nextState = if (state == 1.toByte) 3.toByte else state
 

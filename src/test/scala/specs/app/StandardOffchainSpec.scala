@@ -23,7 +23,7 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
   private def offerSpec(w: World, capital: Long = erg("20")): OfferSpec =
     OfferSpec(Market.Erg, capital, 0L, yieldBps = 1000L, minBlocks = 1L, maxBlocks = 262800L, batcherFee = fee,
       feeReserve = reserve, floorBps = 13000L, maxAge = 30L, expiry = w.h + 500L, minPrice = 1L,
-      auctionFloorBps = 0L, auctionLength = 0L, delivery = None)
+      auctionFloorBps = 0L, auctionExpiry = 0L, delivery = None)
 
   private def oracleLoan(w: World, tokens: Long, repayment: Long = erg("6")): StdLoan =
     loan(repayment = repayment, collateral = Seq(Token(collateralToken, tokens)), rule = OracleChoice(15000L, 60L))(w)
@@ -128,11 +128,16 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
     shares shouldBe Seq("ZCS-Bond-Shares-3fa2c1",
       s"""{"zcs":1,"type":"shares","shares":100,"bond":"3fa2c1","market":"SigUSD",$terms,$note}""", "6")
     // Dutch auction shares take the same name; the description's type and auction tell them apart.
-    val auction = Some(AuctionTerms(12000L, 9050L, 720L))
-    val sale = """"auction":{"from":120,"to":90.5,"blocks":720}"""
+    val auction = Some(AuctionTerms(12000L, 9050L, 720L, 720L, StandardProtocol.DutchThreshold))
+    val sale = """"auction":{"from":120,"to":90.5,"blocks":720,"expiry":720}"""
     val dutch = StandardMetadata.shares(Market.SigUsd, auction, Some(facts))
     dutch shouldBe Seq("ZCS-Bond-Shares-3fa2c1",
       s"""{"zcs":1,"type":"auction shares","shares":100,"bond":"3fa2c1","market":"SigUSD",$terms,$sale,$note}""", "6")
+    // Selective shares carry the threshold under which their auction runs.
+    val selective = StandardMetadata.shares(Market.SigUsd, Some(AuctionTerms(12000L, 9050L, 720L, 2160L, 100L)), Some(facts))
+    selective(1) shouldBe s"""{"zcs":1,"type":"selective shares","shares":100,"bond":"3fa2c1","market":"SigUSD",$terms,""" +
+      s""""auction":{"from":120,"to":90.5,"blocks":720,"expiry":2160,"threshold":100},$note}"""
+    io.circe.parser.parse(selective(1)).isRight shouldBe true
     // Without the bond, as an offer writes them: the market and where they came from.
     val viaOffer = StandardMetadata.shares(Market.Erg, None, None)
     viaOffer shouldBe Seq("ZCS-Bond-Shares", s"""{"zcs":1,"type":"shares","shares":100,"market":"ERG","via":"lend offer",$note}""", "6")
@@ -184,14 +189,14 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
 
       // Dutch shares of a known bond: named after it, with the bond's terms and the auction in the description.
       val bond = w.liveBond(loan(collateral = Seq(Token(collateralToken, 100L)))(w), l)
-      val auction = Some(AuctionTerms(15000L, 9000L, 500L))
+      val auction = Some(AuctionTerms(15000L, 9000L, 500L, 500L, StandardProtocol.DutchThreshold))
       w.run(l, w.app(l).fractionalize(bond.asset.toString, ShareTerms(pullFee = fee, mintFee = fee, auction = auction)))
       val req = w.app(e).shareRequests().loneElement
       req.shares shouldBe 100000000L
       StandardMetadata.text(req.metadata.head) shouldBe s"ZCS-Bond-Shares-${bond.asset.toString.take(6)}"
       StandardMetadata.text(req.metadata(1)) shouldBe s"""{"zcs":1,"type":"auction shares","shares":100,""" +
         s""""bond":"${bond.asset.toString.take(6)}","market":"ERG","principal":5,"repayment":6,"start":${w.h},""" +
-        s""""maturity":${w.h + 1000L},"rule":"maturity","auction":{"from":150,"to":90,"blocks":500},""" +
+        s""""maturity":${w.h + 1000L},"rule":"maturity","auction":{"from":150,"to":90,"blocks":500,"expiry":500},""" +
         """"note":"Verify on chain."}"""
       w.app(e).requestMetadataIssues(req) shouldBe empty
       w.run(e, w.app(e).mintShares(req.box.id.toString))
@@ -422,7 +427,7 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
     }
   }
 
-  property("sale guard: a guarded ask sells, at NAV or at a fixed price, only while its bond's cover holds") {
+  property("sale guard: a guarded ask sells, at a yield or at a fixed price, only while its bond's cover holds") {
     withCtx { ctx =>
       val w = new World(ctx)
       val (b, l, e, o) = (borrower(ctx), lender(ctx), executor(ctx), other(ctx))
@@ -435,8 +440,8 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
       w.run(l, w.app(l).fillOrder(w.app(l).orders().loneElement.box.id.toString, reserve))
       val bond = w.app(e).bonds().loneElement
 
-      // At NAV with a 160% guard: an offer buys it at 166%.
-      val pricedAsk = w.app(l).sell(bond.asset.toString, 1L, Market.Erg, NavPrice(0L, None), Some(1L), w.h + 100L,
+      // At a 1000% yield with a 160% guard: an offer buys it at 166%.
+      val pricedAsk = w.app(l).sell(bond.asset.toString, 1L, Market.Erg, YieldPrice(100000L), Some(1L), w.h + 100L,
         erg("0.002"), Some(SaleGuard(16000L, 30L)))
       pricedAsk.notes.exists(_.startsWith("sale guard: it sells only while the bond's collateral is worth at least 160%")) shouldBe true
       w.run(l, pricedAsk)
@@ -446,11 +451,11 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
       w.run(e, w.app(e).matchAsk(w.app(e).offers().loneElement.box.id.toString, nav.box.id.toString, None))
       w.tokens(o).get(bond.asset) shouldBe Some(1L)
 
-      // At a fixed 5.5 ERG with the same guard: a NAV ask whose floor is the price.
+      // At a fixed 5.5 ERG with the same guard: a guarded yield ask whose floor is the price.
       w.run(o, w.app(o).sell(bond.asset.toString, 1L, Market.Erg, FixedPrice(erg("5.5")), Some(1L), w.h + 100L,
         erg("0.002"), Some(SaleGuard(16000L, 30L))))
       val fixed = w.app(e).asks().loneElement
-      fixed.margin shouldBe StandardProtocol.GuardedFixedMargin
+      fixed.yieldLine.map(_.startBps) shouldBe Some(StandardProtocol.GuardedFixedYield)
       w.app(e).askPrice(fixed, 1L)._1 shouldBe erg("5.5")
       // ERG at about $1.18: 158%, over the bond's 150% ratio but under the seller's 160%.
       w.chain.unspent.remove(high.id.toString)

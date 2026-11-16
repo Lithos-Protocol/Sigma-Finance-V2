@@ -27,8 +27,9 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
   private case class Terms(yieldBps: Long = 0L, minBlocks: Long = 1L, maxBlocks: Long = 100000L,
                            batcherFee: Long = batchingFee, reserve: Long = batchingFee, floorBps: Long = 13000L,
                            expiry: Long = -1L, minFill: Long = 1L, maxAge: Long = 30L,
-                           auctionFloor: Long = 0L, auctionLength: Long = 1000000L,
-                           minFillBps: Long = 100L, rewardBudget: Long = 200000000L)
+                           auctionFloor: Long = 0L, auctionExpiry: Long = 1000000L,
+                           minFillBps: Long = 100L, rewardBudget: Long = 200000000L,
+                           curve: Seq[(Long, Long)] = Seq.empty)
 
   private def offerBox(ctx: BlockchainContext, kind: Kind, t: Terms = Terms(), policy: Contract = null,
                        fractional: Seq[Long] = Seq.empty, mint: Array[Byte] = Array.empty[Byte]): UTXO = {
@@ -36,7 +37,7 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
     val budget = if (kind == ErgBond) Seq.empty else
       Seq(tokenCapital, Parameters.OneErg - minBox - t.batcherFee, t.minFillBps, t.rewardBudget)
     val terms = Seq(t.yieldBps, t.minBlocks, t.maxBlocks, t.batcherFee, t.reserve, t.floorBps, expiry, t.minFill,
-      t.maxAge, t.auctionFloor, t.auctionLength) ++ budget
+      t.maxAge, t.auctionFloor, t.auctionExpiry) ++ budget ++ t.curve.flatMap { case (y, d) => Seq(y, d) }
     val regs = Seq(bytesValue(hashOf(lenderTree(ctx))), longsValue(terms: _*),
       bytesValue((if (policy == null) alwaysTrue(ctx) else policy).hashedValueBytes),
       longsValue(fractional: _*), if (fractional.isEmpty) textsValue() else textsValue(metadata: _*), bytesValue(mint))
@@ -187,7 +188,7 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
   property("delivery: a fill can put the unit into the standard or the Dutch mint the lender names, and a batcher mints") {
     withCtx { ctx =>
       val standard = Seq(1000L, pullFee, mintFee)
-      val dutch = Seq(1000L, pullFee, mintFee, 15000L, 11000L, 500L)
+      val dutch = Seq(1000L, pullFee, mintFee, 15000L, 11000L, 500L, 500L, 100L)
       Seq(scripts(ctx).fractionalMint -> standard, marketOf(ctx, ErgBond).dutchMint -> dutch).foreach { case (mint, longs) =>
         val f = flow(ctx, ErgBond)
         val offer = offerBox(ctx, ErgBond, fractional = longs, mint = hashOf(mint))
@@ -197,14 +198,14 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
         // Any batcher now runs the mint for the mint fee, with the bond's state box as data for the Dutch mint.
         val shares = UTXO(lenderTree(ctx), minBox, Seq(Token(delivered.id, 1000L)),
           Seq(textsValueItem(0), textsValueItem(1), textsValueItem(2)))
-        val isDutch = longs.size == 6
+        val isDutch = longs.size == 8
         // Registers are dense, so a Dutch vault carrying R7 and R8 also carries an R6. The mint does not
         // read it and the vault ignores it until the pull sets the state.
         val vault = if (isDutch)
           UTXO(exchange(ctx).dutchVault, delivered.value - mintFee - minBox,
             Seq(Token(delivered.id, 1001L), Token(f.asset, 1L)),
             Seq(bytesValue(f.asset.getBytes), longsValue(1000L, 1000L, pullFee), ErgoValue.of(0.toByte),
-              longsValue(f.data(0), 15000L, 11000L, 500L, 0L), bytesValue(Array.empty[Byte])))
+              longsValue(f.data(0), 15000L, 11000L, 500L, 500L, 100L, 0L), bytesValue(Array.empty[Byte])))
         else UTXO(scripts(ctx).fractionalVault, delivered.value - mintFee - minBox,
             Seq(Token(delivered.id, 1001L), Token(f.asset, 1L)),
             Seq(bytesValue(f.asset.getBytes), longsValue(1000L, 1000L, pullFee)))
@@ -364,6 +365,12 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
     def shareId: ErgoId = request.id
   }
 
+  /** The share mint offers buy from: the market's Dutch-pair mint. */
+  private def shareMint(ctx: BlockchainContext, kind: Kind): Contract = marketOf(ctx, kind).dutchMint
+
+  /** Selective request terms for `n` shares: 150% falling to 100% over 300 blocks, held until 500, threshold 100. */
+  private def shareLongs(n: Long): Seq[Long] = Seq(n, pullFee, mintFee, 15000L, 10000L, 300L, 500L, 100L)
+
   /** A bond whose unit went into a mint request at the fill; the request's id is the share id. */
   private def wrapped(ctx: BlockchainContext, kind: Kind, mint: Contract, longs: Seq[Long],
                       liq: Contract = null): Wrapped = {
@@ -384,7 +391,7 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
 
   property("token budgets: minimum fill uses original capital, with an enforced 1% floor") {
     withCtx { ctx =>
-      val w = wrapped(ctx, TokenBond, scripts(ctx).fractionalMint, Seq(1000L, pullFee, mintFee))
+      val w = wrapped(ctx, TokenBond, shareMint(ctx, TokenBond), shareLongs(1000L))
       // The larger reward budget makes a 0.9% fill pay over 0.002 ERG, isolating the size check.
       val o = offerBox(ctx, TokenBond, Terms(rewardBudget = 300000000L))
       accepts(executor(ctx), shareBuy(w, o, 15L, 10L))
@@ -405,7 +412,7 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
 
   property("token budgets: all ERG outflow fits the exact pro rata cap, and budget terms cannot change") {
     withCtx { ctx =>
-      val w = wrapped(ctx, TokenBond, scripts(ctx).fractionalMint, Seq(1000L, pullFee, mintFee))
+      val w = wrapped(ctx, TokenBond, shareMint(ctx, TokenBond), shareLongs(1000L))
       val base = offerBox(ctx, TokenBond)
       // A 1% fill releases 0.002 reward + two 0.001 box allowances = exactly 1% of 0.4 ERG.
       val terms = termsOf(base).updated(12, 400000000L)
@@ -426,7 +433,7 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
 
   property("token rewards: undersized calculated fees reject instead of rounding up; splitting earns no extra reward") {
     withCtx { ctx =>
-      val w = wrapped(ctx, TokenBond, scripts(ctx).fractionalMint, Seq(1000L, pullFee, mintFee))
+      val w = wrapped(ctx, TokenBond, shareMint(ctx, TokenBond), shareLongs(1000L))
       val small = offerBox(ctx, TokenBond, Terms(rewardBudget = 100000000L))
       rejectsAtSigning(executor(ctx), shareBuy(w, small, 15L, 10L))
       accepts(executor(ctx), shareBuy(w, small, 30L, 20L))
@@ -443,9 +450,9 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
   }
 
   for (kind <- kinds) {
-    property(s"$kind shares: standard shares are bought pro rata to the repayment, with an exact yield") {
+    property(s"$kind shares: Selective shares are bought pro rata to the repayment, with an exact yield") {
       withCtx { ctx =>
-        val w = wrapped(ctx, kind, scripts(ctx).fractionalMint, Seq(1000L, pullFee, mintFee))
+        val w = wrapped(ctx, kind, shareMint(ctx, kind), shareLongs(1000L))
         val units = 30L
         val paid = if (kind == ErgBond) 195000000L else 20L
         accepts(executor(ctx), shareBuy(w, offerBox(ctx, kind), units, paid))
@@ -459,75 +466,75 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
 
   property("shares: an offer is never charged for shares it did not receive") {
     withCtx { ctx =>
-      val w = wrapped(ctx, ErgBond, scripts(ctx).fractionalMint, Seq(1000L, pullFee, mintFee))
+      val w = wrapped(ctx, ErgBond, shareMint(ctx, ErgBond), shareLongs(1000L))
       val offer = offerBox(ctx, ErgBond)
       accepts(executor(ctx), shareBuy(w, offer, 30L, 195000000L))
       // The ask sells 30 and states 30, but only 29 reach the offer.
       rejectsAtSigning(executor(ctx), shareBuy(w, offer, 30L, 195000000L, delivered = 29L))
       // More shares than the bond has.
-      val all = wrapped(ctx, ErgBond, scripts(ctx).fractionalMint, Seq(10L, pullFee, mintFee))
+      val all = wrapped(ctx, ErgBond, shareMint(ctx, ErgBond), shareLongs(10L))
       rejectsAtSigning(executor(ctx), shareBuy(all, offer, 11L, 7700000000L, askAmount = 11L))
     }
   }
 
-  property("shares: Dutch auction shares are bought only within the lender's floor and length bounds") {
+  property("shares: only Dutch-pair shares are bought, within the lender's floor and expiry bounds") {
     withCtx { ctx =>
       val dutch = marketOf(ctx, ErgBond).dutchMint
-      val w = wrapped(ctx, ErgBond, dutch, Seq(1000L, pullFee, mintFee, 15000L, 10000L, 500L))
-      def offer(floor: Long, length: Long): UTXO = offerBox(ctx, ErgBond, Terms(auctionFloor = floor, auctionLength = length))
+      // Falls for 300 blocks and holds until 500: the offer bounds the 500, the holders' longest wait.
+      val w = wrapped(ctx, ErgBond, dutch, Seq(1000L, pullFee, mintFee, 15000L, 10000L, 300L, 500L, Long.MaxValue))
+      def offer(floor: Long, expiry: Long): UTXO = offerBox(ctx, ErgBond, Terms(auctionFloor = floor, auctionExpiry = expiry))
       accepts(executor(ctx), shareBuy(w, offer(10000L, 500L), 30L, 195000000L))
       accepts(executor(ctx), shareBuy(w, offer(0L, 1000000L), 30L, 195000000L))
-      Seq(offer(10001L, 500L), offer(10000L, 499L), offer(0L, 0L)).foreach { o =>
+      Seq(offer(10001L, 500L), offer(10000L, 499L), offer(10000L, 300L), offer(0L, 0L)).foreach { o =>
         rejectsAtSigning(executor(ctx), shareBuy(w, o, 30L, 195000000L))
       }
-      // A maximum length of 0 refuses Dutch shares but not standard ones.
-      val standard = wrapped(ctx, ErgBond, scripts(ctx).fractionalMint, Seq(1000L, pullFee, mintFee))
-      accepts(executor(ctx), shareBuy(standard, offer(1000000L, 0L), 30L, 195000000L))
-      // A request under a script that is neither mint.
-      val neither = wrapped(ctx, ErgBond, otherTree(ctx), Seq(1000L, pullFee, mintFee, 15000L, 10000L, 500L))
+      // Plain fractional shares pay a liquidated bond's collateral in kind: no offer buys them, at any bounds.
+      val plain = wrapped(ctx, ErgBond, scripts(ctx).fractionalMint, Seq(1000L, pullFee, mintFee))
+      rejectsAtSigning(executor(ctx), shareBuy(plain, offer(0L, 1000000L), 30L, 195000000L))
+      // A request under a script that is not the Dutch mint.
+      val neither = wrapped(ctx, ErgBond, otherTree(ctx), shareLongs(1000L))
       rejectsAtSigning(executor(ctx), shareBuy(neither, offer(0L, 1000000L), 30L, 195000000L))
       // The Dutch mint compiled for the other repayment asset is not this offer's.
-      val tokenDutch = wrapped(ctx, ErgBond, marketOf(ctx, TokenBond).dutchMint, Seq(1000L, pullFee, mintFee, 15000L, 10000L, 500L))
+      val tokenDutch = wrapped(ctx, ErgBond, marketOf(ctx, TokenBond).dutchMint, shareLongs(1000L))
       rejectsAtSigning(executor(ctx), shareBuy(tokenDutch, offer(0L, 1000000L), 30L, 195000000L))
     }
   }
 
-  // ─── from a NAV ask ───────────────────────────────────────────────────────
+  // ─── from a yield ask ─────────────────────────────────────────────────────
 
-  /** A NAV ask for `amount` of `token`, `whole` of which make one bond, at accrued value with no margin. */
+  /** The buyer yield of the yield asks below, in bps per 262800 blocks: 1000%, flat. */
+  private val askYield: Long = 100000L
+
+  /** A yield ask for `amount` of `token`, `whole` of which make one bond, at a flat `askYield` around `at`. */
   private def pricedAskBox(ctx: BlockchainContext, kind: Kind, token: ErgoId, amount: Long, whole: Long,
-                        asset: ErgoId): UTXO =
+                           asset: ErgoId, at: Long): UTXO =
     UTXO(marketOf(ctx, kind).pricedAsk, minBox, Seq(Token(token, amount)),
-      Seq(bytesValue(hashOf(otherTree(ctx))), longsValue(1L, 1000000000L, 1L, ctx.getHeight + 5000L, 0L, whole),
-        bytesValue(marketOf(ctx, kind).pricing.hashedValueBytes), bytesValue(asset.getBytes)))
+      Seq(bytesValue(hashOf(otherTree(ctx))),
+        longsValue(1L, 1000000000L, 1L, ctx.getHeight + 5000L, whole, at - 10L, askYield, at + 10L, askYield),
+        bytesValue(marketOf(ctx, kind).yieldPricing.hashedValueBytes), bytesValue(asset.getBytes)))
 
-  /** Accrued value of `sold` of `whole` at the live bond's height, rounded up as the expression requires. */
-  private def accrued(l: Live, sold: Long, whole: Long): Long = {
-    val term = l.f.maturity - l.f.start
-    val elapsed = l.height - l.f.start
-    val principal = if (l.f.kind == ErgBond) l.f.data(1) else 600L
-    ceilDiv(BigInt(sold) * (BigInt(principal) * (term - elapsed) + BigInt(l.f.data(0)) * elapsed),
-      BigInt(whole) * term)
-  }
+  /** The yield price of `sold` of `whole` at the live bond's height, rounded up as the expression requires. */
+  private def yieldPrice(l: Live, sold: Long, whole: Long): Long =
+    ceilDiv(BigInt(sold) * l.f.data(0) * year, BigInt(whole) * (year + BigInt(askYield) * l.blocks))
 
   for (kind <- kinds) {
-    property(s"$kind from a NAV ask: an offer buys a unit and shares, each side running its own expression") {
+    property(s"$kind from a yield ask: an offer buys a unit and shares, each side running its own expression") {
       withCtx { ctx =>
         val policy = marketOf(ctx, kind).policy
         val offer = offerBox(ctx, kind, policy = policy)
-        val askVars = Seq[(Byte, ErgoValue[_])](2.toByte -> liqVar(marketOf(ctx, kind).pricing), 3.toByte -> ErgoValue.of(0))
+        val askVars = Seq[(Byte, ErgoValue[_])](2.toByte -> liqVar(marketOf(ctx, kind).yieldPricing), 3.toByte -> ErgoValue.of(0))
         // A whole unit: the ask's pricing expression and the offer's policy share the state box.
         val l = live(ctx, kind, liq = oracleRuleOf(ctx, kind))
-        val unitAsk = pricedAskBox(ctx, kind, l.f.asset, 1L, 1L, l.f.asset)
-        val unitPrice = accrued(l, 1L, 1L)
+        val unitAsk = pricedAskBox(ctx, kind, l.f.asset, 1L, 1L, l.f.asset, l.height)
+        val unitPrice = yieldPrice(l, 1L, 1L)
         def unitTx(paid: Long): UnsignedTransaction = buyTx(l, offer, unitAsk, 1L, paid, policy = policy,
           askVars = askVars, data = Seq(oracleBox(l.f, created = l.height)))
         accepts(executor(ctx), unitTx(unitPrice))
         rejectsAtSigning(executor(ctx), unitTx(unitPrice - 1L))
         // 30 of 1000 shares: the offer also reads the mint request's bytes. The heaviest match there is.
-        val w = wrapped(ctx, kind, scripts(ctx).fractionalMint, Seq(1000L, pullFee, mintFee), liq = oracleRuleOf(ctx, kind))
-        val shareAsk = pricedAskBox(ctx, kind, w.shareId, 100L, 1000L, w.l.f.asset)
-        val sharePrice = accrued(w.l, 30L, 1000L)
+        val w = wrapped(ctx, kind, shareMint(ctx, kind), shareLongs(1000L), liq = oracleRuleOf(ctx, kind))
+        val shareAsk = pricedAskBox(ctx, kind, w.shareId, 100L, 1000L, w.l.f.asset, w.l.height)
+        val sharePrice = yieldPrice(w.l, 30L, 1000L)
         def shareTx(paid: Long): UnsignedTransaction = buyTx(w.l, offer, shareAsk, 30L, paid, request = w.request,
           policy = policy, askVars = askVars, data = Seq(oracleBox(w.l.f, created = w.l.height)))
         accepts(executor(ctx), shareTx(sharePrice))

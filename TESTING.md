@@ -180,3 +180,30 @@ validation: adding the plan does not broadcast transactions or establish live-no
 
 Yield-margin/live-plan follow-up on 2026-11-14: all 467 tests across 24 suites passed; CLI help and
 pinned-reference checks passed. No live-node transactions were broadcast.
+
+## Two-point yields, curve offers, Selective vaults and lots (2026-11-16)
+
+NAV pricing and price margins were removed, so the specs that covered them now cover their
+replacements:
+
+- `ZcStandardPricedOrderSpec`: two-point yield orders in ERG and SigUSD, exact to one raw unit, with
+  flat, rising and falling lines and both clamps checked against one known price; malformed lines;
+  on-close duration; floors, overpayment records and immutable terms as before.
+- `ZcStandardAskSpec`: yield asks on units and shares over flat, rising and falling lines, a falling
+  yield that leaves an earlier payment short, live-bond-only state checks, floors and continuations.
+- `ZcStandardFillGuardSpec`: the guarded yield expression, including a guarded fixed price through a
+  10^15 bps yield.
+- `ZcStandardLendOfferSpec`: shares are bought only from the Dutch-pair mint, bounded by floor and
+  expiry; plain fractional shares are refused; yield-ask purchases replace NAV-ask ones.
+- `ZcStandardDutchAuctionSpec`: the eight mint terms and their bounds (expiry, threshold), the seven-long
+  vault R7, a Selective pull that pays a 100-unit token in kind and auctions a 99-unit one, and claims
+  that wait for the expiry while the lot stays on sale at the floor.
+- App specs and `LivePricingSpec`: the CLI's `--yield/--end-yield`, `--curve`, `--vault`, Selective
+  delivery and the updated live plan, signed offline.
+
+Not yet covered by dedicated specs: `ZC_Standard_LotAuction` and the lend offer's curve beyond the
+live plan's use. Both were checked once with throwaway probes (exact falling price, floor hold, expiry,
+refund, cancel, own-currency refusal; curve midpoints, uneven segments, flat ends, the minimum,
+ordering and the 20-point limit), which were not committed.
+
+On 2026-11-16 all 488 tests across 26 suites passed. No live-node transactions were broadcast.

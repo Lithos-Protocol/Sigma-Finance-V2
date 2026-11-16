@@ -11,7 +11,7 @@ import work.lithos.mutations.{Contract, InputUTXO, Token, UTXO}
 object ZcStandardOfferIsolationSpec {
   private var variant: Option[Contract] = None
 
-  /** Same offer rules, a different Dutch-mint binding: both deployments accept the same new bond. */
+  /** Same offer rules, a different priced-order binding: both deployments accept the same new bond and shares. */
   def otherDeployment(ctx: BlockchainContext): Contract = synchronized {
     variant.getOrElse {
       val set = ZcStandardSpecBase.compiled(ctx)
@@ -19,10 +19,9 @@ object ZcStandardOfferIsolationSpec {
       val constants = ConstantsBuilder.create()
         .item("CONST_REPAYMENT_TOKEN", Colls.fromArray(Array.emptyByteArray))
         .item("CONST_ORDER_HASH", Colls.fromArray(m.order.hashedPropBytes))
-        .item("CONST_PRICED_ORDER_HASH", Colls.fromArray(m.pricedOrder.hashedPropBytes))
+        .item("CONST_PRICED_ORDER_HASH", Colls.fromArray(Array.fill[Byte](32)(42.toByte)))
         .item("CONST_BOND_HASH", Colls.fromArray(m.bond.hashedPropBytes))
-        .item("CONST_FRACTIONAL_MINT_HASH", Colls.fromArray(set.fractionalMint.hashedPropBytes))
-        .item("CONST_DUTCH_MINT_HASH", Colls.fromArray(Array.fill[Byte](32)(42.toByte))).build()
+        .item("CONST_DUTCH_MINT_HASH", Colls.fromArray(m.dutchMint.hashedPropBytes)).build()
       val c = Contract.fromErgoContract(ctx.compileContract(constants,
         ScriptGenerator.mkScript("bonds/P2P/ZC_Standard_LendOffer")))
       variant = Some(c)
@@ -72,8 +71,8 @@ class ZcStandardOfferIsolationSpec extends AnyPropSpec with ZcStandardSpecBase {
         val f = flow(ctx, ErgBond)
         val fill = filled(f)
         val state = spendOutput(fill, 1)
-        val request = inputAt(UTXO(scripts(ctx).fractionalMint, 6000000L, Seq(Token(f.asset, 1L)),
-          eip4() ++ Seq(bytesValue(hashOf(lenderTree(ctx))), longsValue(1000L, 2000000L, 2000000L),
+        val request = inputAt(UTXO(marketOf(ctx, ErgBond).dutchMint, 6000000L, Seq(Token(f.asset, 1L)),
+          eip4() ++ Seq(bytesValue(hashOf(lenderTree(ctx))), longsValue(1000L, 2000000L, 2000000L, 15000L, 10000L, 300L, 500L, 100L),
             textsValue("Shares", "Bond shares", "0"))), ctx, 10)
         val market = marketOf(ctx, ErgBond)
         val ask = UTXO(if (priced) market.pricedAsk else market.saleOrder, minBox,

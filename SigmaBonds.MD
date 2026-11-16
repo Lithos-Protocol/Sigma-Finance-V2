@@ -3,8 +3,9 @@
 The ZC Standard is SigmaFi V2's contract set for P2P zero-coupon bonds on Ergo. A borrower posts an
 order with collateral; a lender fills it and receives a tradeable bond asset; the bond is repaid or
 liquidated into a vault, and whoever holds the asset claims the vault. Around that core sit
-fractional shares, a Dutch auction for liquidated collateral, asks for selling bonds and shares, and
-a lend offer that buys them on a yield target.
+fractional shares with a Selective or Dutch auction for liquidated collateral, asks for selling bonds
+and shares at a fixed price or a moving yield, a lot auction for selling collateral paid in kind, and
+a lend offer that buys on a yield curve.
 
 Status: the set is **not deployed**. Every contract has offline specs (see [TESTING.md](./TESTING.md)),
 and its compiled trees are pinned in [docs/ZC_STANDARD_REFERENCE.md](./docs/ZC_STANDARD_REFERENCE.md).
@@ -29,17 +30,17 @@ All paths are under `contracts/bonds/`. Names drop the `ZC_Standard_` prefix.
 | `P2P/` | `Order`, `PricedOrder` | A borrower's request for a loan; the fill mints the bond asset |
 | `P2P/` | `SaleOrder` | A fixed-price ask for any token |
 | `P2P/` | `PricedAsk` | An ask priced by an expression the seller picks |
-| `P2P/` | `LendOffer` | A lender's yield bid: fills orders and buys from asks |
-| `lender-scripts/` | `FractionalMint`, `FractionalVault` | Turn one bond unit into N fungible shares |
-| `lender-scripts/` | `DutchAuctionMint`, `DutchAuctionVault` | The same, with a Dutch auction of liquidated collateral |
+| `P2P/` | `LendOffer` | A lender's yield-curve bid: fills orders and buys from asks |
+| `P2P/` | `LotAuction` | A Dutch-priced ask for a whole basket of tokens and ERG |
+| `lender-scripts/` | `FractionalMint`, `FractionalVault` | Turn one bond unit into N fungible shares, paid in kind |
+| `lender-scripts/` | `DutchAuctionMint`, `DutchAuctionVault` | The same, with a Selective or Dutch auction of liquidated collateral; the only shares lend offers buy |
 | `liquidations/` | `MaturityLiquidation` | Liquidation rule: at or after maturity |
 | `liquidations/` | `ERG_SigUSD_Liquidation` | Liquidation rule: an oracle collateral ratio, or maturity |
 | `policies/` | `ERG_SigUSD_CollateralPolicy` | The lend offer's risk rule |
-| `policies/` | `AccruedValue_Pricing`, `YieldAsk_Pricing` | A priced ask's NAV or simple block-yield rule |
-| `policies/` | `NavOrder_Pricing`, `YieldOrder_Pricing` | A priced order's principal rule |
+| `policies/` | `YieldAsk_Pricing` | A priced ask's two-point simple block-yield rule |
+| `policies/` | `YieldOrder_Pricing` | A priced order's two-point principal rule |
 | `policies/` | `ERG_SigUSD_GuardedYield_Pricing` | Yield pricing with a sale collateral guard |
 | `policies/` | `ERG_SigUSD_FillGuard` | The borrower's guard: an order fills only at a minimum collateral ratio |
-| `policies/` | `ERG_SigUSD_GuardedNav_Pricing` | Accrued-value pricing with the seller's guard: an ask sells only at a minimum collateral ratio |
 
 Expressions in `liquidations/` and `policies/` are not box scripts. A host box (the bond, the
 offer, the ask) commits to an expression's hash in a register, and a spender supplies the
@@ -126,18 +127,17 @@ output positions as `Order`. Repayment and all non-price terms remain fixed. Its
 An ERG payment minus that fee equals bond R6(1), and its tokens equal bond R7 exactly.
 For a token loan only the principal token amount may change; the nanoERG beside it stays fixed.
 
-R4-R7 follow `Order`, except principal amounts are floors (and the NAV anchor). R8 is a
+R4-R7 follow `Order`, except principal amounts are floors. R8 is a
 `Coll[Coll[Byte]]` of exactly `(pricing expression hash, fill guard hash or empty bytes)`.
 R9 is a `Coll[Long]` payload of at most 64 values. Fill context var 2 supplies mandatory pricing,
 var 1 the optional collateral guard. They run separately with the order as `SELF`.
 Pricing cannot change repayment, collateral, maturity rules, borrower, liquidation expression or fees.
 Cancel and expiry need neither expression, even if pricing data are malformed.
 
-`NavOrder_Pricing` uses R9 `(reference height, margin bps)`: the reference equals the order's
-creation height and the endpoint is the bond's actual maturity. It supports fixed and on-close
-maturity. An on-close endpoint moves with the fill: waiting raises the required principal, but the
-post-fill duration stays fixed. `YieldOrder_Pricing` uses R9 `(yield bps per 262800 blocks, price margin bps)` and
-calculates principal from the fixed repayment and remaining blocks. The original principal floor
+`YieldOrder_Pricing` uses R9 `(start height, start yield, end height, end yield)`, yields in bps per
+262800 blocks. The yield moves in a straight line between the two heights and holds outside them, so
+an order can rise or fall without updates. It calculates principal from the fixed repayment and
+remaining blocks, exactly, and supports fixed and on-close maturity. The original principal floor
 always applies. See [pricing rules and examples](docs/ZC_STANDARD_PRICING.md).
 
 ### Bond
@@ -235,13 +235,26 @@ unit. As with the bond, the box holding N+1 shares is the shares' state box.
 Share count N is free and decimals are display only. The off-chain rules set N = 100,000,000 with 6
 decimals, 100 shares in all (see "Off-chain rules").
 
-## Dutch auction shares
+## Selective and Dutch auction shares
 
-`DutchAuctionMint` is a fractional mint with three more terms in R8: opening and floor prices in basis
-points of the bond's repayment, and an auction length in blocks. The mint reads the repayment from
-the live bond as a data input. If the bond has settled while the request waited, it reads the bond
-from its serialized bytes (context variable 1), proved by hashing to the settlement's R4. So a batcher
-can always run the mint.
+`DutchAuctionMint` is a fractional mint with five more terms in R8: opening and floor prices in basis
+points of the bond's repayment, an auction length and an expiry in blocks from the auction's start,
+and an **in-kind threshold** in raw units, at least 100. The mint reads the repayment from the live
+bond as a data input. If the bond has settled while the request waited, it reads the bond from its
+serialized bytes (context variable 1), proved by hashing to the settlement's R4. So a batcher can
+always run the mint.
+
+The threshold names two settings of the one contract pair:
+
+- **Selective** (threshold 100, the CLI's default): a liquidated bond's collateral is auctioned only
+  if some item holds fewer than 100 raw units, such as an NFT or a token too thin to split pro rata.
+  Collateral that splits is paid in kind.
+- **Dutch** (threshold `Long` max): liquidated collateral is always auctioned.
+
+The decision is made at the pull, on what the settlement actually holds. The bond allows no new
+collateral token but its repayment token (the auction's currency, which the test leaves out) and
+never lowers an amount, so a borrower cannot flip a vault either way after the fill. The plain
+`FractionalMint` still works, but pays any collateral in kind, so lend offers no longer buy its shares.
 
 `DutchAuctionVault` pays out exactly as the fractional vault when the bond was repaid. When it was
 liquidated, the pull opens an auction that sells the collateral for the bond's repayment asset:
@@ -250,13 +263,16 @@ liquidated, the pull opens an auction that sells the collateral for the bond's r
   times a basis-point figure falling in a straight line from the opening to the floor over the
   length, then staying at the floor. A buyer brings the vault's currency up to the target and takes
   the rest of the collateral. Currency already in the vault counts towards the target.
-- An auction opens only if the vault holds less currency than the floor target. Otherwise holders
-  already have the floor and take the collateral in kind. So a floor of 0 means no auction.
-- Partial claims wait until the auction has run its length. A claim after that takes the unsold
-  collateral in kind and closes the auction. The final claim works in every state.
+- An auction opens only if the vault holds less currency than the floor target, and some lot item is
+  under the threshold. Otherwise holders take the collateral in kind. A floor of 0 means no auction.
+- The lot stays on sale at the floor from the end of the fall until the **expiry**. Partial claims wait
+  for the expiry; a claim after that takes the unsold collateral in kind and closes the auction. The
+  final claim works in every state.
 
 The guarantee to holders: after a liquidation the vault holds at least `floor × repayment` in the
-repayment asset, unless an auction runs its full length with no buyer.
+repayment asset, unless every collateral item splits pro rata (Selective), or an auction reaches its
+expiry with no buyer. Two cases still pay a thin item in kind: when the vault already holds the floor
+target (an auction would have to give the lot away), and when an auction expires unsold.
 
 The vault's state is R6: 0 repaid, 1 auction open, 2 sold or no auction needed, 3 paid out in kind.
 Registers are dense, so the mint places some R6 to carry R7 and R8; nothing reads it before the pull.
@@ -283,32 +299,50 @@ ask that keeps the convention works with existing offers.
 partial fills and a minimum fill. `PricedAsk` does the same with a fixed floor price, plus a pricing
 expression the seller pins in R6; a new pricing method is a new expression, not a new ask.
 
-`AccruedValue_Pricing` prices a live bond, or u of its N shares, at accrued value plus a signed
-margin: `P + (R − P) × (HEIGHT − start) / (maturity − start)`, all read from the bond. It stops at
-maturity and at settlement, because the state box is then no longer a live bond. The price rises
-every block, so a fill pays for the height it lands at.
-
-`YieldAsk_Pricing` instead enforces `paid * N * (B + yield_bps * D) * 10000 >= sold * R * B * (10000 + margin_bps)`,
-where `B = 10000 * 262800` and `D` is remaining blocks. Its R5(4) is a nonnegative reference yield,
-R5(5) the units per bond, and R5(6) the signed price margin with NAV's bounds. The guarded version
-adds R5(7..8) minimum-cover/oracle-age parameters; guarded NAV retains its original R5(6..7). Both price only live bonds, before maturity; they are quoted
-returns conditional on repayment, not collateral valuations or guaranteed returns.
+`YieldAsk_Pricing` prices a live bond, or u of its N shares, at a buyer's simple block yield to
+maturity that moves in a straight line between two points in time. Ask R5 is `(floor numerator,
+floor denominator, minimum fill, expiry, N, start height, start yield, end height, end yield)`; the
+yield at HEIGHT is exactly `Y / L` with `L = end − start` and `Y = y0 × L + (y1 − y0) × (at − start)`,
+`at` being HEIGHT clamped to the two heights. A fill must satisfy `paid × N × (B × L + Y × D) ≥ sold × R × B × L`,
+`B = 10000 × 262800` and D the remaining blocks: exact, with no division. It stops at maturity and at
+settlement, because the state box is then no longer a live bond. Yields are quoted returns
+conditional on repayment, not collateral valuations or guaranteed returns.
 
 Both asks are paid in one asset, compiled in per market. `PricedAsk` retains the former `NavAsk`
-script bytes: it is a generic policy shell, with NAV and yield as alternative expressions.
+script bytes: it is a generic policy shell. NAV pricing and price margins were removed on 2026-11-16;
+a margin was only a different yield, so one number now describes every quote. See
+[docs/ZC_STANDARD_PRICING.md](./docs/ZC_STANDARD_PRICING.md).
+
+### Lot auction
+
+`LotAuction` sells everything in its box whole, to the first buyer, for one currency (compiled in per
+market like the asks). For an ERG currency the lot is the tokens, and the box's nanoERG returns to the
+seller with the payment; for a token currency the lot is the tokens and all the nanoERG, and the box
+may not hold the currency itself. R5 is `(opening, floor, start height, end height, expiry, refund
+fee)`: the price is the opening until the start, falls in a straight line to the floor at the end, and
+holds there until the expiry, when anyone may refund the lot to the seller for the refund fee. The
+price only falls, so a purchase priced now stays valid. Prices are absolute; a client may set them
+from an oracle. It is how a holder paid collateral in kind, by a Selective vault, a Dutch auction past
+its expiry or several bonds at once, gets the repayment asset back without staying online. It does
+not follow the ask convention, so lend offers never buy from it.
 
 ### Lend offer
 
-`LendOffer` holds a lender's capital and buys at a minimum **simple block yield** (normalized over 262800 blocks):
+`LendOffer` holds a lender's capital and buys at a **simple block yield curve** (normalized over
+262800 blocks). R5 holds the offer's fixed terms and then up to 20 points of `(yield bps, blocks left
+to maturity)`, blocks strictly increasing. For a bond with D blocks left the required yield is on the
+straight line between the two points around D, flat beyond the first and last, and never below the
+minimum yield R5(0); with no points R5(0) is the one yield. On a segment of span L the yield is
+exactly `Y / L`, and the test is
 
 ```
-R × 10000 × 262800 ≥ P × (10000 × 262800 + yield_bps × D)
+R × 10000 × 262800 × L ≥ P × (10000 × 262800 × L + Y × D)
 ```
 
-where R is the repayment, P the price, D the blocks left to maturity and 262800 blocks one year at
-2 minutes. For u of N shares, `R × u` is compared against `P × N`. On an ERG offer, P includes the
-batcher fee. The price ceiling rises towards R as maturity nears, so one number follows a bond's
-value with no updates. A lender can ladder offers with different maturity windows.
+where R is the repayment, P the price and 262800 blocks one year at 2 minutes. For u of N shares,
+`R × u` is compared against `P × N`. On an ERG offer, P includes the batcher fee. The curve is keyed
+by blocks left, so it rolls with time: a resting offer keeps bidding the same rate per maturity.
+R5(1) and R5(2) still bound which maturities are bought.
 
 The batcher fee per fill, R5(3), is at least 0.002 ERG, the floor every standard batching fee
 shares. An offer set below it never fills; its owner cancels it, or anyone refunds it after expiry.
@@ -318,11 +352,14 @@ The offer buys from three sources, chosen by context variables:
 1. **A new bond**: it fills an accepted `Order` or `PricedOrder`. The issuing script validates the bond.
 2. **An existing bond unit** from any ask: it verifies the origin from the order's serialized box
    and requires the live bond as a data input.
-3. **Shares** from any ask: it also verifies the mint request's serialized box. Dutch auction shares
-   must also clear the lender's bounds: an auction floor at least R5(9) and a length at most R5(10).
+3. **Shares** from any ask: it also verifies the mint request's serialized box, which must be the
+   Dutch-pair mint (Selective or Dutch; plain fractional shares are not bought), and its auction must
+   clear the lender's bounds: a floor at least R5(9) and an expiry at most R5(10). An R5(10) of 0 buys
+   no shares.
 
-It delivers the unit to the owner, or into a mint request at the script the lender names (standard or
-Dutch), so a batcher mints shares for an offline lender. Bought shares go straight to the owner.
+It delivers the unit to the owner, or into a mint request at the script the lender names (the CLI
+writes Selective or Dutch), so a batcher mints shares for an offline lender. Bought shares go straight
+to the owner.
 
 The **collateral policy** is an expression the offer pins and runs. `ERG_SigUSD_CollateralPolicy`
 requires the bond to carry the oracle liquidation rule, that rule to fire at or above the lender's
@@ -338,7 +375,7 @@ nothing about the collateral's value, so an order left open while the price fall
 a bond that is liquidatable at once, or after a small move, and a liquidation sends all the
 collateral to the lender. The bond's 60-block recollateralize wait counts from its start, so the
 borrower cannot top up in time. An ask on a bond near its line has the same problem the other way:
-a buyer pays accrued value, at most the repayment, then liquidates for all the collateral. The
+a buyer pays at most the repayment, then liquidates for all the collateral. The
 guards let the owner of the resting box set a collateral ratio under which it does not trade.
 
 **Fill guard.** An order's optional R8 names a guard expression; a fill must pass it, run from the
@@ -350,11 +387,11 @@ liquidatable; a higher one buys the borrower room after the fill. Without R8 a f
 The guard binds every fill, a lend offer's included, and the order still cancels and refunds as
 before.
 
-**Sale guard.** `ERG_SigUSD_GuardedNav_Pricing` is `AccruedValue_Pricing` plus the same check on
-the live bond the ask sells, against the seller's minimum R5(6) at an oracle no older than R5(7).
+**Sale guard.** `ERG_SigUSD_GuardedYield_Pricing` is `YieldAsk_Pricing` plus the same check on
+the live bond the ask sells, against the seller's minimum R5(9) at an oracle no older than R5(10).
 While the guard holds the ask still, anyone may liquidate the bond and the seller claims the vault
-with the unit. A margin of -99.99% leaves the ask's fixed floor as the price, so the same
-expression gives a guarded fixed-price ask without another contract.
+with the unit. A yield of 10^15 bps prices next to nothing and leaves the ask's fixed floor as the
+price, so the same expression gives a guarded fixed-price ask without another contract.
 
 Both are compiled per repayment asset and, like the oracle rule, support ERG and SigUSD only. Each
 needs a fresh oracle at the trade, so a guarded box cannot trade while the pool is stale.
@@ -367,10 +404,11 @@ Every box that waits on someone has a way out.
 |---|---|---|
 | Order, PricedOrder | Borrower cancels | From expiry: refund to the borrower for the expiry fee |
 | Lend offer | Owner cancels | From expiry: refund to the owner for the offer's batcher fee |
-| Sale order, NAV ask | Seller cancels | From expiry: refund to the seller for the nanoERG funded above 0.001 ERG |
-| Fractional or Dutch mint request | Owner cancels | The mint itself, for the mint fee, at any time |
+| Sale order, priced ask | Seller cancels | From expiry: refund to the seller for the nanoERG funded above 0.001 ERG |
+| Fractional, Selective or Dutch mint request | Owner cancels | The mint itself, for the mint fee, at any time |
 | Bond | Borrower repays or recollateralizes | Liquidation, paid by the lender's reserve |
-| Bond vault, fractional and Dutch vaults | Holders claim | Pulls, for the pull fee; Dutch auction purchases |
+| Bond vault, fractional, Selective and Dutch vaults | Holders claim | Pulls, for the pull fee; auction purchases |
+| Lot auction | Seller cancels | Purchase at the current price; from expiry, refund to the seller for the refund fee |
 
 Refunds are tagged with the box's id, so an owner that is a contract, which cannot co-sign a cancel,
 can recognise its funds. Nothing sweeps lost shares or a lost circulating unit: their claims stay
@@ -384,7 +422,7 @@ of 7,030,268 and a size of 1,271,009 bytes.
 
 | Transaction | Cost | Bytes |
 |---|---|---|
-| Offer buys shares from a NAV ask (offer, policy, pricing, two serialized boxes, oracle) | 24,521 | 6,251 |
+| Offer buys shares from a priced ask (offer, policy, pricing, two serialized boxes, oracle; measured with the former NAV expression) | 24,521 | 6,251 |
 | Offer fills a new bond, with policy and oracle | 21,655 | 4,258 |
 | Offer buys from a sale order | 20,626 | 5,226 |
 | Dutch vault claim / pull / sale | 18,858 / 18,533 / 16,503 | up to 2,272 |
@@ -407,7 +445,7 @@ input. In brief:
   output already carries it. Any batcher then finds every script in one lookup. Batchers skip boxes
   that do not do this. Variables 64 to 127 are reserved for off-chain data.
 - **Token metadata** (recommended). Short names, `ZCS-Bond-Unit-3fa2c1` for a bond unit and
-  `ZCS-Bond-Shares-3fa2c1` for its shares, with or without a Dutch auction, and compact JSON
+  `ZCS-Bond-Shares-3fa2c1` for its shares, plain, Selective or Dutch, and compact JSON
   descriptions of the bond's terms (and any auction) with a fixed key order. Both are built only from
   chain data, so any client writes the same bytes and readers can flag a mismatch. Shares minted
   through a lend offer omit the bond, which the offer cannot know when it is posted.
@@ -422,8 +460,8 @@ input. In brief:
   and batchers never fill or buy a bond under its own ratio (they liquidate it instead), and a
   fixed-maturity order's default expiry leaves at least half its term.
 - **Batching.** Pack refunds and liquidations into one transaction (the CLI's `pack`), chain fills
-  through continuations in one block, use one published matching order, and price NAV asks 3 blocks
-  ahead.
+  through continuations in one block, use one published matching order, and price yield asks and
+  orders at the most they ask over the next 3 blocks.
 
 ## Limits and assumptions
 
@@ -433,8 +471,8 @@ input. In brief:
 - Liquidation expressions, collateral policies and pricing expressions are commitments, not proofs:
   the parties inspect them.
 - The ERG/SigUSD rules trust the USD oracle pool's identity NFT and value SigUSD at $1.
-- Only live bonds can be bought by an offer or priced by the NAV ask; settled bonds cannot.
-- A share's value in the offer and the NAV ask ignores the fractional vault's own nanoERG.
+- Only live bonds can be bought by an offer or priced by a yield ask; settled bonds cannot.
+- A share's value in the offer and a yield ask ignores the fractional vault's own nanoERG.
 - Storage rent is outside script evaluation and is not modelled.
 - Nothing has run on a live node yet; the offline harness runs the real interpreter.
 
@@ -449,3 +487,20 @@ are new. `LendOffer` now pins both accepted issuing hashes for primary fills and
 checks; its tree/address changes. Existing boxes cannot be upgraded by replacing source files.
 The CLI pins and generated reference include the new set. Validation is offline; new priced paths
 have not been run against a live node. Historical cost figures above predate this extension.
+
+## Liquidity and collateral changes (2026-11-16)
+
+- **Selective and Dutch vaults.** `DutchAuctionMint` and `DutchAuctionVault` gained an auction expiry
+  and an in-kind threshold. Selective (threshold 100) is the CLI's default vault; lend offers buy
+  shares only from this mint pair, bounding its floor and expiry. Plain fractional shares remain
+  claimable but are no longer bought by offers, since a token too thin to split goes to the last
+  claimant.
+- **Lot auction.** New `LotAuction` contract for selling collateral received in kind.
+- **Pricing.** NAV expressions and price margins removed; yield expressions take two points in time.
+  `PricedOrder`, `PricedAsk`, `SaleOrder`, `Order`, the bond and both fractional contracts keep their
+  trees.
+- **Lend offer.** Replaced by the yield-curve offer under the same name. It pins the Dutch mint only.
+  Its tree and address change; existing offer boxes keep their old scripts.
+
+Validation is offline (the real interpreter, by signing); nothing here has run on a live node.
+Cost and size figures above predate this change.

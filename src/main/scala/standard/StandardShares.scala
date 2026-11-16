@@ -10,9 +10,28 @@ import work.lithos.mutations.{Contract, InputUTXO, Token, UTXO}
 
 import scala.util.Try
 
-/** A Dutch auction's terms: basis points of the repayment, and a length in blocks. */
-case class AuctionTerms(openingBps: Long, floorBps: Long, length: Long) {
-  def longs: Seq[Long] = Seq(openingBps, floorBps, length)
+/**
+ * A Dutch-pair vault's auction terms: prices in basis points of the repayment, a length and an expiry in blocks
+ * from the auction's start, and the in-kind threshold: the auction opens only when some lot item holds fewer raw
+ * units than it. `StandardProtocol.SelectiveThreshold` (100) is Selective, `DutchThreshold` (Long max) is Dutch.
+ */
+case class AuctionTerms(openingBps: Long, floorBps: Long, length: Long, expiry: Long, threshold: Long) {
+  def longs: Seq[Long] = Seq(openingBps, floorBps, length, expiry, threshold)
+  def selective: Boolean = threshold != StandardProtocol.DutchThreshold
+  def kind: String = if (selective) "Selective" else "Dutch"
+  def describe: String =
+    (if (!selective) "after a liquidation the collateral is always auctioned"
+     else if (threshold == StandardProtocol.SelectiveThreshold) "after a liquidation the collateral is auctioned " +
+       "only if some item holds fewer than 100 raw units, otherwise holders are paid in kind"
+     else s"after a liquidation the collateral is auctioned only if some item holds fewer than $threshold raw units, " +
+       "otherwise holders are paid in kind") +
+      s"; the auction falls from ${Units.percent(openingBps)} to ${Units.percent(floorBps)} of the repayment over " +
+      s"$length blocks and holds there until $expiry blocks after it opens, when holders may take it in kind"
+}
+
+object AuctionTerms {
+  def fromLongs(s: Seq[Long]): Option[AuctionTerms] =
+    if (s.size == 5) Some(AuctionTerms(s(0), s(1), s(2), s(3), s(4))) else None
 }
 
 /**
@@ -93,10 +112,7 @@ trait StandardShares extends AppBase { self: StandardApp =>
     if (t.shares < 1L || t.shares > 1000000000L) fail("the share count must be 1 to 1000000000")
     if (t.pullFee < MinBatchingFee || t.mintFee < MinBatchingFee) fail(s"the pull and mint fees must each be at least ${Fmt.erg(MinBatchingFee)}")
     val market = assetMarket(asset).getOrElse(fail(s"$assetId was not minted by a standard order"))
-    t.auction.foreach { a =>
-      if (a.floorBps < 0L || a.floorBps > a.openingBps || a.openingBps > 1000000L) fail("the auction needs 0 <= floor <= opening <= 10000%")
-      if (a.length < 1L || a.length > 1000000L) fail("the auction length must be 1 to 1000000 blocks")
-    }
+    t.auction.foreach(checkAuction)
     val script = if (t.auction.isDefined) protocol.market(market).dutchMint else protocol.contracts.fractionalMint
     // zcs1 names the bond in the shares' metadata when the writer knows it, as here.
     val standard = StandardMetadata.shares(market, t.auction, bondFacts(asset))
@@ -107,11 +123,18 @@ trait StandardShares extends AppBase { self: StandardApp =>
     prepare(s"Fractionalize $assetId", plan(Seq.empty, Seq(request)), Seq(
       s"${t.shares} shares of bond $asset ($market), named '${metadata(0)}' with ${metadata(2)} decimals") ++
       t.departures(standard) ++ Seq(
-      t.auction.fold("no auction: after a liquidation, holders are paid in kind")(a =>
-        s"Dutch auction after a liquidation: from ${Units.percent(a.openingBps)} down to ${Units.percent(a.floorBps)} " +
-          s"of the repayment over ${a.length} blocks"),
+      t.auction.fold("WARNING: a plain fractional vault: after a liquidation holders are paid in kind, and a token " +
+        "too thin to split goes to the last claimant. Lend offers do not buy these shares")(a => s"${a.kind}: ${a.describe}"),
       s"fees committed: mint ${Fmt.erg(t.mintFee)}, pull ${Fmt.erg(t.pullFee)}",
       "Output 0 is the request; any batcher can mint it with `mint-shares <its box id>`."))
+  }
+
+  /** The Dutch mint's own bounds on auction terms, checked before a request commits to them. */
+  private[standard] def checkAuction(a: AuctionTerms): Unit = {
+    if (a.floorBps < 0L || a.floorBps > a.openingBps || a.openingBps > 1000000L) fail("the auction needs 0 <= floor <= opening <= 10000%")
+    if (a.length < 1L || a.length > 1000000L) fail("the auction length must be 1 to 1000000 blocks")
+    if (a.expiry < a.length || a.expiry > 1000000L) fail("the auction expiry must be from its length to 1000000 blocks")
+    if (a.threshold < SelectiveThreshold) fail(s"the in-kind threshold must be at least $SelectiveThreshold raw units")
   }
 
   /**
@@ -133,7 +156,7 @@ trait StandardShares extends AppBase { self: StandardApp =>
   /** How a share request's committed count and metadata depart from zcs1. Empty when they match. */
   def requestMetadataIssues(req: StdShareRequest): Seq[String] = {
     val market = req.dutch.orElse(assetMarket(req.bondAsset))
-    val auction = req.dutch.map(_ => AuctionTerms(req.auction(0), req.auction(1), req.auction(2)))
+    val auction = req.dutch.flatMap(_ => AuctionTerms.fromLongs(req.auction))
     val count = if (req.shares != StandardMetadata.ShareCount)
       Seq(s"its share count is ${req.shares}, not zcs1's ${StandardMetadata.ShareCount}") else Seq.empty
     count ++ market.fold(Seq("its bond asset was not minted by a standard order")) { m =>
@@ -183,7 +206,8 @@ trait StandardShares extends AppBase { self: StandardApp =>
 
   /**
    * Pull a settled bond's vault into the share vault holding its unit; all 3 bond units burn. A liquidated
-   * bond's lot opens a Dutch auction if the vault holds less currency than the floor. Earns the pull fee.
+   * bond's lot opens a Dutch auction if the vault holds less currency than the floor and some lot item is under
+   * the vault's in-kind threshold. Earns the pull fee.
    */
   def pull(vaultId: String): Prepared = {
     val v = protocol.asShareVault(unspent(vaultId)).getOrElse(fail(s"$vaultId is not a share vault"))
@@ -200,15 +224,22 @@ trait StandardShares extends AppBase { self: StandardApp =>
       else {
         val currency = v.currencyToken
         val held = currency.fold(value)(id => source.proceeds.filter(_.id == id).map(_.amount).sum)
-        val hasLot = currency.isDefined || source.proceeds.nonEmpty
+        val lotTokens = source.proceeds.filterNot(t => currency.contains(t.id))
+        val lotErg = if (currency.isEmpty) 0L else value - MinBox
+        val hasLot = lotTokens.nonEmpty || lotErg > 0L
         val short = BigInt(held) * 10000 < BigInt(v.auction(0)) * v.auction(2)
-        val state: Byte = if (!source.liquidated) 0 else if (hasLot && short) 1 else 2
+        val thin = lotTokens.exists(_.amount < v.threshold) || (currency.isDefined && lotErg < v.threshold)
+        val state: Byte = if (!source.liquidated) 0 else if (hasLot && short && thin) 1 else 2
         val began = if (state == 1) height.toLong else 0L
-        (supply ++ Seq(ErgoValue.of(state), longsValue(v.auction.updated(4, began): _*), bytesValue(v.currency.get)),
+        (supply ++ Seq(ErgoValue.of(state), longsValue(v.auction.updated(6, began): _*), bytesValue(v.currency.get)),
           state match {
             case 0 => "repaid"
-            case 1 => s"liquidated: a Dutch auction of the lot opens at height $began"
-            case _ => "liquidated: the vault already holds the floor, or there is no lot; holders are paid in kind"
+            case 1 => s"liquidated: a Dutch auction of the lot opens at height $began; holders may take it in kind " +
+              s"from height ${began + v.auctionExpiry} if it is unsold"
+            case _ if !hasLot => "liquidated: there is no lot to sell; holders are paid in kind"
+            case _ if !short => "liquidated: the vault already holds the floor; holders are paid in kind"
+            case _ => s"liquidated: every lot item holds at least ${v.threshold} raw units, so it splits pro rata; " +
+              "holders are paid in kind (`sell-lot` auctions what you claim)"
           })
       }
     val next = UTXO(Contract(v.box.input.getErgoTree), value, tokens, regs)
@@ -219,7 +250,7 @@ trait StandardShares extends AppBase { self: StandardApp =>
 
   /** The least currency a Dutch vault must hold after a sale at `at`, in its currency's raw units. */
   def lotTarget(v: StdShareVault, at: Long): Long = {
-    val Seq(repayment, opening, floor, length, began) = v.auction
+    val Seq(repayment, opening, floor, length, _, _, began) = v.auction
     val since = math.min(math.max(at - began, 0L), length)
     val num = BigInt(repayment) * (BigInt(opening) * length - BigInt(opening - floor) * since)
     val den = BigInt(10000) * length
@@ -257,7 +288,7 @@ trait StandardShares extends AppBase { self: StandardApp =>
   /**
    * Claim with shares this wallet holds. Holding every outstanding share is a final claim: the vault and its
    * reserve go too, before the pull taking the bond unit itself. Otherwise a partial claim pays the burned
-   * fraction of each asset, rounded down, and waits for a Dutch auction to run its length.
+   * fraction of each asset, rounded down, and waits for a Dutch auction's expiry.
    */
   def claimShares(shareId: String, amount: Option[Long]): Prepared = {
     val id = Try(ErgoId.create(shareId)).getOrElse(fail(s"$shareId is not a token id"))
@@ -277,8 +308,8 @@ trait StandardShares extends AppBase { self: StandardApp =>
       if (burned < 1L || burned > held) fail(s"claim 1 to $held shares")
       if (burned >= v.outstanding) fail(s"$burned is every outstanding share: that is a final claim, which needs them all")
       if (v.holding) fail("the bond has not settled into the vault yet: pull it first, or make a final claim with every share")
-      val ended = height.toLong >= v.auction.lift(4).getOrElse(0L) + v.auction.lift(3).getOrElse(0L)
-      if (v.auctionOpen && !ended) fail(s"the auction runs until height ${v.auction(4) + v.auction(3)}; claims wait for it")
+      if (v.auctionOpen && height.toLong < v.claimableFrom)
+        fail(s"the auction holds until its expiry at height ${v.claimableFrom}; claims wait for it")
       def part(n: Long): Long = (BigInt(n) * burned / v.outstanding).toLong
       val paidErg = part(v.box.value)
       // A token's part can round to zero, and a token box cannot hold zero of one: drop it before building.

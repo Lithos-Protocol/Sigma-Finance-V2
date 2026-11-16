@@ -165,6 +165,7 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
         case BoxKind.Order => protocol.asOrder(b).map(_.expiry)
         case BoxKind.Offer => protocol.asOffer(b).map(_.expiry)
         case BoxKind.Ask => protocol.asAsk(b).map(_.expiry)
+        case BoxKind.Lot => protocol.asLot(b).map(_.expiry)
       }
     }
     def bond(id: String): Option[StdBond] = box(id).flatMap(protocol.asBond)
@@ -291,6 +292,7 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
     case BoxKind.Order => "order"
     case BoxKind.Offer => "offer"
     case BoxKind.Ask => "ask"
+    case BoxKind.Lot => "lot"
   }
 
   /** The gate's verdict, or None when it is open. A height counts once the chain is at it: the node wallet signs there. */

@@ -19,7 +19,7 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
   private def offerSpec(w: World, capital: Long = erg("20")): OfferSpec =
     OfferSpec(Market.Erg, capital, 0L, yieldBps = 1000L, minBlocks = 1L, maxBlocks = 262800L, batcherFee = fee,
       feeReserve = reserve, floorBps = 13000L, maxAge = 30L, expiry = w.h + 500L, minPrice = 1L,
-      auctionFloorBps = 0L, auctionLength = 0L, delivery = None)
+      auctionFloorBps = 0L, auctionExpiry = 0L, delivery = None)
 
   private val oracleLoan = (w: World, tokens: Long) =>
     loan(collateral = Seq(Token(collateralToken, tokens)), rule = OracleChoice(15000L, 60L))(w)
@@ -148,7 +148,7 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
       w.fund(e, erg("20"))
       val bond = w.liveBond(loan(collateralErg = erg("1"), collateral = Seq(Token(SigUsd, 1000L)),
         rule = OracleChoice(15000L, 30L))(w), l)
-      w.run(l, w.app(l).fractionalize(bond.asset.toString, terms(100L, Some(AuctionTerms(15000L, 9000L, 500L)))))
+      w.run(l, w.app(l).fractionalize(bond.asset.toString, terms(100L, Some(AuctionTerms(15000L, 9000L, 500L, 500L, StandardProtocol.DutchThreshold)))))
       val req = w.app(e).shareRequests().loneElement
       req.dutch shouldBe Some(Market.Erg)
       w.run(e, w.app(e).mintShares(req.box.id.toString))
@@ -158,8 +158,8 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
       w.run(e, w.app(e).pull(w.app(e).shareVault(req.shareId).get.box.id.toString))
       val open = w.app(e).shareVault(req.shareId).get
       open.auctionOpen shouldBe true
-      open.auction(4) shouldBe w.h.toLong
-      refused(w.app(l).claimShares(req.shareId.toString, Some(10L))) should include("auction runs until")
+      open.auctionStart shouldBe w.h.toLong
+      refused(w.app(l).claimShares(req.shareId.toString, Some(10L))) should include("holds until its expiry")
 
       // 150% of the 6 ERG repayment at the start of the auction.
       w.app(e).lotTarget(open, w.h.toLong) shouldBe erg("9")
@@ -185,7 +185,7 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
       // 2 ERG and 50 unpriced tokens against a 7.00 SigUSD repayment, liquidated below 150%.
       val bond = w.liveBond(loan(Market.SigUsd, principal = 600L, repayment = 700L, collateralErg = erg("2"),
         collateral = Seq(Token(collateralToken, 50L)), rule = OracleChoice(15000L, 30L))(w), l)
-      w.run(l, w.app(l).fractionalize(bond.asset.toString, terms(100L, Some(AuctionTerms(15000L, 9000L, 500L)))))
+      w.run(l, w.app(l).fractionalize(bond.asset.toString, terms(100L, Some(AuctionTerms(15000L, 9000L, 500L, 500L, StandardProtocol.DutchThreshold)))))
       val req = w.app(e).shareRequests().loneElement
       req.dutch shouldBe Some(Market.SigUsd)
       w.run(e, w.app(e).mintShares(req.box.id.toString))
@@ -223,7 +223,7 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
 
   // ═══ ASKS ═════════════════════════════════════════════════════════════════
 
-  property("asks: a bond unit at a fixed price and shares at NAV, bought by wallets; the seller cancels; an expired ask is refunded") {
+  property("asks: a bond unit at a fixed price and shares at a yield, bought by wallets; the seller cancels; an expired ask is refunded") {
     withCtx { ctx =>
       val w = new World(ctx)
       val (b, l, e, o) = (borrower(ctx), lender(ctx), executor(ctx), other(ctx))
@@ -241,13 +241,13 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
       w.tokens(e).get(bond.asset) shouldBe Some(1L)
       w.nano(l) shouldBe l0 + erg("5.5")
 
-      // The new holder splits the unit and sells 60 of 100 shares at accrued value.
+      // The new holder splits the unit and sells 60 of 100 shares at a yield.
       w.run(e, w.app(e).fractionalize(bond.asset.toString, terms(100L)))
       w.run(e, w.app(e).mintShares(w.app(e).shareRequests().loneElement.box.id.toString))
       val shareId = w.app(e).shareVaults().loneElement.shareId
-      refused(w.app(e).sell(shareId.toString, 60L, Market.SigUsd, NavPrice(0L, None), Some(1L), w.h + 100L, 0L)) should
+      refused(w.app(e).sell(shareId.toString, 60L, Market.SigUsd, YieldPrice(100000L), Some(1L), w.h + 100L, 0L)) should
         include("use --market ERG")
-      w.run(e, w.app(e).sell(shareId.toString, 60L, Market.Erg, NavPrice(0L, None), Some(1L), w.h + 100L, erg("0.002")))
+      w.run(e, w.app(e).sell(shareId.toString, 60L, Market.Erg, YieldPrice(100000L), Some(1L), w.h + 100L, erg("0.002")))
       val nav = w.app(l).asks().loneElement
       nav.priced shouldBe true
       nav.wholeUnits shouldBe 100L
@@ -321,7 +321,7 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
     }
   }
 
-  property("lend offer: buys shares from a NAV ask into its owner's wallet, and an expired offer is refunded") {
+  property("lend offer: buys Selective shares from a yield ask into its owner's wallet, and an expired offer is refunded") {
     withCtx { ctx =>
       val w = new World(ctx)
       val (b, l, e, o) = (borrower(ctx), lender(ctx), executor(ctx), other(ctx))
@@ -331,11 +331,17 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
       w.fund(o, erg("30"))
       w.oracle(500000000L, w.h)
       val bond = w.liveBond(oracleLoan(w, 100L), l)
-      w.run(l, w.app(l).fractionalize(bond.asset.toString, terms(100L)))
+      w.run(l, w.app(l).fractionalize(bond.asset.toString,
+        terms(100L, Some(AuctionTerms(15000L, 8000L, 720L, 2160L, StandardProtocol.SelectiveThreshold)))))
       w.run(e, w.app(e).mintShares(w.app(e).shareRequests().loneElement.box.id.toString))
       val shareId = w.app(e).shareVaults().loneElement.shareId
-      w.run(l, w.app(l).sell(shareId.toString, 60L, Market.Erg, NavPrice(0L, None), Some(1L), w.h + 100L, erg("0.002")))
+      w.run(l, w.app(l).sell(shareId.toString, 60L, Market.Erg, YieldPrice(100000L), Some(1L), w.h + 100L, erg("0.002")))
+      // An offer buying no shares at all refuses them; one accepting a 2160-block expiry buys.
       w.run(o, w.app(o).createOffer(offerSpec(w)))
+      refused(w.app(e).matchAsk(w.app(e).offers().loneElement.box.id.toString, w.app(e).asks().loneElement.box.id.toString,
+        Some(40L))) should include("buys no shares")
+      w.run(o, w.app(o).cancelOffer(w.app(e).offers().loneElement.box.id.toString))
+      w.run(o, w.app(o).createOffer(offerSpec(w).copy(auctionExpiry = 2160L)))
 
       val ask = w.app(e).asks().loneElement
       w.run(e, w.app(e).matchAsk(w.app(e).offers().loneElement.box.id.toString, ask.box.id.toString, Some(40L)))
@@ -353,7 +359,7 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
     }
   }
 
-  property("lend offer: buys Dutch shares only when their auction clears its floor and length bounds") {
+  property("lend offer: buys Dutch shares only when their auction clears its floor and expiry bounds") {
     withCtx { ctx =>
       val w = new World(ctx)
       val (b, l, e, o) = (borrower(ctx), lender(ctx), executor(ctx), other(ctx))
@@ -362,24 +368,24 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
       w.fund(e, erg("1"))
       w.fund(o, erg("90"))
       w.oracle(500000000L, w.h)
-      // Shares whose auction falls from 150% to a 90% floor over 500 blocks, 60 of them for sale at NAV.
+      // Shares whose auction falls from 150% to a 90% floor over 500 blocks, 60 of them for sale at a yield.
       val bond = w.liveBond(oracleLoan(w, 100L), l)
-      w.run(l, w.app(l).fractionalize(bond.asset.toString, terms(100L, Some(AuctionTerms(15000L, 9000L, 500L)))))
+      w.run(l, w.app(l).fractionalize(bond.asset.toString, terms(100L, Some(AuctionTerms(15000L, 9000L, 500L, 500L, StandardProtocol.DutchThreshold)))))
       w.run(e, w.app(e).mintShares(w.app(e).shareRequests().loneElement.box.id.toString))
       val shareId = w.app(e).shareVaults().loneElement.shareId
-      w.run(l, w.app(l).sell(shareId.toString, 60L, Market.Erg, NavPrice(0L, None), Some(1L), w.h + 100L, erg("0.002")))
+      w.run(l, w.app(l).sell(shareId.toString, 60L, Market.Erg, YieldPrice(100000L), Some(1L), w.h + 100L, erg("0.002")))
       val ask = w.app(e).asks().loneElement
 
-      // Three offers: one buys no Dutch shares, one wants a 95% floor, one accepts 80% over at most 1000 blocks.
+      // Three offers: one buys no shares, one wants a 95% floor, one accepts 80% with an expiry of at most 1000 blocks.
       Seq((0L, 0L), (9500L, 1000L), (8000L, 1000L)).foreach { case (floor, length) =>
-        w.run(o, w.app(o).createOffer(offerSpec(w).copy(auctionFloorBps = floor, auctionLength = length)))
+        w.run(o, w.app(o).createOffer(offerSpec(w).copy(auctionFloorBps = floor, auctionExpiry = length)))
       }
       def offerWith(floor: Long, length: Long): String =
         w.app(e).offers().find(x => x.terms(9) == floor && x.terms(10) == length).get.box.id.toString
-      refused(w.app(e).matchAsk(offerWith(0L, 0L), ask.box.id.toString, Some(40L))) should include("buys no Dutch auction shares")
+      refused(w.app(e).matchAsk(offerWith(0L, 0L), ask.box.id.toString, Some(40L))) should include("buys no shares")
       refused(w.app(e).matchAsk(offerWith(9500L, 1000L), ask.box.id.toString, Some(40L))) should include("outside the offer's bounds")
-      // A shorter length bound than the auction's is refused too.
-      w.run(o, w.app(o).createOffer(offerSpec(w).copy(auctionFloorBps = 8000L, auctionLength = 499L)))
+      // A shorter expiry bound than the auction's is refused too.
+      w.run(o, w.app(o).createOffer(offerSpec(w).copy(auctionFloorBps = 8000L, auctionExpiry = 499L)))
       refused(w.app(e).matchAsk(offerWith(8000L, 499L), ask.box.id.toString, Some(40L))) should include("outside the offer's bounds")
 
       w.run(e, w.app(e).matchAsk(offerWith(8000L, 1000L), ask.box.id.toString, Some(40L)))
@@ -396,7 +402,7 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
       w.fund(e, erg("1"))
       w.fund(o, erg("5"), Token(SigUsd, 1000L))
       w.oracle(500000000L, w.h)
-      val auction = Some(AuctionTerms(15000L, 9000L, 500L))
+      val auction = Some(AuctionTerms(15000L, 9000L, 500L, 500L, StandardProtocol.DutchThreshold))
       w.run(o, w.app(o).createOffer(offerSpec(w).copy(market = Market.SigUsd, capital = 1000L, fees = erg("0.5"),
         delivery = Some(OfferDelivery(terms(100L, auction))))))
       w.run(b, w.app(b).createOrder(loan(Market.SigUsd, principal = 600L, repayment = 700L,

@@ -20,8 +20,10 @@ class ZcStandardDutchAuctionSpec extends AnyPropSpec with ZcStandardSpecBase {
   private val shares: Long = 1000L
   private val metadata: Seq[String] = Seq("Auction shares", "Shares of one bond", "0")
 
-  private case class Auction(opening: Long, floor: Long, length: Long) {
-    def longs: Seq[Long] = Seq(opening, floor, length)
+  /** Auction terms; the expiry defaults to the length, and the threshold to Dutch's (always auction). */
+  private case class Auction(opening: Long, floor: Long, length: Long, expiry: Long = -1L, threshold: Long = Long.MaxValue) {
+    def until: Long = if (expiry < 0L) length else expiry
+    def longs: Seq[Long] = Seq(opening, floor, length, until, threshold)
   }
 
   /**
@@ -103,11 +105,15 @@ class ZcStandardDutchAuctionSpec extends AnyPropSpec with ZcStandardSpecBase {
 
   property("mint: the auction terms are bounded") {
     withCtx { ctx =>
-      Seq(Auction(1000000L, 0L, 1000000L), Auction(10000L, 10000L, 1L)).foreach { a =>
+      Seq(Auction(1000000L, 0L, 1000000L), Auction(10000L, 10000L, 1L),
+        Auction(10000L, 10000L, 1L, expiry = 1000000L, threshold = 100L)).foreach { a =>
         accepts(executor(ctx), mintTx(wrap(ctx, a = a)))
       }
       Seq(Auction(10000L, 10001L, 500L), Auction(1000001L, 10000L, 500L), Auction(15000L, 11000L, 0L),
-        Auction(15000L, 11000L, 1000001L), Auction(15000L, -1L, 500L)).foreach { a =>
+        Auction(15000L, 11000L, 1000001L), Auction(15000L, -1L, 500L),
+        // The expiry runs from the length to 1000000 blocks; the in-kind threshold is at least 100.
+        Auction(15000L, 11000L, 500L, expiry = 499L), Auction(15000L, 11000L, 500L, expiry = 1000001L),
+        Auction(15000L, 11000L, 500L, threshold = 99L)).foreach { a =>
         rejectsAtSigning(executor(ctx), mintTx(wrap(ctx, a = a)))
       }
     }
@@ -118,9 +124,11 @@ class ZcStandardDutchAuctionSpec extends AnyPropSpec with ZcStandardSpecBase {
       val w = wrap(ctx)
       val vault = vaultBox(w)
       accepts(executor(ctx), mintTx(w, vault = vault))
-      Seq(vault.withRegNum(7, longsValue(w.f.data(0) - 1L, 20000L, 15000L, 500L, 0L)),
-        vault.withRegNum(7, longsValue(w.f.data(0), 20000L, 15000L, 500L, 1L)),
-        vault.withRegNum(7, longsValue(w.f.data(0), 20000L, 14999L, 500L, 0L)),
+      Seq(vault.withRegNum(7, longsValue(w.f.data(0) - 1L, 20000L, 15000L, 500L, 500L, Long.MaxValue, 0L)),
+        vault.withRegNum(7, longsValue(w.f.data(0), 20000L, 15000L, 500L, 500L, Long.MaxValue, 1L)),
+        vault.withRegNum(7, longsValue(w.f.data(0), 20000L, 14999L, 500L, 500L, Long.MaxValue, 0L)),
+        vault.withRegNum(7, longsValue(w.f.data(0), 20000L, 15000L, 500L, 501L, Long.MaxValue, 0L)),
+        vault.withRegNum(7, longsValue(w.f.data(0), 20000L, 15000L, 500L, 500L, 100L, 0L)),
         vault.withRegNum(8, bytesValue(SigUSD.getBytes)),
         vault.withRegNum(5, longsValue(shares, shares - 1L, pullFee)),
         vault.setContract(scripts(ctx).fractionalVault)).foreach { bad =>
@@ -210,7 +218,8 @@ class ZcStandardDutchAuctionSpec extends AnyPropSpec with ZcStandardSpecBase {
         rejectsAtSigning(executor(ctx), pullTx(l, proceeds, pulledBox(l, proceeds, 2.toByte, 0L)))
         // The auction terms ride along unchanged.
         rejectsAtSigning(executor(ctx), pullTx(l, proceeds,
-          pulledBox(l, proceeds, 1.toByte, l.height).withRegNum(7, longsValue(l.w.f.data(0), 20000L, 1L, 500L, l.height))))
+          pulledBox(l, proceeds, 1.toByte, l.height).withRegNum(7, longsValue(l.w.f.data(0), 20000L, 1L, 500L, 500L,
+            Long.MaxValue, l.height))))
       }
     }
   }
@@ -238,7 +247,7 @@ class ZcStandardDutchAuctionSpec extends AnyPropSpec with ZcStandardSpecBase {
     }
   }
 
-  property("pull: nothing to sell, or a floor of 0, opens no auction") {
+  property("pull: nothing to sell, a floor of 0, or a Selective lot that splits pro rata, opens no auction") {
     withCtx { ctx =>
       val bare = minted(ctx, collateral = Seq.empty)
       val src = liquidated(bare.w)
@@ -248,6 +257,15 @@ class ZcStandardDutchAuctionSpec extends AnyPropSpec with ZcStandardSpecBase {
       val src0 = liquidated(zero.w)
       accepts(executor(ctx), pullTx(zero, src0, pulledBox(zero, src0, 2.toByte, 0L)))
       rejectsAtSigning(executor(ctx), pullTx(zero, src0, pulledBox(zero, src0, 1.toByte, zero.height)))
+      // Selective (threshold 100): a token of 100 raw units splits and is paid in kind; one of 99 is auctioned.
+      Seq(100L -> 2.toByte, 99L -> 1.toByte).foreach { case (units, state) =>
+        val s = minted(ctx, a = Auction(20000L, 15000L, 500L, threshold = 100L), collateral = Seq(Token(collateralToken, units)))
+        val srcS = liquidated(s.w)
+        def startOf(st: Byte): Long = if (st == 1.toByte) s.height.toLong else 0L
+        val wrong: Byte = if (state == 1.toByte) 2.toByte else 1.toByte
+        accepts(executor(ctx), pullTx(s, srcS, pulledBox(s, srcS, state, startOf(state))))
+        rejectsAtSigning(executor(ctx), pullTx(s, srcS, pulledBox(s, srcS, wrong, startOf(wrong))))
+      }
     }
   }
 
@@ -258,8 +276,8 @@ class ZcStandardDutchAuctionSpec extends AnyPropSpec with ZcStandardSpecBase {
     def kind: Kind = m.w.kind
   }
 
-  private def open(ctx: BlockchainContext, kind: Kind): Open = {
-    val m = minted(ctx, kind)
+  private def open(ctx: BlockchainContext, kind: Kind, a: Auction = null): Open = {
+    val m = minted(ctx, kind, a)
     val src = liquidated(m.w)
     val tx = accepts(executor(ctx), pullTx(m, src, pulledBox(m, src, 1.toByte, m.height.toLong)))
     Open(m, spendOutput(tx, 0), m.height)
@@ -348,11 +366,15 @@ class ZcStandardDutchAuctionSpec extends AnyPropSpec with ZcStandardSpecBase {
       Seq(tagged(lenderTree(w.ctx), vault.value, vault.id, vault.tokens.drop(1))), w.f.holder.getAddress,
       burn = Seq(Token(w.shareId, 2L * shares + 1L)))
 
-  property("claims: an open auction blocks partial claims for its length, then a claim takes the lot in kind and closes it") {
+  property("claims: an open auction blocks partial claims until its expiry, then a claim takes the lot in kind and closes it") {
     withCtx { ctx =>
-      val o = open(ctx, ErgBond)
+      // Falls for 500 blocks, then holds at the floor until 700.
+      val o = open(ctx, ErgBond, Auction(20000L, 15000L, 500L, expiry = 700L))
       val w = o.m.w
-      val end = o.start + w.a.length.toInt
+      val end = o.start + 700
+      // Past the fall the lot is still for sale at the floor, and claims still wait.
+      accepts(executor(ctx), saleTx(o, soldBox(o, target(o, 600L)), 600L))
+      rejectsAtSigning(w.f.holder, partialTx(w, o.vault, o.m.holder, 250L, shares, 3.toByte, o.start + 600))
       rejectsAtSigning(w.f.holder, partialTx(w, o.vault, o.m.holder, 250L, shares, 3.toByte, end - 1))
       rejectsAtSigning(w.f.holder, partialTx(w, o.vault, o.m.holder, 250L, shares, 1.toByte, end))
       val tx = accepts(w.f.holder, partialTx(w, o.vault, o.m.holder, 250L, shares, 3.toByte, end))
@@ -360,7 +382,7 @@ class ZcStandardDutchAuctionSpec extends AnyPropSpec with ZcStandardSpecBase {
       // In kind for good: the rest of the lot can no longer be bought.
       val after = spendOutput(tx, 1)
       rejectsAtSigning(executor(ctx), saleTx(o.copy(vault = after), soldBox(o.copy(vault = after), 20000000000L),
-        w.a.length + 1L, vault = after))
+        701L, vault = after))
     }
   }
 

@@ -5,21 +5,21 @@ Sigma Finance V2 is an open standard for decentralized P2P contracts on Ergo.
 ## SigmaBonds: the ZC Standard
 
 [SigmaBonds.MD](./SigmaBonds.MD) describes the ZC Standard: P2P zero-coupon bonds on any collateral,
-with a tradeable bond asset, pluggable liquidation, fractional shares, a Dutch auction for liquidated
-collateral, and an exchange where a lender's yield bid buys new and existing bonds. It is not
-deployed. Every contract has offline specs, and the CLI below builds all of it: the bond lifecycle,
-fractional and Dutch auction shares, asks and lend offers, plus a batch scan for the work that pays
-whoever runs it. [docs/ZC_STANDARD_OFFCHAIN.md](./docs/ZC_STANDARD_OFFCHAIN.md) sets the off-chain rules
+with a tradeable bond asset, pluggable liquidation, fractional shares with a Selective or Dutch auction
+for liquidated collateral, a lot auction for selling collateral paid in kind, and an exchange where a
+lender's yield-curve bid buys new and existing bonds. It is not deployed. Every contract has offline
+specs, and the CLI below builds all of it: the bond lifecycle, Selective and Dutch shares, asks, lots
+and lend offers, plus a batch scan for the work that pays whoever runs it. [docs/ZC_STANDARD_OFFCHAIN.md](./docs/ZC_STANDARD_OFFCHAIN.md) sets the off-chain rules
 that clients and batchers follow: script disclosure, token names and descriptions, share count, the
 maturity grid, batching and defaults.
 
 | Folder (`contracts/bonds/`) | Contracts (`ZC_Standard_*`) |
 |---|---|
 | `core/` | `Bond`, `BondVault`: the bond and the vault its settlement pays |
-| `P2P/` | `Order`, `PricedOrder`, `LendOffer`, `SaleOrder`, `PricedAsk`: borrowing, lending and trading |
-| `lender-scripts/` | `FractionalMint`, `FractionalVault`, `DutchAuctionMint`, `DutchAuctionVault`: shares |
+| `P2P/` | `Order`, `PricedOrder`, `LendOffer`, `SaleOrder`, `PricedAsk`, `LotAuction`: borrowing, lending and trading |
+| `lender-scripts/` | `FractionalMint`, `FractionalVault`, `DutchAuctionMint`, `DutchAuctionVault` (Selective or Dutch): shares |
 | `liquidations/` | `MaturityLiquidation`, `ERG_SigUSD_Liquidation`: when a bond may be liquidated |
-| `policies/` | `ERG_SigUSD_CollateralPolicy`, NAV/yield pricing and collateral guards: risk and price policies |
+| `policies/` | `ERG_SigUSD_CollateralPolicy`, two-point yield pricing and collateral guards: risk and price policies |
 
 How it works, in brief:
 
@@ -70,44 +70,51 @@ sbt "runMain ksingh.sigmabonds.app.SigmaFiCli help"
   asset was really minted by a standard order), `claims`
 - Borrower: `create-order` (ERG or SigUSD market; maturity or oracle-ratio liquidation; a fixed
   maturity at least 21,600 blocks out snaps to the grid unless `--exact-maturity`; an oracle order
-  accepts optional `--nav [--margin <percent>]` or `--yield <percent> [--margin <percent>]` to create a `PricedOrder` that
-  prices principal while keeping repayment fixed (both fixed and on-close maturity); an oracle order
+  accepts optional `--yield <percent> [--end-yield <percent>]` to create a `PricedOrder` that prices
+  principal at a simple yield, moving in a straight line to `--end-yield` by the order's expiry, while
+  keeping repayment fixed (both fixed and on-close maturity); an oracle order
   carries a fill guard that its contract enforces, at `--ratio` or `--fill-ratio`, unless
   `--no-fill-guard`), `cancel-order`, `repay [--from-collateral]`, `recollateralize`
 - Lender: `fill-order [--fee-reserve <ERG>]` (CLI minimum and default 0.05 ERG), `claim`. A fill or
   purchase that would leave a bond under its own oracle ratio is refused unless `--allow-liquidatable`
 - Anyone: `liquidate`, which keeps the bonds' fee reserves, `refund-order`, which returns an expired
-  order to its borrower for its expiry fee, and `pack`, which refunds expired orders, offers and asks
-  and liquidates bonds in one transaction with one miner fee
-- Shares: `shares`, `fractionalize` (fractional, or `--dutch` with an auction of a liquidated bond's
-  collateral), `mint-shares` and `pull` (anyone, for the fees the owner committed), `buy-lot` (anyone,
-  at an open auction's current price), `claim-shares`, `cancel-share-request`
-- Asks: `asks` (prices also as a percentage of face), `sell` (a fixed `--price`, or `--nav` at a bond's
-  accrued value plus a margin, or `--yield <percent>` at a simple block yield; `--price` can also set a
-  floor on either expression-priced ask; both policies accept signed `--margin` on the calculated
-  price, which changes the resulting yield; `--min-cover` adds a sale guard that stops sales while the bond's
-  collateral is thin), `buy`, `cancel-ask`, `refund-ask`
-- Lend offers: `offers`, `create-offer` (a block-yield limit, a maturity window, a collateral floor, and
-  optionally `--deliver-shares` into fractional or Dutch shares), `cancel-offer`, `refund-offer`, and
+  order to its borrower for its expiry fee, and `pack`, which refunds expired orders, offers, asks and
+  lots and liquidates bonds in one transaction with one miner fee
+- Shares: `shares`, `fractionalize` (Selective by default: a liquidated bond's collateral is auctioned
+  only if some item is too thin to split, under 100 raw units; `--vault dutch` always auctions; the
+  auction's `--auction-opening` and `--auction-floor` are yours to set, and it holds at the floor until
+  `--auction-expiry`), `mint-shares` and `pull` (anyone, for the fees the owner committed), `buy-lot`
+  (anyone, at an open auction's current price), `claim-shares`, `cancel-share-request`
+- Lots: `lots`, `sell-lot` (a basket of tokens, and in a token market ERG too, sold whole at a price
+  falling from `--opening` to `--floor` and then held), `take-lot`, `cancel-lot`, `refund-lot`
+- Asks: `asks` (prices also as a percentage of face), `sell` (a fixed `--price`, or `--yield <percent>
+  [--end-yield <percent>]` at a simple block yield that can move in a straight line by the ask's expiry;
+  `--price` can also set a floor on a yield ask; `--min-cover` adds a sale guard that stops sales while
+  the bond's collateral is thin), `buy`, `cancel-ask`, `refund-ask`
+- Lend offers: `offers`, `create-offer` (a minimum yield and an optional `--curve` of up to 20
+  `<yield>:<blocks left>` points, a maturity window, a collateral floor, and optionally
+  `--deliver-shares` into Selective or Dutch shares), `cancel-offer`, `refund-offer`, and
   `match-offer --order | --ask`, which anyone runs for the offer's batcher fee. An offer's policy buys
-  only bonds with the oracle liquidation rule, since it measures their collateral at the oracle price.
+  only bonds with the oracle liquidation rule, since it measures their collateral at the oracle price,
+  and buys shares only from Selective or Dutch vaults.
 - `batch` lists every mint, pull, expiry refund, liquidation and offer match that pays its runner, and
   any box it passes over because it does not disclose a script it names; `batch --run` does the work
   in rounds, packing refunds and liquidations, matching each offer to its best-yield source, and
   scanning again with mempool lookups so fills chain through an offer's continuation. `--send` submits.
 
 Pricing formulas, register layouts, fees, block inclusion and examples are in
-[docs/ZC_STANDARD_PRICING.md](./docs/ZC_STANDARD_PRICING.md). `PricedAsk` is the generic name of the
-former `NavAsk`: renaming it does not change its tree. `PricedOrder` is an additional issuing type;
-fixed `Order` and `SaleOrder` remain. The bond and settlement scripts are unchanged. Updated lend
-offers accept both issuing types; existing offer boxes keep their original issuer restrictions.
+[docs/ZC_STANDARD_PRICING.md](./docs/ZC_STANDARD_PRICING.md). Pricing is fixed or yield: NAV pricing
+and price margins were removed on 2026-11-16. `PricedAsk` is the generic name of the former `NavAsk`:
+renaming it does not change its tree. `PricedOrder` is an additional issuing type; fixed `Order` and
+`SaleOrder` remain. The bond and settlement scripts are unchanged. Lend offers accept both issuing
+types; existing offer boxes keep their original scripts.
 
 Every transaction follows the zcs1 off-chain rules in
 [docs/ZC_STANDARD_OFFCHAIN.md](./docs/ZC_STANDARD_OFFCHAIN.md). It discloses each script its boxes name
 by hash in context variable 64, unless an input or output already carries it, so any batcher can pay
 it. A fill names the lender's bond unit `ZCS-Bond-Unit-<first6>`, with a compact JSON description of
 the bond's terms. Shares default to 100 with 6 decimals (1.0 shares is 1% of the bond) and are named
-`ZCS-Bond-Shares-<first6>`, with or without a Dutch auction. The listings flag anything nonstandard.
+`ZCS-Bond-Shares-<first6>`, plain, Selective or Dutch. The listings flag anything nonstandard.
 `help` lists every option.
 
 **First generation, with `--old`.** `info`, `orders`, `bonds`, `claims`, `fill-order [--batching-fee
@@ -150,11 +157,12 @@ runs again once that confirms, and the final report lists those. A step whose tr
 mempool unconfirmed has the ids it found undone and runs again, and `retry failed` re-runs every failed
 step.
 
-The pricing paths include fixed and on-close NAV/yield orders with explicit margins, NAV unit
-resale, yield-priced partial share sales and guarded yield-priced Dutch shares. Priced-fill checks
-compare the actual borrower payment (less the expiry refund) with the bond's recorded principal;
-ask checks verify the policy and margin. Each check reads the step's own historical outputs even
-after later steps spend them. The short offer matches use explicit price discounts to cover fees.
+The pricing paths include fixed-maturity and on-close yield orders, rising and falling, a curve lend
+offer, yield-priced unit resale, partial share sales at a rising yield and guarded yield-priced Dutch
+shares; track L sells lots. Priced-fill checks compare the actual borrower payment (less the expiry
+refund) with the bond's recorded principal; ask checks verify the committed yield points. Each check
+reads the step's own historical outputs even after later steps spend them. The loans last tens of
+blocks, so the yields that leave room for batcher fees run to thousands of percent.
 The full coverage matrix is in [the pricing guide](docs/ZC_STANDARD_PRICING.md#live-test-coverage).
 
 Steps also run the listings and check what they show, and run commands the CLI must refuse: a claim

@@ -12,7 +12,7 @@ Four principles:
 
 - **Off-chain rules serve user experience and batching.** They decide how boxes are written, found,
   grouped and displayed. They never decide a price or a risk. Yield, collateral floor, liquidation
-  ratio, principal, repayment, an ask's price or margin and a Dutch auction's terms are always the
+  ratio, principal, repayment, an ask's price, a yield's two points, an offer's curve, the prices of a Dutch auction or a lot are always the
   user's own input. No client should default them.
 - **Required rules** are the ones a batcher cannot work without. A batcher following this profile
   skips boxes that break one. The owner can still act on such a box with their own client.
@@ -39,17 +39,18 @@ Four principles:
 
 ## Expression-priced orders and asks
 
-[ZC_STANDARD_PRICING.md](./ZC_STANDARD_PRICING.md) specifies NAV and simple block-yield policies,
-principal-only resolution, signed price margins for both policies, register layouts, rounding, on-close behavior, fees and CLI examples.
+[ZC_STANDARD_PRICING.md](./ZC_STANDARD_PRICING.md) specifies fixed and two-point simple block-yield
+pricing, the lend offer's yield curve, principal-only resolution, register layouts, exact comparisons,
+on-close behavior, fees and CLI examples. NAV pricing and price margins were removed on 2026-11-16.
 `Order` and `SaleOrder` retain fixed terms. `PricedOrder` is a separate accepted issuer; `PricedAsk`
 is the generic expression shell formerly named `NavAsk`. A reader authenticates either accepted
 issuing tree, including when verifying a bond's secondary sale or fractional shares.
 
 Clients resolve priced principal before checking bids, ranking matches, building metadata or paying
-the borrower. They never use its stored principal floor as its fill price. A three-block lookahead
-is used for increasing NAV/yield prices; the bond records the actual amount paid, not the curve's
-reference amount. Unknown policies do not silently fall back to NAV: direct fills/buys refuse them,
-and matching skips them. Cancel and expiry refunds remain available without policy witnesses.
+the borrower. They never use its stored principal floor as its fill price. A two-point yield can move
+a price either way, so a quote takes the most it asks at any height from now to three blocks ahead;
+the bond records the actual amount paid. Unknown policies never fall back to another formula: direct
+fills/buys refuse them, and matching skips them. Cancel and expiry refunds remain available without policy witnesses.
 Pricing and collateral-guard commitments are independent. No rate or pricing mode is chosen for the
 user. Block yields use 262800 blocks as a scale, with no compounding or calendar-time guarantee.
 
@@ -134,11 +135,11 @@ Names are short and say only what a token is. The terms go in the description.
 ```
 name     = "ZCS-Bond-" kind [ "-" id6 ]
 kind     = "Unit"       a bond unit
-         | "Shares"     shares from ZC_Standard_FractionalMint or ZC_Standard_DutchAuctionMint
+         | "Shares"     shares from ZC_Standard_FractionalMint or ZC_Standard_DutchAuctionMint (Selective or Dutch)
 id6      = the first 6 lowercase hexadecimal characters of the bond asset id
 ```
 
-Standard and Dutch auction shares share a name on purpose: a holder sees shares of a bond, and the
+Plain, Selective and Dutch shares share a name on purpose: a holder sees shares of a bond, and the
 auction is a detail of how a liquidation pays out. The description's `type` and `auction` fields tell
 them apart.
 
@@ -150,7 +151,7 @@ which is a hash over the request's registers, the name among them.
 | Token | Name |
 |---|---|
 | Bond unit | `ZCS-Bond-Unit-3fa2c1` |
-| Shares of that bond, standard or Dutch auction | `ZCS-Bond-Shares-3fa2c1` |
+| Shares of that bond, plain, Selective or Dutch | `ZCS-Bond-Shares-3fa2c1` |
 | Shares delivered through an offer | `ZCS-Bond-Shares` |
 
 ### Descriptions
@@ -162,7 +163,7 @@ description.
 | Key | Value | In |
 |---|---|---|
 | `zcs` | `1`, the profile's version | every description |
-| `type` | `"bond unit"`, `"shares"` or `"auction shares"` | every description |
+| `type` | `"bond unit"`, `"shares"` (plain fractional), `"selective shares"` or `"auction shares"` (Dutch) | every description |
 | `shares` | `100`, the whole share supply in display units, so each share is 1% of the bond | shares |
 | `bond` | id6 of the bond asset | shares whose bond the writer knows |
 | `market` | `"ERG"` or `"SigUSD"`, the unit of every amount | every description |
@@ -172,7 +173,7 @@ description.
 | `rule` | `"maturity"`; `"oracle"`; or `"other"` | the same |
 | `ratio` | the oracle rule's ratio in percent (borrower value 7): liquidated below it, or at maturity if unpaid | with `"rule":"oracle"` |
 | `ruleHash` | the first 8 lowercase hexadecimal characters of the rule's hash | with `"rule":"other"` |
-| `auction` | `{"from":opening,"to":floor,"blocks":length}`: if liquidated, the collateral is auctioned for `from`% falling to `to`% of the repayment over `length` blocks | auction shares |
+| `auction` | `{"from":opening,"to":floor,"blocks":length,"expiry":expiry}`, and for Selective shares `"threshold":units` last: if liquidated, the collateral is auctioned for `from`% falling to `to`% of the repayment over `length` blocks and held at `to`% until `expiry` blocks after it opens; Selective shares auction only when some collateral item holds fewer than `threshold` raw units, and are otherwise paid in kind | selective and auction shares |
 | `note` | `"Verify on chain."` | every description |
 
 | Token | Description |
@@ -180,9 +181,10 @@ description.
 | Bond unit, oracle rule (169 bytes) | `{"zcs":1,"type":"bond unit","market":"SigUSD","principal":100,"repayment":105.5,"start":1712000,"maturity":1749600,"rule":"oracle","ratio":150,"note":"Verify on chain."}` |
 | Bond unit, maturity rule | `{"zcs":1,"type":"bond unit","market":"ERG","principal":0.1,"repayment":0.11,"start":1915530,"maturity":1922400,"rule":"maturity","note":"Verify on chain."}` |
 | Shares, bond known | `{"zcs":1,"type":"shares","shares":100,"bond":"3fa2c1","market":"SigUSD","principal":100,"repayment":105.5,"start":1712000,"maturity":1749600,"rule":"oracle","ratio":150,"note":"Verify on chain."}` |
-| Auction shares, bond known (247 bytes, the longest) | `{"zcs":1,"type":"auction shares","shares":100,"bond":"3fa2c1","market":"SigUSD","principal":100,"repayment":105.5,"start":1712000,"maturity":1749600,"rule":"oracle","ratio":150,"auction":{"from":100,"to":90,"blocks":720},"note":"Verify on chain."}` |
+| Auction shares, bond known | `{"zcs":1,"type":"auction shares","shares":100,"bond":"3fa2c1","market":"SigUSD","principal":100,"repayment":105.5,"start":1712000,"maturity":1749600,"rule":"oracle","ratio":150,"auction":{"from":100,"to":90,"blocks":720,"expiry":2160},"note":"Verify on chain."}` |
+| Selective shares, bond known (279 bytes, the longest) | `{"zcs":1,"type":"selective shares","shares":100,"bond":"3fa2c1","market":"SigUSD","principal":100,"repayment":105.5,"start":1712000,"maturity":1749600,"rule":"oracle","ratio":150,"auction":{"from":100,"to":90,"blocks":720,"expiry":2160,"threshold":100},"note":"Verify on chain."}` |
 | Shares, bond unknown | `{"zcs":1,"type":"shares","shares":100,"market":"SigUSD","via":"lend offer","note":"Verify on chain."}` |
-| Auction shares, bond unknown | `{"zcs":1,"type":"auction shares","shares":100,"market":"ERG","via":"lend offer","auction":{"from":100,"to":90,"blocks":720},"note":"Verify on chain."}` |
+| Selective shares, bond unknown | `{"zcs":1,"type":"selective shares","shares":100,"market":"ERG","via":"lend offer","auction":{"from":100,"to":90,"blocks":720,"expiry":2160,"threshold":100},"note":"Verify on chain."}` |
 
 A share's bond terms are the same fields as its bond unit's, so a holder reads the whole bond from the
 share token. An offer's metadata is fixed before it buys anything, so shares it delivers name only the
@@ -241,7 +243,7 @@ bond, and `1.000000` (1.0 shares) as 1% of the vault's value.
   they warn when an in-kind claim would round a collateral token to zero. On a bond repaying 105.5
   SigUSD that lot is 9,479 raw shares (0.009479 shares, one cent).
 - It fits every bond the contracts allow: N is under their 1,000,000,000 cap, and every contract
-  product involving N (claims, Dutch pricing, the offer's yield test, NAV pricing) is computed in
+  product involving N (claims, Dutch pricing, the offer's yield test, yield pricing) is computed in
   `BigInt`, so a large N cannot overflow. With R in raw units, one raw share is worth
   `R / 100,000,000`: 10 nanoERG on a 1 ERG bond, or one cent on a 1,000,000 SigUSD bond.
 
@@ -293,10 +295,10 @@ flags it. The standard lend offer checks only the blocks left to maturity agains
 matching order under "Batching" ranks by yield alone.
 
 **Why a grid at all.** Not for pricing. The lend offer's yield test reads the blocks left to maturity,
-and `AccruedValue_Pricing` reads each bond's own start and maturity, so both price any maturity with
+and the yield pricing expressions read each bond's own maturity, so both price any maturity with
 no setup. Comparing quotes across maturities needs no grid either: a UI shows each ask's yield to
-maturity, the figure the matching order already ranks by. (A NAV ask's price is the bond's own
-accrued value, not a market rate, so even two NAV asks compare by yield, not by price.)
+maturity, the figure the matching order already ranks by. A lend offer's curve is keyed by blocks left
+to maturity, not by height, so it needs no grid either.
 
 What the grid gives is identical maturities. Bonds can only be pooled into one fungible token when
 they mature at the same height. Series, a planned layer, group bonds of one market, one maturity
@@ -375,9 +377,9 @@ A batcher following this profile:
 - **Uses a fixed matching order.** Offers are taken by maximum remaining batcher reward, highest first. Each takes the order
   or ask that gives it the highest yield, `(R / P − 1) × 262800 / D`. Ties go to the lower box id. No
   contract enforces this, but every batcher following the profile behaves the same way.
-- **Prices ahead.** A transaction lands at the next height or later. A purchase from a NAV ask pays
-  that ask's price 3 blocks ahead, because the price rises every block. A Dutch lot is bought at the
-  current height's target, because the target only falls.
+- **Prices ahead.** A transaction lands at the next height or later. A purchase from a yield ask or a
+  priced order's fill pays the most its price asks from now to 3 blocks ahead, since a two-point yield can move it either way. A Dutch lot or a lot auction is bought at the
+  current height's price, because that price only falls.
 - **Skips** boxes that break script disclosure and boxes that name an expression missing from the
   reference (it cannot supply the bytes).
 
@@ -410,18 +412,24 @@ when the order's oracle age is at least the offer's. The values are the CLI's cu
 | Ask refund fee | 0.002 ERG | none |
 | ERG carried by a SigUSD offer for fees | 0.5 ERG | — |
 | Ask minimum fill, offer minimum price | 1 raw unit | — |
+| Fill guard on an oracle order | on, at the order's own liquidation ratio | at least that ratio |
+| Sale guard | off; its oracle age 30 blocks when set | 1 to 100,000 blocks |
+| Share count, decimals | 100,000,000 (100 shares), 6 | 1 to 1,000,000,000 |
+| Share vault | Selective (in-kind threshold 100); `--vault dutch` always auctions | threshold at least 100 |
+| Auction length, expiry | 720 and 2,160 blocks | length 1 to 1,000,000; expiry from the length to 1,000,000 |
+| Offer: most auction expiry it buys | 0: buys no shares | — |
+| Yield end point | the order's or ask's expiry | after the start |
+| Lot auction fall, hold | 720 and 2,160 blocks | the fall at least 1 block |
+| Lot refund fee | 0.002 ERG | none |
 
 Token offers also enforce a proportional total ERG budget covering rewards, box funding and reserves.
 The original capital and both budgets survive every continuation. A 1% minimum therefore permits at
 most 100 fills, while splitting cannot increase total batcher reward. Fixed box/reserve costs may require
 a larger fill. See [the review's formulas and CLI options](./AUDIT_REVIEW_2026-11-14.md#token-rewards-and-total-erg-protection).
-| NAV pricing margin | 0% | above −100% |
-| Fill guard on an oracle order | on, at the order's own liquidation ratio | at least that ratio |
-| Sale guard | off; its oracle age 30 blocks when set | 1 to 100,000 blocks |
-| Share count, decimals | 100,000,000 (100 shares), 6 | 1 to 1,000,000,000 |
 
 No defaults, ever: principal, repayment, collateral, maturity, liquidation ratio, yield, collateral
-floor, an ask's price or `--nav`, and a Dutch auction's opening, floor and length.
+floor, a yield curve, an ask's price, the opening and floor of a Dutch or Selective auction, and the
+opening and floor of a lot.
 
 ## Display
 
@@ -462,6 +470,8 @@ floor, an ask's price or `--nav`, and a Dutch auction's opening, floor and lengt
 | Share metadata | The zcs1 template: with the bond for `fractionalize`, without it for an offer's delivery. `--share-name`, `--share-description` and `--decimals` override it and are flagged NONSTANDARD. `shares` and `offers` check every request, vault and offer. |
 | Share count | 100,000,000 (100 shares) by default (`--shares` overrides, flagged). `create-offer --deliver-shares` is a flag. `asks` quotes a percentage of face; a share ask's `--min-fill` defaults to the least lot; a partial claim warns when an asset rounds to nothing. |
 | Maturity grid | `create-order --maturity` and `--term` at least 21,600 blocks out snap to the grid, and the summary says when the height moved; nearer ones and `--exact-maturity` keep the height. `create-order` does not look at open offers, so aiming at an offer's window takes `--exact-maturity` or a grid height chosen by hand. `match-offer`, `batch` and the listings ignore the grid. |
-| Cover at the fill | `create-order` gives an oracle order the fill guard at its `--ratio`, or at `--fill-ratio`; `--no-fill-guard` leaves it out. It notes the cover now and the ERG price at which the guard stops fills, and warns when it would refuse one now; an unguarded order already under its own ratio is refused. `fill-order`, `match-offer` and `batch` supply the guard and the oracle and check the guard first. `sell --min-cover <percent> [--oracle-age <blocks>]` adds the sale guard at a NAV or a fixed price; `buy`, `match-offer` and `batch` check it. `fill-order` and `buy` refuse a bond under its own ratio, and `buy` names the `liquidate` command instead; `--allow-liquidatable` overrides those and the unguarded create-order refusal, never a guard. A fixed-maturity order's default expiry is half its term at most, and a later `--expires-in` warns. Without a readable oracle, unguarded boxes are not checked and a note says so. |
+| Cover at the fill | `create-order` gives an oracle order the fill guard at its `--ratio`, or at `--fill-ratio`; `--no-fill-guard` leaves it out. It notes the cover now and the ERG price at which the guard stops fills, and warns when it would refuse one now; an unguarded order already under its own ratio is refused. `fill-order`, `match-offer` and `batch` supply the guard and the oracle and check the guard first. `sell --min-cover <percent> [--oracle-age <blocks>]` adds the sale guard at a yield or a fixed price; `buy`, `match-offer` and `batch` check it. `fill-order` and `buy` refuse a bond under its own ratio, and `buy` names the `liquidate` command instead; `--allow-liquidatable` overrides those and the unguarded create-order refusal, never a guard. A fixed-maturity order's default expiry is half its term at most, and a later `--expires-in` warns. Without a readable oracle, unguarded boxes are not checked and a note says so. |
+| Shares | `fractionalize` and `create-offer --deliver-shares` make only Selective (default) or Dutch (`--vault dutch`) requests, and need `--auction-opening` and `--auction-floor`. Plain fractional vaults made earlier stay listable, pullable and claimable. `match-offer` buys shares only from the Dutch-pair mint, within the offer's floor and expiry bounds. |
+| Lots | `sell-lot`, `lots`, `take-lot`, `cancel-lot`, `refund-lot`; `pack` and `batch` include expired lots. |
 | Batching | `pack` for refunds and liquidations; `batch --run` packs, ranks offers and their sources, and runs up to 5 rounds with mempool lookups. `--mempool` turns those lookups on for any command. |
 | Defaults | As in the table above |

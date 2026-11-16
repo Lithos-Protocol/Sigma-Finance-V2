@@ -30,7 +30,7 @@ class LivePricingSpec extends AnyPropSpec with StandardSpecSupport {
     }
   }
 
-  property("the A and B live commands issue NAV-priced bonds with margins; A sells yield-priced shares before repaying") {
+  property("the A and B live commands issue moving-yield and on-close yield bonds; A sells yield-priced shares before repaying") {
     withCtx { ctx =>
       val w = new World(ctx)
       val p = borrower(ctx)
@@ -51,7 +51,7 @@ class LivePricingSpec extends AnyPropSpec with StandardSpecSupport {
     }
   }
 
-  property("the E live commands exercise a priced-order offer fill, NAV resale and guarded yield-priced Dutch shares") {
+  property("the E live commands exercise a curve offer filling a priced order, yield resale and guarded yield-priced Dutch shares") {
     withCtx { ctx =>
       val w = new World(ctx)
       val p = borrower(ctx)
@@ -62,8 +62,8 @@ class LivePricingSpec extends AnyPropSpec with StandardSpecSupport {
       LiveChecks.verify(step("E2"), r.state, r.node, protocol) shouldBe None
       LiveChecks.verify(step("E4"), r.state, r.node, protocol) shouldBe None
       LiveChecks.verify(step("E9"), r.state, r.node, protocol) shouldBe None
-      LiveChecks.verify(step("E9").copy(check = Check.AskPricing("askE", true, 0L)), r.state, r.node, protocol).get should
-        include("price margin")
+      LiveChecks.verify(step("E9").copy(check = Check.AskPricing("askE", 1L, 1L)), r.state, r.node, protocol).get should
+        include("yields differ")
     }
   }
 

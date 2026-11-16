@@ -1,30 +1,33 @@
-# ZC Standard expression pricing
+# ZC Standard pricing
 
-Implemented locally on 2026-11-14. The interpreter and client specs validate these paths offline;
-the new priced paths have not been broadcast or tested against a live node. Current trees, hashes
-and addresses are generated in [ZC_STANDARD_REFERENCE.md](./ZC_STANDARD_REFERENCE.md).
+Updated 2026-11-16. Pricing is **fixed** or **yield**, nothing else: NAV (accrued-value) pricing and
+price margins were removed on that date. A yield can move in a straight line between two points in
+time, so an order or ask can rise or fall without updates, and a lend offer bids a yield **curve**
+across maturities. The interpreter and client specs validate these paths offline; none of the new
+paths has been broadcast or tested against a live node. Current trees, hashes and addresses are
+generated in [ZC_STANDARD_REFERENCE.md](./ZC_STANDARD_REFERENCE.md).
 
 ## Contracts and policies
 
-| Contract | What is fixed | What a policy prices |
+| Contract | What is fixed | What is priced |
 |---|---|---|
 | `Order` | Principal, repayment and every borrower term | Nothing: fixed principal |
-| `PricedOrder` | Repayment, maturity rule, collateral, borrower, liquidation rule, fees | Minimum principal at fill |
+| `PricedOrder` + `YieldOrder_Pricing` | Repayment, maturity rule, collateral, borrower, liquidation rule, fees | Minimum principal at fill, from a two-point yield |
 | `SaleOrder` | Price per raw token unit | Nothing: fixed price |
-| `PricedAsk` | Asset, seller, floor, minimum fill and expiry | Minimum payment for the units sold |
-| `LendOffer` | Minimum yield, maturity window, collateral policy and fees | Maximum cost allowed by its yield test |
+| `PricedAsk` + `YieldAsk_Pricing` (or `ERG_SigUSD_GuardedYield_Pricing`) | Asset, seller, floor, minimum fill and expiry | Minimum payment for the units sold, from a two-point yield |
+| `LendOffer` | Yield curve, minimum yield, maturity window, collateral policy and fees | Maximum cost allowed by its yield test |
+| `LotAuction` | Seller, currency, refund fee | A basket of ERG and tokens at a falling absolute price (not a bond price; see the last section) |
 
-`PricedAsk` is the generic name of the former `NavAsk`; the shell's tree bytes and address are
-unchanged. An expression is a validator returning `SigmaProp`, not a function returning a price.
-The filler supplies bytes matching the expression hash the owner committed when posting. Each box
-selects one pricing expression, independently of other boxes. Adding another supported pricing
-policy does not require another ask shell. Pricing an unissued loan uses the separate `PricedOrder`
-interface; ask and order policies share mathematics but read different boxes.
+An expression is a validator returning `SigmaProp`, not a function returning a price. The filler
+supplies bytes matching the expression hash the owner committed when posting. Adding another pricing
+policy needs no new shell. The `PricedOrder` and `PricedAsk` shells did not change when NAV was
+removed: their trees, hashes and addresses are the same, so the lend offer's pinned
+`CONST_PRICED_ORDER_HASH` still holds. Only the expressions changed.
 
-The fixed order remains an accepted issuer. The updated lend offer pins **both** issuing hashes,
-for primary fills and secondary origin checks. Arbitrary scripts are not accepted as issuers.
-The bond/vault, fractional and Dutch lifecycle contracts do not change. Existing offer boxes keep
-their original hashes and issuer restrictions; changing source does not upgrade them.
+The fixed order remains an accepted issuer. The lend offer pins **both** issuing hashes, for primary
+fills and secondary origin checks. Existing boxes keep their original scripts and hashes; changing
+source upgrades nothing on chain. A box committed to a removed NAV expression can still be cancelled
+or refunded, since those paths read no pricing.
 
 ## Principal resolution
 
@@ -38,8 +41,7 @@ and maturity checks. The resulting bond records the **actual principal**, not th
   a refund, collateral return or sale payout owed by another input from also counting as principal.
 - Bond R6(0), R6(2..) and the liquidation expression are unchanged. Repayment never reprices.
 - The quoted principal is always a floor. Paying above the expression's minimum is permitted only
-  when the actual principal is recorded consistently. This gives a buyer room for block inclusion
-  and avoids stale principal in future NAV, yield or metadata reads.
+  when the actual principal is recorded consistently. This gives a buyer room for block inclusion.
 
 The shell validates these rules before executing pricing. A permissive pricing expression cannot
 weaken them. Collateral guards execute separately, so pricing cannot turn one off.
@@ -48,255 +50,201 @@ weaken them. Collateral guards execute separately, so pricing cannot turn one of
 
 | Register | Meaning |
 |---|---|
-| R4 `Coll[Long]` | Fixed order borrower terms (7..64); principal nanoERG is a minimum/quote |
+| R4 `Coll[Long]` | Fixed order borrower terms (7..64); principal nanoERG is a minimum |
 | R5 `Coll[(Coll[Byte], Long)]` | Minimum principal tokens; empty for ERG, one repayment token for a token loan |
 | R6 `Coll[Byte]` | Borrower script hash |
 | R7 `Coll[Byte]` | Liquidation expression hash |
 | R8 `Coll[Coll[Byte]]` | Exactly `(pricing hash, optional guard hash)`; pricing is 32 bytes, guard empty or 32 |
-| R9 `Coll[Long]` | Pricing payload, at most 64 values |
+| R9 `Coll[Long]` | Pricing payload; for `YieldOrder_Pricing` exactly `(start height, start yield, end height, end yield)` |
 
 Input 0 is the issuing order. Output 0 is the circulating unit, output 1 the standard bond, output 2
 the principal and expiry refund. On fills, context var 1 carries the optional fill guard; var 2
-carries mandatory pricing. Both run with the **order** as `SELF`. The guard uses the existing oracle
-payload R4(7..9). On expiry var 0 selects the refund output. Refund/cancel do not read R8/R9, so even
-malformed or unknown policies can be exited without their bytes.
+carries mandatory pricing. Both run with the **order** as `SELF`. On expiry var 0 selects the refund
+output. Refund/cancel do not read R8/R9, so even malformed or unknown policies can be exited.
 
-## NAV pricing
+## Two-point yield pricing
 
-For an ask, `AccruedValue_Pricing` reads original principal P, repayment R, start S and maturity M
-from the existing live bond:
-
-```text
-NAV(H) = [P * (M-H) + R * (H-S)] / (M-S)
-minimum ask payment = NAV(H) * units/N * (10000 + margin_bps)/10000
-```
-
-For an order, `NavOrder_Pricing` reads the quoted principal P0 from the order, a reference height H0
-equal to its creation height, and the new bond's **actual** maturity M:
+A yield is a simple return in basis points per 262800 blocks (one year of 2-minute blocks), the
+lend offer's own convention. Each priced order or ask commits two points in time:
 
 ```text
-minimum principal = max(P0, ceil([P0*(M-H) + R*(H-H0)] * (10000+margin_bps) / [(M-H0)*10000]))
+(start height h0, start yield y0, end height h1, end yield y1),   y0, y1 >= 0,   h1 > h0
 ```
 
-Order R9 is `(H0, margin_bps)`. Margins are signed, greater than -10000 and at most 1000000 bps.
-The reference cannot be changed by the filler. Both maturity modes work:
-
-- Fixed: M is the committed absolute maturity height.
-- On-close: M is the validated fill start plus the committed duration. Waiting raises the NAV
-  price toward R, while the duration after fill stays fixed. There is no separate expiry of the
-  NAV curve at H0 + duration: the endpoint moves with the fill. The order's actual expiry still applies.
-
-Pricing requires H0 <= H < M. An ask additionally authenticates the live bond state; after settlement
-or at maturity its price is unavailable and the seller cancels/refunds and claims the proceeds.
-
-## Simple block-yield pricing
-
-Use the same normalization as `LendOffer`:
+The yield is y0 up to h0, y1 from h1 on, and on the straight line between them in between. Equal
+yields give one fixed rate. Clients put h0 at the current height and h1 at the box's expiry, so the
+yield reaches its endpoint as the order or ask is about to expire. With
 
 ```text
-B = 10000 * 262800
-y = nonnegative simple yield in basis points per 262800 blocks
-D = actual maturity - HEIGHT
-F = R for a whole bond; R * units/N for shares
-minimum payment = ceil(F * B * (10000+margin_bps) / ((B + y*D)*10000))
+B  = 10000 * 262800
+L  = h1 - h0
+at = HEIGHT clamped to [h0, h1]
+Y  = y0 * L + (y1 - y0) * (at - h0)          (the yield at HEIGHT is exactly Y / L)
+D  = maturity - HEIGHT
+F  = R for a whole bond; R * units / N for shares
 ```
 
-`YieldOrder_Pricing` uses order R9 `(y, margin_bps)` and prices principal. `YieldAsk_Pricing` uses ask R5(4)=y,
-R5(5)=N, R5(6)=signed price margin bps, R7=bond asset id and context var 3=live bond data-input index. The ask's existing payout
-and continuation conventions are unchanged. Both policies widen products to BigInt before
-multiplication and check inequalities without on-chain division. Integer rounding favors the
-borrower/seller. The fixed principal/ask floor may bind. A margin is applied to the exact rational price before
-rounding, with the same bounds as NAV: -9999..1000000 bps. Zero preserves the chosen block yield
-before floors and fees. A positive margin raises the price and lowers the buyer's resulting yield;
-a negative margin discounts the price and raises the resulting yield, subject to the floor. The
-quoted yield is therefore a reference rate when a nonzero price margin is selected.
+the minimum principal or payment satisfies
+
+```text
+paid * (B * L + Y * D) >= F * B * L          i.e.  paid >= F / (1 + yield * D / 262800)
+```
+
+Products are widened to BigInt; there is no on-chain division, so the boundary is exact to one raw
+unit. The fixed principal or ask floor still binds. Fees are not included.
+
+- **Rising yield**: the price falls while the box waits. A borrower who wants 8% now but would accept
+  12% by expiry posts `--yield 8 --end-yield 12`.
+- **Falling yield**: the price rises. A seller who opens cheap and firms up posts the reverse.
+- **Fixed**: `--yield` alone.
+
+`YieldOrder_Pricing` reads R9 as above. `YieldAsk_Pricing` reads ask R5: `(floor numerator, floor
+denominator, minimum fill, expiry, N, h0, y0, h1, y1)`, with R7 the bond asset id and context var 3
+the live bond's data-input index. The ask's payout and continuation conventions are unchanged.
+
+Both maturity modes work for orders. Fixed: D shrinks while the order waits. On-close: D is the
+committed duration whenever the fill lands, so only the yield's own movement changes the quote.
 
 This is simple return over **blocks**, not a wall-clock promise or compounding. A quoted yield is
 conditional on full repayment at maturity. It is not a market rate, collateral valuation, guarantee
-of recovery, or the selling holder's historical return. A seller chooses its prospective buyer rate
-independently of the original loan rate. Yield pricing needs no original principal or start anchor.
+of recovery, or the selling holder's historical return.
 
-For a 110-unit repayment and y=1000 bps at zero margin, ignoring floors and atomic rounding:
+### Why margins were removed
 
-| Remaining blocks | Yield-priced principal/payment | Straight-line NAV from 100 over 262800 blocks |
-|---:|---:|---:|
-| 262800 | 100 | 100 |
-| 131400 | 104.761904... | 105 |
-| 65700 | 107.317073... | 107.5 |
+A margin multiplied the yield price by `(10000 + margin) / 10000`. On the yield axis that is just a
+different yield: a seller wanting a discount quotes a higher yield, and a borrower leaving room for a
+lend offer's batcher fee quotes a little above the offer's yield. Removing it leaves one number to
+compare on both sides of the book.
 
-For an on-close yield order, the duration stays constant, so waiting alone does not change the
-quote, unlike on-close NAV. Once filled, the recorded P and R are fixed for either policy.
-Generic token sales and liquidation collateral auctions have no defined future cash flow/maturity
-to which this formula applies; their existing fixed and Dutch pricing remain available.
+## Collateral guards
 
-## Collateral guards and fee treatment
+`ERG_SigUSD_GuardedYield_Pricing` adds a minimum cover at a fresh oracle to the same yield price. Ask
+R5(9..10) is `(minimum cover bps, maximum oracle age)`. It values collateral against the fixed
+repayment, excluding the lender reserve, exactly as the oracle liquidation rule does. Order guards
+use the independent R8 second hash and the existing `ERG_SigUSD_FillGuard` expression.
 
-`ERG_SigUSD_GuardedYield_Pricing` adds the same oracle and minimum-cover checks as guarded NAV.
-For guarded yield, ask R5(7..8) is `(minimum cover bps, maximum oracle age)` after the margin at R5(6).
-Guarded NAV retains its original guard positions R5(6..7). It needs a fresh oracle and values
-collateral against fixed repayment, excluding the lender reserve. Order guards use the independent
-R8 second hash and existing `ERG_SigUSD_FillGuard` expression.
+A guarded fixed price, formerly a NAV ask at margin -9999, is now a guarded yield ask with a yield of
+10^15 bps: its yield price is next to nothing, so the floor, the fixed price, is what a buyer pays,
+and the guard still holds the sale to its cover. The CLI does this for `sell --price ... --min-cover`.
 
-With zero price margin, borrower/seller yield y is an upper limit on the gross yield they offer a buyer (a minimum price).
+## The lend offer's yield curve
+
+`LendOffer` R5 holds its fixed terms (11 for ERG, 15 for a token offer) and then 0 to 20 points of
+`(yield bps, blocks left to maturity)`, blocks strictly increasing. For a bond with D blocks left:
+
+- Between two neighbouring points the required yield is on the straight line joining them.
+- Below the first point it is the first point's yield; above the last, the last's.
+- It is never below R5(0), the offer's minimum yield. With no points, R5(0) is the one yield.
+- R5(1) and R5(2) still bound which maturities are bought at all.
+
+On a segment from (y1, D1) to (y2, D2), L = D2 - D1 and Y = y1 * L + (y2 - y1) * (D - D1), and the
+test is `R * B * L >= cost * (B * L + Y * D)`, again exact. For u of N shares both sides scale by u
+and N. Because the axis is blocks left, the curve rolls with time: a resting offer keeps bidding the
+same rate for a 30-day bond whatever day it is. A lender wanting a compounded curve states each
+maturity's simple equivalent.
+
+The minimum yield is a hard floor (a mistyped low point cannot undercut it) and a key indexers can
+filter offers by without parsing the curve. A badly made curve can only pay too much of the lender's
+own capital; points out of order are refused so every batcher reads a curve the same way.
+
+`create-offer --yield 5 --curve 6:21600,8:131400,10:262800` bids at least 6% for a 30-day bond, 8% for
+six months and 10% for a year, interpolated in between, and never under 5%.
+
+## Fee treatment
+
+Borrower/seller yield is an upper limit on the gross yield they offer a buyer (a minimum price).
 Lender yield is a lower limit on the return it accepts (a maximum cost). Ignoring fees and rounding,
 an ask offering 10% can cross a bid requiring 8%; one offering 6% cannot. For an ERG offer its cost
 includes the batcher fee: `cost = price + batcherFee`. A token offer pays fees separately in ERG,
 with a reward proportional to original capital filled, a proportional total ERG spending cap, and a
 minimum 1% fill of original capital. See [the fee-budget rules](./AUDIT_REVIEW_2026-11-14.md#token-rewards-and-total-erg-protection).
-Other reserve/box funding is not included in this yield test. Do not label it a fully fee-adjusted
-return. Equal rate limits may fail to match; short durations or small share fills may have so little
-interest that the batcher fee exceeds it, even with a lender yield floor of zero.
+Equal rates may fail to match: short durations or small share fills may earn so little interest
+that the batcher fee exceeds it. On a 60-block loan, leaving room for a 0.005 ERG fee on a 0.12 ERG
+repayment takes a yield in the tens of thousands of percent.
 
 ## Choosing pricing and maturity
 
-APR can be an input calculator as well as an on-chain pricing policy. Given principal P, a
-simple APR y expressed as a decimal, and D remaining blocks, a borrower-facing form can calculate:
+APR can be an input calculator as well as an on-chain policy. Given principal P, a simple APR y as a
+decimal and D remaining blocks, a borrower-facing form calculates `R = P * (1 + y * D / 262800)`,
+rounds R up to a raw unit and commits it. Repayment is fixed when the order is posted; the actual
+principal paid at fill is recorded in the bond.
 
-```text
-R = P * (1 + y * D / 262800)
-```
+| Loan timing | Pricing | Effect of waiting for funding |
+|---|---|---|
+| Term from funding | Fixed principal | Principal, repayment and duration stay constant, so APR stays constant. |
+| Term from funding | Yield | The duration stays constant; only a moving yield changes the quote. |
+| Fixed maturity height | Fixed principal | Remaining time shrinks, so the borrowing APR rises. Contract-valid, but a creation UI should avoid it. |
+| Fixed maturity height | Yield | Principal follows the fixed debt at the stated yield as time shrinks. |
 
-The form rounds repayment up to the repayment asset's raw unit and displays the resulting quote.
-For `YieldOrder_Pricing`, the contract reads that committed repayment and validates the minimum
-principal in the reverse direction. Repayment is fixed when the order is posted, not recomputed
-at each future fill. The actual principal paid at fill is recorded in the issued bond.
+A moving yield adds a second dimension to either yield row: the borrower's acceptable rate itself
+changes while the order waits. With a fixed maturity, principal, repayment and APR cannot all stay
+constant as funding time changes; yield pricing adjusts principal to the fixed debt.
 
-A rate-driven form should therefore calculate repayment from the chosen principal, APR and
-effective maturity rather than expose all four as independent inputs. Recalculate before posting
-when the asset, amount, APR, term or grid-snapped maturity changes. With a fixed maturity, time
-passing after posting changes the principal quote; it must not rewrite the committed repayment.
-Price margins, principal floors, raw-unit rounding, inclusion buffers and fees can make the actual
-quoted APR differ from the reference APR. A zero price margin is not a zero APR.
-
-### Borrow-order combinations
-
-The table describes minimum quotes for interest-bearing loans at zero price margin, before a
-binding floor, atomic rounding, inclusion buffers or fees. Fixed means an absolute maturity
-height; term from funding means a validated fill start plus a fixed duration.
-
-| Loan timing | Pricing | Effect of waiting for funding | UI interpretation |
-|---|---|---|---|
-| Term from funding | Fixed principal | Principal, repayment and full duration stay constant, so APR stays constant. | Natural simple borrowing; an APR calculator can derive the fixed repayment. |
-| Term from funding | Simple APR / Yield | The remaining duration used by the pricing convention stays constant, so the principal quote stays constant. | Largely equivalent to fixed principal when calibrated to the same terms; this adds little useful timing behavior. |
-| Term from funding | NAV | The creation-height anchor stays fixed while maturity moves with the fill. Principal rises and APR falls even though the borrower retains the full loan duration. | Valid but unusual; expose as an explicit advanced choice. |
-| Fixed maturity height | Fixed principal | Principal and repayment stay constant while remaining time shrinks, so borrowing APR rises. | Contract-valid, but exclude from the borrower creation UI to avoid unexpectedly expensive late funding. |
-| Fixed maturity height | Simple APR / Yield | Principal rises as remaining time shrinks, approximately preserving the reference APR at the minimum quote. | Useful rate-driven fixed-maturity borrowing. Calculate repayment at creation and display it as derived. |
-| Fixed maturity height | NAV | Principal follows straight-line accrual toward fixed repayment. At zero margin the quoted APR generally drifts slightly downward. | Useful accrued-value pricing; it can be close to Yield pricing for short, low-interest terms. |
-
-These are interface choices, not new contract restrictions. The contracts continue to support
-all six combinations. A UI may offer Fixed or NAV for term-from-funding requests, and Yield or
-NAV for fixed-maturity requests. The APR calculator on a fixed-principal request does not imply
-that the request uses `YieldOrder_Pricing`. NAV forms may still choose repayment explicitly.
-
-With a fixed maturity, principal, repayment and APR cannot all remain constant as funding time
-changes. Fixed pricing preserves principal; Yield pricing adjusts principal to the fixed debt.
-Keeping principal and APR fixed instead would require repayment to change, which these posted
-orders do not permit.
-
-For illustration, a bond starts at 100 with repayment 110 after 262800 blocks. Halfway to that
-maturity, ignoring floors, fees, expiry, buffers and raw-unit rounding:
-
-| Pricing | Minimum principal / ask price | Gross simple APR at entry |
-|---|---:|---:|
-| Fixed | 100 | 20% |
-| Yield at 10% | 104.761904... | 10% |
-| NAV | 105 | 9.523809...% |
-
-Grid and exact maturity choose the height; they are not different pricing policies. Identical
-effective heights produce identical pricing behavior. A fixed maturity entered as "blocks from
-now" still loses remaining time while the order waits. A term from funding preserves its full
-duration and does not promise a grid-aligned maturity.
+For illustration, a bond repays 110 after 262800 blocks. Halfway to maturity, ignoring floors, fees
+and raw-unit rounding, a 10% yield prices it at 110 / 1.05 = 104.7619..., and a fixed 100 is a 20%
+gross APR at entry.
 
 ### Resale asks and lender offers
 
-An existing bond already has fixed repayment and maturity, including one originally issued from
-a term-from-funding order. A resale ask cannot restart the duration or change the debt. Its seller
-may independently choose Fixed, Yield or NAV, regardless of the issuing order's pricing choice.
-Whole bonds and shares use the same proportional pricing mathematics; share rounding and per-fill
-fees can materially change small-lot returns.
+An existing bond already has fixed repayment and maturity. A resale ask cannot restart the duration
+or change the debt; its seller chooses fixed or yield pricing regardless of how it was issued. Whole
+bonds and shares use the same proportional mathematics; share rounding and per-fill fees can change
+small-lot returns materially.
 
-A lend offer supplies a minimum acceptable APR and a remaining-maturity window. It can match
-Fixed, Yield or NAV sources that satisfy all its other terms. Fixed/NAV are not alternative
-lend-offer pricing modes. A borrower/seller Yield reference is an upper limit on gross buyer yield
-at zero margin before floors and fees; the lender's minimum is a lower limit. Rate overlap alone
-does not establish an executable match. Waiting does not automatically close a Yield-vs-Yield
-rate gap, although maturity windows, budgets, collateral, fees and rounding can change eligibility.
-
-Floors can hide dynamic pricing: while the policy quote is below a principal or ask floor, the
-floor determines the price. A zero Yield at zero margin prices at repayment value regardless of
-the remaining term. NAV is flat when reference principal equals repayment. These are valid
-degenerate cases, not independent sources of return.
-
-### Delivery, guards and client presets
-
-The UI default for lend offers is whole-bond delivery; already-fractional sources retain their
-existing shares. Optional fractionalization belongs in a separate off-chain queue after purchase.
-The queued job chooses standard or Dutch recovery from the purchased collateral, then creates a
-separately reviewed mint request. It is not part of the offer fill, does not alter the committed
-offer registers and does not reserve the wallet's unit or mint fees merely by being queued.
-The underlying offer contract still supports explicit in-transaction fractional delivery; the
-client workflow simply does not select it. The current mock queue is a simulation, not a deployed
-production service.
-
-Simple Exchange starts with Yield pricing at zero price margin. Sale protection follows the same
-choices as fill protection: match the supported oracle liquidation trigger, choose a higher minimum
-coverage, or explicitly turn it off. The trigger-matched option is the starting preset. Simple
-Exchange and the supported oracle-policy lend offers exclude maturity-only positions; Advanced
-direct workflows remain available for those positions without inventing an oracle trigger.
-
-Auction-share purchases start with a minimum floor of 100% of repayment and a maximum duration
-of 720 blocks. These purchase bounds are separate from the terms used to create a new Dutch vault.
-For a later Dutch conversion, the auction opening remains an explicit user choice. A 100% floor
-does not guarantee a buyer or full repayment recovery: an unsold auction ends with in-kind claims.
+A lend offer's curve and minimum are the lower limit on the return it accepts. Rate overlap alone
+does not establish an executable match: maturity windows, budgets, collateral, fees and rounding
+decide eligibility. Floors can hide dynamic pricing: while the yield quote is below a floor, the
+floor sets the price. A zero yield prices at repayment value regardless of the remaining term.
 
 ## Building, matching and examples
 
-The CLI accepts an explicit pricing choice; fixed orders remain the default. `--principal` is still
-required for a priced order, as its floor and NAV reference principal. `--yield` is a percentage
-with up to two decimals, interpreted per 262800 blocks; zero is permitted. `--nav` and `--yield`
-are mutually exclusive. `--margin` accepts a signed price adjustment with either `--nav` or `--yield`; its default is zero. With an expression-priced ask, `--price` is an
-optional floor for the entire offered amount. Floors and guards are independently enforced.
-
 ```text
-create-order --principal 5 --repayment 6 --collateral-erg 10 --term 21600 --nav
-create-order --principal 5 --repayment 6 --collateral-erg 10 --duration 21600 --nav --margin -1
-create-order --principal 5 --repayment 6 --collateral-erg 10 --term 21600 --yield 10 --margin -2
+create-order --principal 5 --repayment 6 --collateral-erg 10 --term 21600 --yield 10
+create-order --principal 5 --repayment 6 --collateral-erg 10 --duration 21600 --yield 8 --end-yield 12
 create-order --market SigUSD --principal 5 --repayment 6 --collateral-erg 10 --duration 21600 --yield 10
-sell <bond-or-share-id> --amount 1 --yield 10 --margin -2
+sell <bond-or-share-id> --amount 1 --yield 10 --end-yield 6 --end-in 720
 sell <bond-or-share-id> --amount 1 --yield 10 --price 5 --min-cover 160 --oracle-age 60
+create-offer --capital 20 --yield 5 --curve 6:21600,8:131400,10:262800 --collateral-floor 150
 ```
 
-Amounts are in the chosen market's raw-display unit (ERG or SigUSD). The usual fixed-maturity grid
-and `--exact-maturity` apply. `orders` shows the quoted floor and resolved current principal;
-`asks` identifies NAV/yield policies and their current price. Builders price three blocks ahead to
-survive inclusion delays; late transactions require rebuilding. There is no single-height exact
-equality on the formula. The bond's start still uses the existing eight-block validation window.
+`--yield` and `--end-yield` are percentages with up to two decimals per 262800 blocks; zero is
+permitted. The end defaults to the box's expiry; `--end-height` or `--end-in` sets it. `--principal`
+is still required for a priced order, as its floor. With a yield ask, `--price` is an optional floor
+for the entire offered amount. `--nav` and `--margin` no longer exist.
 
-Wallet fills, offer matches, metadata and batch ranking all use resolved actual principal.
-Readers verify either accepted issuing tree before trusting the asset. Unknown expression hashes
-are refused for fills/buys and skipped by matching rather than treated as NAV. Their owners retain
-cancel/refund exits. After an expression change, regenerate pins/reference with:
+`orders` shows the floor, the yield now and where it is heading, and the current fill principal;
+`asks` does the same for asks; `offers` prints each curve. A two-point yield can move the price either
+way between signing and inclusion, so builders take the most the next three blocks ask. Wallet fills,
+offer matches, metadata and batch ranking all use the resolved actual principal. Unknown expression
+hashes are refused for fills/buys and skipped by matching; their owners keep cancel/refund exits.
+After an expression change, regenerate pins/reference with:
 
 ```text
 sbt "Test / runMain org.lithosprotocol.sigmafi.specs.bonds.ZcStandardReference --write"
 sbt test
 ```
 
-## Live-test coverage
+## Lot auctions are not bond pricing
 
-The existing `sbt livetest` tracks now exercise these paths without adding funding requirements:
+`ZC_Standard_LotAuction` sells a basket of tokens (and, for a token currency, ERG) whole to one buyer
+at an absolute price falling from an opening to a floor and then held until expiry. It has no
+maturity or repayment, so no yield applies; a client may set its prices from an oracle. It exists
+so a holder paid collateral in kind can turn it back into the repayment asset. See
+[SigmaBonds.MD](../SigmaBonds.MD) and [the off-chain rules](./ZC_STANDARD_OFFCHAIN.md).
+
+## Live-test coverage
 
 | Track | Pricing exercised |
 |---|---|
-| A | Fixed-maturity NAV order, +1% margin; yield-priced shares, -5% margin, partial wallet fill, repayment and claims |
-| B | On-close NAV order, +1% margin; recollateralization and repayment from collateral |
-| D/E | Fixed order D remains; E is a guarded fixed-maturity yield order, -10% margin, filled by an offer; NAV unit resale and guarded yield-priced Dutch shares at -25% margin |
-| G | On-close yield order, -10% margin, matched by the batch runner with delivery into fractional shares |
-| K | NAV-priced expiry refund and a SigUSD yield-priced order cancellation/refused guarded fill |
+| A | Fixed-maturity order at a yield falling from 50% to 20%; Selective shares sold at a yield rising from 5% to 10%, partial wallet fill, repayment and claims |
+| B | On-close order at a 50% yield; recollateralization and repayment from collateral |
+| D/E | A curve offer fills a guarded order whose yield rises from 100000% to 120000%, buys the unit back from an ask falling from 100000% to 80000%, and buys guarded Dutch shares at 400000% |
+| G | On-close order at 50000%, matched by the batch runner with delivery into Selective shares |
+| K | A rising-yield order refunded at expiry, and a SigUSD yield order cancelled after a refused guarded fill |
+| L | Lot auctions: one bought, one refunded after expiry, one cancelled |
 
-The live confirmation checks compare actual principal payments (excluding expiry refunds) with the
-bond records and preserve checks of non-price terms. Ask checks verify the committed policy and
-margin. Checks read the step's historical outputs even when later steps spend or rebind them.
-Yield-price discounts in E/G leave room for batcher fees on short, small trades; they are explicit
-live-test choices, not client defaults. `LivePricingSpec` executes the actual plan commands offline,
-but the updated plan still requires a user-run node/wallet session for live confirmation evidence.
+The live loans last tens to hundreds of blocks, so yields that leave room for batcher fees are in the
+thousands of percent. Confirmation checks compare actual principal payments with the bond records,
+preserve checks of non-price terms, and verify each ask's committed yield points. `LivePricingSpec`
+executes the actual plan commands offline; the updated plan still needs a user-run node session for
+live evidence.
