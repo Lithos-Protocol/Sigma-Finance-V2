@@ -166,9 +166,12 @@ collateral the oracle does not price, which the Dutch auction's lot and the toke
 need. Where the CLI can, a step builds on transactions still in the mempool (`--mempool`). It waits for
 confirmation where the CLI reads the chain's history: an offer or a share request checks a bond asset's
 origin, which needs the order spent on chain. A step that fails while what it built on is unconfirmed
-runs again once that confirms, and the final report lists those. A step whose transaction leaves the
-mempool unconfirmed has the ids it found undone and runs again, and `retry failed` re-runs every failed
-step.
+runs again once that confirms, and the final report lists those. One that fails while only other steps'
+transactions are in flight waits for them without spending an attempt: without chaining, the steps that
+spend the test token take turns, one a block, since each leaves the rest in unconfirmed change. A step
+whose transaction leaves the mempool unconfirmed has the ids it found undone and runs again, and
+`retry failed` re-runs every failed step. Without chaining, the batch run (G2, G3) also waits until
+nothing is in flight, since its scan cannot see what unconfirmed transactions make.
 
 The pricing paths include fixed-maturity and on-close yield orders, rising and falling, a curve lend
 offer, yield-priced unit resale, partial share sales at a rising yield and guarded yield-priced Dutch

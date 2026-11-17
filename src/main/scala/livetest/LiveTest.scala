@@ -126,6 +126,12 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
   /** Polls a lookup should wait between, and how many attempts a step gets before it fails for good. */
   private val PollSeconds = 15
   private val MaxAttempts = 3
+  /**
+   * How often a step may wait out other steps' transactions without spending an attempt. Without mempool
+   * chaining, the steps that spend the test token take turns, one a block, as each leaves the rest in an
+   * unconfirmed change box; eleven steps spend it, so this covers the last of them with room to spare.
+   */
+  private val MaxDeferrals = 20
 
   private def save(): Unit = LiveState.save(state, file)
   private def st(id: String): StepState = state.step(id)
@@ -327,10 +333,20 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
   }
 
   private var quietMemo: Option[((Int, Int, Set[String]), Option[Readiness])] = None
+  /** Steps run so far: a step that ran may have changed what a batch scan finds, so the scan is read afresh. */
+  private var stepsRun = 0
 
-  /** Open when a batch scan finds work and every piece spends only `ids` (so a batch run does just that). */
+  /**
+   * Open when a batch scan finds work and every piece spends only `ids` (so a batch run does just that). Without
+   * mempool chaining, the scan cannot see what transactions in flight make (an ask, a repaid bond), and once they
+   * confirm a batch run would find that work too, so it waits until nothing is in flight.
+   */
   private def quiet(ids: Set[String], v: View): Option[Readiness] = {
-    val key = (v.height, session.submissions.size, ids)
+    val flying = plan.map(_.id).filter(d => st(d).status == InFlight)
+    if (!state.chain && flying.nonEmpty)
+      return Some(Waiting(s"waiting for ${flying.mkString(", ")} to confirm: without mempool chaining the batch scan " +
+        "cannot see what they make yet"))
+    val key = (v.height, stepsRun, ids)
     quietMemo.filter(_._1 == key).map(_._2).getOrElse {
       val verdict = Try(session.withStandard(launch, state.chain)((app, _) => app.batchScan())) match {
         case Failure(e) => Some(Waiting(s"the batch scan failed: ${e.getMessage}"))
@@ -397,7 +413,12 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
       .orElse(err.split("\r?\n").map(_.trim).filter(_.nonEmpty).lastOption)
 
   /** Run one step. `chained` says it builds on transactions still in the mempool. */
-  private def run(s: Step, chained: Boolean, v: View): Unit = s.kind match {
+  private def run(s: Step, chained: Boolean, v: View): Unit = {
+    stepsRun += 1
+    runStep(s, chained, v)
+  }
+
+  private def runStep(s: Step, chained: Boolean, v: View): Unit = s.kind match {
     case Kind.Setup => setup(s, v)
     case kind => fill(s.command, state.vars) match {
       case Left(missing) => finish(s, Failed, s"no value for {$missing}")
@@ -439,8 +460,10 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
   /**
    * A failure while transactions are in flight may be the mempool's doing (a lookup that does not see it yet,
    * a wallet box still unconfirmed), so the step runs again once they confirm: its own dependencies when it
-   * built on any of them, else everything in flight. A refusal that names the next block (an oracle refresh in
-   * the mempool) waits for it without counting as an attempt. Otherwise the step fails.
+   * built on any of them, else everything in flight. Waiting on other steps' transactions is not the step's own
+   * failure (another step holds a wallet box it needs, say), so it spends no attempt, up to MaxDeferrals times.
+   * A refusal that names the next block (an oracle refresh in the mempool) waits for it without counting as an
+   * attempt. Otherwise the step fails.
    */
   private def failure(s: Step, message: String): Unit = {
     val inflightDeps = deps(s).filter(d => st(d).status == InFlight)
@@ -450,6 +473,11 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
       set(s.id)(ss => ss.copy(status = Pending, attempts = math.max(0, ss.attempts - 1), notBefore = Some(at),
         notes = ss.notes :+ s"waited a block: $message"))
       say(s"[${s.id}] $message\n[${s.id}] it runs again at height $at")
+    } else if (!s.noDefer && inflight.nonEmpty && inflightDeps.isEmpty && st(s.id).deferrals < MaxDeferrals) {
+      set(s.id)(ss => ss.copy(status = Pending, waitFor = inflight.toVector, attempts = math.max(0, ss.attempts - 1),
+        deferrals = ss.deferrals + 1, notes = ss.notes :+ s"waited for transactions in flight: $message"))
+      say(s"[${s.id}] waits for transactions in flight: $message\n[${s.id}] it runs again once ${inflight.mkString(", ")} " +
+        "confirm, without spending an attempt")
     } else if (!s.noDefer && inflight.nonEmpty && st(s.id).attempts < MaxAttempts) {
       val how = if (inflightDeps.nonEmpty) "chained through the mempool" else "with transactions in flight"
       set(s.id)(ss => ss.copy(status = Pending, waitFor = inflight.toVector,

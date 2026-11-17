@@ -12,13 +12,14 @@ import scala.util.Try
  * Where one step stands. `txs` and `outputs` are its submitted transactions and their output box ids;
  * `waitFor` holds back a retry until those steps' transactions confirm; `misses` counts polls that found a
  * transaction neither confirmed nor in the mempool, from `firstMiss` (epoch millis). `notBefore` holds a
- * retry back until that height (after an oracle refresh, say).
+ * retry back until that height (after an oracle refresh, say). `deferrals` counts the times the step waited out
+ * other steps' transactions, which spend no attempt.
  */
 case class StepState(status: String = StepState.Pending, txs: Vector[String] = Vector.empty,
                      outputs: Vector[Vector[String]] = Vector.empty, command: Option[String] = None,
                      notes: Vector[String] = Vector.empty, waitFor: Vector[String] = Vector.empty,
                      attempts: Int = 0, misses: Int = 0, firstMiss: Long = 0L, ranAt: Option[Int] = None,
-                     notBefore: Option[Int] = None)
+                     notBefore: Option[Int] = None, deferrals: Int = 0)
 
 /**
  * One variable a step bound, in order (`seq`), with what the variable held before. `alive` until the
@@ -55,7 +56,7 @@ case class LiveState(started: Boolean, chain: Boolean, maturityBlocks: Int, addr
     val next = if (submitted) this else unbind(id)
     next.update(id)(ss => ss.copy(status = if (submitted) StepState.InFlight else StepState.Pending,
       outputs = if (submitted) ss.outputs else Vector.empty, waitFor = Vector.empty,
-      attempts = 0, misses = 0, firstMiss = 0L, notBefore = None,
+      attempts = 0, misses = 0, firstMiss = 0L, notBefore = None, deferrals = 0,
       notes = ss.notes :+ (if (submitted) "rechecking submitted transactions" else "retried")))
   }
 
@@ -127,7 +128,8 @@ object LiveState {
         "misses" -> Json.fromInt(t.misses),
         "firstMiss" -> Json.fromLong(t.firstMiss),
         "ranAt" -> t.ranAt.fold(Json.Null)(Json.fromInt),
-        "notBefore" -> t.notBefore.fold(Json.Null)(Json.fromInt))
+        "notBefore" -> t.notBefore.fold(Json.Null)(Json.fromInt),
+        "deferrals" -> Json.fromInt(t.deferrals))
     }: _*),
     "log" -> Json.fromValues(s.log.map(e => Json.obj(
       "seq" -> Json.fromLong(e.seq),
@@ -154,7 +156,8 @@ object LiveState {
         misses = s.downField("misses").as[Int].getOrElse(0),
         firstMiss = s.downField("firstMiss").as[Long].getOrElse(0L),
         ranAt = s.downField("ranAt").as[Option[Int]].getOrElse(None),
-        notBefore = s.downField("notBefore").as[Option[Int]].getOrElse(None))
+        notBefore = s.downField("notBefore").as[Option[Int]].getOrElse(None),
+        deferrals = s.downField("deferrals").as[Int].getOrElse(0))
     }
     LiveState(
       started = c.downField("started").as[Boolean].getOrElse(false),

@@ -176,7 +176,8 @@ class LivePlanSpec extends AnyPropSpec with Matchers {
     val s = LiveState(started = true, chain = false, maturityBlocks = 33, address = Some("9addr"),
       vars = Map("orderA" -> "aa", "M" -> "123"),
       steps = Map("A1" -> StepState(StepState.InFlight, Vector("tx1"), Vector(Vector("o0", "o1")), Some("create-order"),
-        Vector("note"), Vector("S1"), attempts = 2, misses = 1, firstMiss = 99L, ranAt = Some(7), notBefore = Some(8))))
+        Vector("note"), Vector("S1"), attempts = 2, misses = 1, firstMiss = 99L, ranAt = Some(7), notBefore = Some(8),
+        deferrals = 4)))
       .bindAs("A1", Seq("orderA" -> "bb", "reqA" -> "cc")).unbind("A1").bindAs("A2", Seq("orderA" -> "dd"))
     LiveState.decode(LiveState.encode(s)) shouldBe s
   }
@@ -203,7 +204,7 @@ class LivePlanSpec extends AnyPropSpec with Matchers {
   property("retrying a submitted failure preserves its transactions and historical bindings for rechecking") {
     for (status <- Seq(StepState.Failed, StepState.Skipped)) {
       val submitted = StepState(status, txs = Vector("pullTx"), outputs = Vector(Vector("openVault")),
-        attempts = 3, misses = 2, firstMiss = 123L, notBefore = Some(100))
+        attempts = 3, misses = 2, firstMiss = 123L, notBefore = Some(100), deferrals = 7)
       val state = LiveState.fresh(chain = true, maturityBlocks = 40)
         .update("E12")(_ => submitted)
         .bindAs("E12", Seq("vaultE" -> "openVault"))
@@ -216,6 +217,7 @@ class LivePlanSpec extends AnyPropSpec with Matchers {
       retried.step("E12").misses shouldBe 0
       retried.step("E12").firstMiss shouldBe 0L
       retried.step("E12").notBefore shouldBe None
+      retried.step("E12").deferrals shouldBe 0
       retried.vars("vaultE") shouldBe "soldVault"
       retried.checkVars("E12")("vaultE") shouldBe "openVault"
       retried.checkVars("E14")("vaultE") shouldBe "soldVault"

@@ -261,3 +261,21 @@ nanoERG (SigUSD currency) and claims then split them, while a Dutch one still se
 with an R5 is refused; the client refuses a hand-made share vault naming a genuine bond, and a bond refresh
 beside a box younger than its stamp. Dedicated specs for these are listed in the audit report as test cases
 to add.
+
+## First live run without mempool chaining (2026-11-17)
+
+A mainnet run with `chain off` (setup at height 1918919) failed ten steps; three causes, all fixed:
+
+- The batch scan paired a lend offer with a share ask it refuses: it never checked that the offer buys shares or
+  that their auction lies inside its floor and expiry bounds, which `match-offer` checks. O3 (delivers shares, buys
+  none) claimed ask E, so order G went to O1. `StandardExchangeAppSpec` now has the scan list no purchase for three
+  refusing offers and exactly one for the offer that accepts the shares; it failed before the fix.
+- The test token sits in one box, and each step that spends it leaves the rest in unconfirmed change, which the
+  wallet does not list without chaining. Seven token steps spent their three attempts waiting their turn. Waiting
+  on other steps' transactions now spends no attempt (up to 20 times); `LivePlanSpec` round-trips the new count.
+- G2 and G3 ran while E9, A10 and V10 were in flight; their block reached the index between G2's scan and G3's
+  batch run, which then pulled vault A, spent O1 and bound the wrong box as G's share request. Without chaining
+  the batch gate now waits until nothing is in flight, and a step that ran makes the gate scan again.
+
+The runner changes are checked only by compiling and the state round trip; the next `chain off` run is their
+test. All 524 tests pass. Nothing was broadcast.

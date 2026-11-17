@@ -307,6 +307,9 @@ trait StandardBatch extends AppBase { self: StandardApp =>
     val orderSources = openOrders.filter(order => next < order.expiry && Try(checkOrder(order)).isSuccess &&
       served(order.borrowerHash, order.box, "order", "borrower"))
     val askSources = openAsks.filter(a => next < a.expiry && served(a.sellerHash, a.box, "ask", "seller"))
+    // Shares carry their auction terms in their mint request: one lookup per share token, whatever the offers.
+    val mintRequests = mutable.Map.empty[String, Option[StdShareRequest]]
+    def mintRequest(shareId: org.ergoplatform.sdk.ErgoId) = mintRequests.getOrElseUpdate(shareId.toString, shareMintRequest(shareId))
     val taken = mutable.Set.empty[String]
     allOffers.filter(o => next < o.expiry && alone(o.fillFee(o.capital)) && served(o.ownerHash, o.box, "lend offer", "owner"))
       .sortBy(o => (-o.fillFee(o.capital), o.box.id.toString)).foreach { o =>
@@ -330,8 +333,11 @@ trait StandardBatch extends AppBase { self: StandardApp =>
             val units = if (whole == 1L) 1L else a.token.amount
             val bond = liveBonds.find(_.asset == asset).get
             val price = if (o.market.token.isEmpty) math.max(askPrice(a, units)._1, MinBox) else askPrice(a, units)._1
+            val shares = a.token.id != asset
             if (units < a.minFill && units != a.token.amount) None
-            else if (!alone(o.fillFee(price)) || offerRefusal(o, bond, price, units, whole, usableOracle, shares = a.token.id != asset).nonEmpty ||
+            // As match-offer: shares only when the offer buys them and their auction is inside its bounds.
+            else if (shares && mintRequest(a.token.id).forall(req => shareRefusal(o, req).nonEmpty)) None
+            else if (!alone(o.fillFee(price)) || offerRefusal(o, bond, price, units, whole, usableOracle, shares = shares).nonEmpty ||
               saleGuardRefusal(a, bond, usableOracle).nonEmpty) None
             else Some((impliedYield(o, bond.repayment, price, units, whole, bond.maturity), a.box.id.toString,
               Work(s"buy $units of ${a.token.id} from ask ${a.box.id} with offer ${o.box.id}",

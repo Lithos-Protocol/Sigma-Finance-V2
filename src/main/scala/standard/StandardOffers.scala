@@ -177,6 +177,27 @@ trait StandardOffers extends AppBase { self: StandardApp =>
   }
 
   /**
+   * The spent mint request whose id is `shareId`, which carries the shares' auction terms; None when the node's
+   * index has no standard share mint request by that id.
+   */
+  def shareMintRequest(shareId: ErgoId): Option[StdShareRequest] =
+    nodeApi.boxById(shareId.toString).flatMap(j => Try(NodeJson.box(j)).toOption).flatMap(protocol.asShareRequest)
+
+  /**
+   * Why offer `o` would refuse shares minted by `req`, or None if it would buy them: it buys only Selective or
+   * Dutch shares, only when it buys shares at all, and only with an auction floor and expiry inside its bounds.
+   * Both match-offer and the batch scan apply it, so the scan never lists a purchase the offer refuses.
+   */
+  def shareRefusal(o: StdOffer, req: StdShareRequest): Option[String] =
+    if (req.dutch.isEmpty) Some("offers buy shares only from the Selective/Dutch mint: plain fractional shares are paid " +
+      "in kind after a liquidation")
+    else if (o.terms(10) == 0L) Some("the offer buys no shares")
+    else if (req.auction(1) < o.terms(9) || req.auction(3) > o.terms(10))
+      Some(s"the shares' auction (floor ${Units.percent(req.auction(1))}, expiry ${req.auction(3)} blocks) is outside " +
+        "the offer's bounds")
+    else None
+
+  /**
    * zcs1's maturity for filling window order `order` from offer `o`, or None when no maturity suits both. The
    * candidates are the ends of the heights both accept, both curves' breakpoints and the grid heights between: between
    * those, both yields are straight lines, so the best maturity is always one of them. Of the ones the offer accepts,
@@ -324,12 +345,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
       val request = nodeApi.boxById(v.shareId.toString).flatMap(j => Try(NodeJson.box(j)).toOption)
         .getOrElse(fail("the request that minted the shares is not in the node's index"))
       val req = protocol.asShareRequest(request).getOrElse(fail("the shares were not minted by a standard share mint"))
-      if (req.dutch.isEmpty) fail("offers buy shares only from the Selective/Dutch mint: plain fractional shares are paid " +
-        "in kind after a liquidation")
-      if (o.terms(10) == 0L) fail("the offer buys no shares")
-      if (req.auction(1) < o.terms(9) || req.auction(3) > o.terms(10))
-        fail(s"the shares' auction (floor ${Units.percent(req.auction(1))}, expiry ${req.auction(3)} blocks) is outside " +
-          "the offer's bounds")
+      shareRefusal(o, req).foreach(fail)
       request.bytes
     }
     val rest = askRest(ask, n)

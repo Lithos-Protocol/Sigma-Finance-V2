@@ -376,18 +376,22 @@ class StandardExchangeAppSpec extends AnyPropSpec with StandardSpecSupport with 
       w.run(l, w.app(l).sell(shareId.toString, 60L, Market.Erg, YieldPrice(100000L), Some(1L), w.h + 100L, erg("0.002")))
       val ask = w.app(e).asks().loneElement
 
-      // Three offers: one buys no shares, one wants a 95% floor, one accepts 80% with an expiry of at most 1000 blocks.
-      Seq((0L, 0L), (9500L, 1000L), (8000L, 1000L)).foreach { case (floor, length) =>
+      // Three offers the shares fail: one buys no shares, one wants a 95% floor, one bounds the expiry at 499 blocks.
+      Seq((0L, 0L), (9500L, 1000L), (8000L, 499L)).foreach { case (floor, length) =>
         w.run(o, w.app(o).createOffer(offerSpec(w).copy(auctionFloorBps = floor, auctionExpiry = length)))
       }
       def offerWith(floor: Long, length: Long): String =
         w.app(e).offers().find(x => x.terms(9) == floor && x.terms(10) == length).get.box.id.toString
       refused(w.app(e).matchAsk(offerWith(0L, 0L), ask.box.id.toString, Some(40L))) should include("buys no shares")
       refused(w.app(e).matchAsk(offerWith(9500L, 1000L), ask.box.id.toString, Some(40L))) should include("outside the offer's bounds")
-      // A shorter expiry bound than the auction's is refused too.
-      w.run(o, w.app(o).createOffer(offerSpec(w).copy(auctionFloorBps = 8000L, auctionExpiry = 499L)))
       refused(w.app(e).matchAsk(offerWith(8000L, 499L), ask.box.id.toString, Some(40L))) should include("outside the offer's bounds")
+      // The batch scan refuses them as match-offer does, so none of them claims the ask.
+      def scanMatches = w.app(e).batchScan().work.map(_.command).filter(_.startsWith("match-offer"))
+      scanMatches shouldBe empty
 
+      // One that accepts an 80% floor and an expiry of up to 1000 blocks buys, and is the one the scan lists.
+      w.run(o, w.app(o).createOffer(offerSpec(w).copy(auctionFloorBps = 8000L, auctionExpiry = 1000L)))
+      scanMatches shouldBe Seq(s"match-offer ${offerWith(8000L, 1000L)} --ask ${ask.box.id}")
       w.run(e, w.app(e).matchAsk(offerWith(8000L, 1000L), ask.box.id.toString, Some(40L)))
       w.tokens(o).get(shareId) shouldBe Some(40L)
       w.app(e).asks().loneElement.token.amount shouldBe 20L
