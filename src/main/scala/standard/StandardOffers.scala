@@ -302,6 +302,8 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     if (ask.market != o.market) fail(s"the ask is paid in ${ask.market}, the offer lends ${o.market}")
     val token = ask.token.id
     val shares = shareVault(token)
+    if (shares.exists(v => !shareVerified(v)))
+      fail(s"$token sits in a share vault, but no standard share mint minted it: the offer would refuse it on chain")
     val asset = shares.fold(token)(_.bondAsset)
     val whole = shares.fold(1L)(_.n)
     val n = units.getOrElse(ask.token.amount)

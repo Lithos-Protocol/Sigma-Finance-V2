@@ -15,7 +15,7 @@ class LivePricingSpec extends AnyPropSpec with StandardSpecSupport {
 
   private class Run(val w: World, p: ErgoProver) {
     var state = LiveState.fresh(chain = true, maturityBlocks = 40).bind("token" -> collateralToken.toString,
-      "T0" -> w.h.toString, "M" -> (w.h + 40).toString)
+      "T0" -> w.h.toString, "M" -> (w.h + 40).toString, "V" -> (w.h + LivePlan.WindowMaturityBlocks).toString)
     val node = new FakeNode(w.chain, p)
     def exec(id: String): Unit = {
       var captured: Option[Prepared] = None
@@ -64,6 +64,35 @@ class LivePricingSpec extends AnyPropSpec with StandardSpecSupport {
       LiveChecks.verify(step("E9"), r.state, r.node, protocol) shouldBe None
       LiveChecks.verify(step("E9").copy(check = Check.AskPricing("askE", 1L, 1L)), r.state, r.node, protocol).get should
         include("yields differ")
+    }
+  }
+
+  property("the V live commands fill a window order at maturity V from the wallet, and another from an offer at zcs1's choice") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val p = borrower(ctx)
+      w.fund(p, erg("10"), Token(collateralToken, 10000L))
+      w.oracle(500000000L, w.h)
+      val r = new Run(w, p)
+      Seq("V1", "V3").foreach(r.exec)
+      val bondV = protocol.asBond(NodeJson.box(r.node.boxById(r.state.vars("bondV")).get)).get
+      bondV.maturity shouldBe w.h + LivePlan.WindowMaturityBlocks
+      bondV.principal should be > erg("0.1")
+      bondV.repayment shouldBe erg("0.12")
+      Seq("V4", "V5", "V6", "O4", "V7", "V8", "V9", "V10").foreach(r.exec)
+    }
+  }
+
+  property("D's Dutch request builds: its floor is under the ERG bond D holds, so a liquidation opens an excess auction") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val p = borrower(ctx)
+      w.fund(p, erg("10"), Token(collateralToken, 10000L))
+      val r = new Run(w, p)
+      Seq("D1", "D2", "D3", "D4").foreach(r.exec)
+      val vault = w.app(p).shareVaults().find(_.box.id.toString == r.state.vars("vaultD")).get
+      vault.dutch shouldBe true
+      vault.auction(2) shouldBe 1000L
     }
   }
 

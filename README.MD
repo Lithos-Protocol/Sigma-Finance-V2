@@ -172,9 +172,11 @@ step.
 
 The pricing paths include fixed-maturity and on-close yield orders, rising and falling, a curve lend
 offer, yield-priced unit resale, partial share sales at a rising yield and guarded yield-priced Dutch
-shares; track L sells lots; track W wraps a test token, mints and unwraps its receipt, cancels a second
-wrap, and shows a refresh refused as too early (a refresh opens after two years, and window orders and
-Dutch excess auctions are covered offline only). Priced-fill checks compare the actual borrower payment (less the expiry
+shares; bond D's Dutch vault holds its floor, so its thin lot sells in an excess auction (state 4);
+track V fills a window order from the wallet at a chosen maturity and another from a lend offer at
+zcs1's default; track L sells lots; track W wraps a test token, mints and unwraps its receipt, cancels a
+second wrap, and shows a refresh refused as too early (a refresh opens after two years, so a paid
+refresh is covered offline only). Priced-fill checks compare the actual borrower payment (less the expiry
 refund) with the bond's recorded principal; ask checks verify the committed yield points. Each check
 reads the step's own historical outputs even after later steps spend them. The loans last tens of
 blocks, so the yields that leave room for batcher fees run to thousands of percent.

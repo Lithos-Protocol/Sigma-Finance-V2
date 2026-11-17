@@ -398,7 +398,10 @@ A batcher following this profile:
   earliest grid height in it, else its shortest maturity. Batchers use the rule above.
 - **Refresh.** A bond's successor is stamped 60 blocks back (the contract allows 60 to 999), so the
   borrower may recollateralize at once, and the refresh discloses the borrower's script. A vault's is
-  stamped at the current height. A reader who cannot find a bond's borrower through the box's creating
+  stamped at the current height. No output may be stamped below any input's creation height (EIP-39),
+  so every input of a bond refresh, the wallet's fee box included, must be at least 60 blocks old. A
+  bond above its floor pays its own miner fee from the bounty and needs no other input; a refresher
+  keeps an aged box for the rest, and packs bond refreshes only with each other. A reader who cannot find a bond's borrower through the box's creating
   transaction looks in the fill that minted the bond asset, which paid the principal to it: a refresh
   is open to anyone, zcs1 client or not, and must never hide a borrower.
 - **Wraps.** A capability token (one whose presence among inputs grants authority elsewhere, such as a
@@ -508,8 +511,9 @@ opening and floor of a lot.
 | Shares | `fractionalize` and `create-offer --deliver-shares` make only Selective (default) or Dutch (`--vault dutch`) requests, and need `--auction-opening` and `--auction-floor`. Plain fractional vaults made earlier stay listable, pullable and claimable. `match-offer` buys shares only from the Dutch-pair mint, within the offer's floor and expiry bounds. |
 | Lots | `sell-lot`, `lots`, `take-lot`, `cancel-lot`, `refund-lot`; `pack` and `batch` include expired lots. |
 | Window orders | `create-order --window <min>:<max> [--yield <cap>] [--curve ...]`; `fill-order --maturity`, defaulting to the earliest grid height; `match-offer --maturity`, defaulting to the zcs1 rule, which `batch` uses and names in each match command. `orders` shows the window and curve. |
-| Dutch excess auctions | `pull` opens state 4 when the floor is held; `buy-lot` pays its falling price and refuses once it reaches zero; `claim-shares` waits for the end of its fall; `shares` shows it. |
-| Refresh | `refresh <box id ...>` (bonds, bond vaults and share vaults pack; a wrap vault alone); `pack` refreshes old bonds that are not due and old vaults; `batch` lists every refresh that pays. Bonds are stamped 60 back and disclose their borrower; a borrower is also found through the fill. |
+| Dutch excess auctions | `pull` opens state 4 when the floor is held; `buy-lot` pays its falling price, takes only the items under the threshold and leaves the rest for claims, and refuses once the price reaches zero; `claim-shares` waits for the end of its fall; `shares` shows it. |
+| Refresh | `refresh <box id ...>` (bonds, bond vaults and share vaults pack; a wrap vault alone); `pack` refreshes old bonds that are not due and old vaults; `batch` lists every refresh that pays. Bonds are stamped 60 back and disclose their borrower; a borrower is also found through the fill. A transaction with a bond refresh spends only boxes made by its stamp (EIP-39): wallet boxes are picked by age, `pack` refuses younger boxes beside it, and `batch --run` packs bond refreshes apart. |
+| Share verification | `asks`, `buy`, `sell`, `match-offer` and the batch scan treat a token as shares of a bond only when the box whose id it is was spent as a standard share mint request holding that bond's unit, with the vault's share count, and the bond asset is genuine. `buy` and `match-offer` refuse a token whose share vault fails that; `asks` and `shares` flag it. |
 | Wraps | `wrap`, `mint-wrap` (the request as the only input), `cancel-wrap`, `unwrap`, `wraps` (with receipt verification and refresh height); `batch` lists mints. Raw capability tokens are not yet recognized and refused. |
 | Batching | `pack` for refunds, liquidations and refreshes; `batch --run` packs, ranks offers and their sources, and runs up to 5 rounds with mempool lookups. `--mempool` turns those lookups on for any command. |
 | Defaults | As in the table above |

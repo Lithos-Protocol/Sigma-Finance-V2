@@ -76,9 +76,29 @@ trait StandardShares extends AppBase { self: StandardApp =>
     (decoded(nodeApi.unspentByErgoTree(protocol.contracts.fractionalVault.ergoTreeHex)) ++
       decoded(nodeApi.unspentByErgoTree(protocol.contracts.dutchVault.ergoTreeHex))).flatMap(protocol.asShareVault)
 
-  /** A share's vault: the one box holding N+1 of it. */
+  /**
+   * A share's vault: the box holding N+1 of it under a share vault script. That proves nothing on its own, since
+   * anyone can send N+1 of a token they minted to a vault address; see `shareVerified`.
+   */
   def shareVault(shareId: ErgoId): Option[StdShareVault] =
     decoded(nodeApi.unspentByTokenId(shareId.toString)).flatMap(protocol.asShareVault).find(_.shareId == shareId)
+
+  /**
+   * Whether a share vault's token is genuine, as ZC_Standard_LendOffer checks it on chain: the box whose id is the
+   * share id was spent as a standard share mint request (ZC_Standard_FractionalMint for a plain vault, the Dutch mint
+   * of the vault's currency for a Dutch one) holding this vault's bond unit with this vault's share count, and that
+   * bond asset was minted by a standard order. The mint fixed the supply at 2N+1 with N+1 in this vault.
+   */
+  def shareVerified(v: StdShareVault): Boolean =
+    nodeApi.boxById(v.shareId.toString).exists { json =>
+      NodeJson.spentBy(json).isDefined && Try(NodeJson.box(json)).toOption.flatMap(protocol.asShareRequest).exists { req =>
+        req.bondAsset == v.bondAsset && req.shares == v.n &&
+          (if (v.dutch) req.dutch.exists(_.token == v.currencyToken) else req.dutch.isEmpty)
+      }
+    } && assetMarket(v.bondAsset).isDefined
+
+  /** A share's vault, only when the share is genuine (`shareVerified`). */
+  def verifiedShareVault(shareId: ErgoId): Option[StdShareVault] = shareVault(shareId).filter(shareVerified)
 
   /** The market a bond asset belongs to, read from the order that minted it, which also proves it genuine. */
   def assetMarket(asset: ErgoId): Option[Market] =
@@ -304,14 +324,21 @@ trait StandardShares extends AppBase { self: StandardApp =>
     } else math.max(lotTarget(v, height.toLong), before)
     val m = Market.of(v.currencyToken).getOrElse(fail("the vault's currency is not a market this client knows"))
     val regs = v.box.registers.updated(2, ErgoValue.of(2.toByte))
+    // A floor auction sells the whole lot. An excess auction sells only the items under the in-kind threshold; the
+    // contract keeps the rest in the vault, after the reserve and any token currency, for pro rata claims.
+    val kept = v.keptBySale
     val sold = v.currencyToken match {
-      case None => UTXO(Contract(v.box.input.getErgoTree), after, Seq(v.box.tokens.head), regs)
-      case Some(id) => UTXO(Contract(v.box.input.getErgoTree), MinBox, Seq(v.box.tokens.head, Token(id, after)), regs)
+      case None => UTXO(Contract(v.box.input.getErgoTree), after, v.box.tokens.head +: kept, regs)
+      case Some(id) => UTXO(Contract(v.box.input.getErgoTree), if (v.saleKeepsErg) v.box.value else MinBox,
+        Seq(v.box.tokens.head, Token(id, after)) ++ kept, regs)
     }
-    val lot = v.currencyToken.fold(v.assets)(id => v.assets.filterNot(_.id == id))
+    val lot = v.currencyToken.fold(v.assets)(id => v.assets.filterNot(_.id == id)).filterNot(kept.contains)
+    val lotErg = if (v.currencyToken.isEmpty || v.saleKeepsErg) 0L else v.box.value - MinBox
     prepare(s"Buy the lot of $vaultId", plan(Seq(v.box.withCtxVar(0.toByte, intValue(0))), Seq(sold)),
       Seq(s"pay ${Units.amount(after - before, m)} into the vault (it then holds ${Units.amount(after, m)})",
-        s"receive the lot: ${Fmt.contents(v.currencyToken.fold(0L)(_ => v.box.value - MinBox), lot)}"))
+        s"receive the lot: ${Fmt.contents(lotErg, lot)}") ++
+        (if (kept.isEmpty && !v.saleKeepsErg) Seq.empty
+         else Seq(s"stays in the vault for pro rata claims: ${Fmt.contents(if (v.saleKeepsErg) v.box.value - MinBox else 0L, kept)}")))
   }
 
   // ═══ CLAIMS ═══════════════════════════════════════════════════════════════

@@ -240,6 +240,15 @@ case class StdShareVault(box: InputUTXO, dutch: Boolean, bondAsset: ErgoId, n: L
    * excess auction's fall, where its price reaches zero.
    */
   def claimableFrom: Long = auctionStart + (if (excess) auctionLength else auctionExpiry)
+  /**
+   * The lot tokens a sale leaves in the vault, in the vault's order: none in a floor auction, which sells the whole
+   * lot; in an excess auction every one at or above the in-kind threshold, which the contract keeps for pro rata
+   * claims while the thin ones are sold.
+   */
+  def keptBySale: Seq[Token] =
+    if (!excess) Seq.empty else assets.filter(t => !currencyToken.contains(t.id) && t.amount >= threshold)
+  /** Whether a sale leaves a token currency's nanoERG above the box minimum: an excess sale does, unless it is thin. */
+  def saleKeepsErg: Boolean = excess && currencyToken.isDefined && box.value - MinBox >= threshold
 }
 
 /** An ask: a ZC_Standard_SaleOrder, or a ZC_Standard_PricedAsk (`priced`) priced by its R6 expression. */

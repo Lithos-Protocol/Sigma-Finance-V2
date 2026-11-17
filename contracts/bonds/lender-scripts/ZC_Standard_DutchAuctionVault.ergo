@@ -49,11 +49,15 @@
     //   price stays above zero throughout, so the lot is never given away. The target stays at the
     //   floor from the end of the fall until the expiry; claims wait for it.
     // - At or above the floor target (state 4, the excess auction): holders already have the floor,
-    //   and the lot is surplus that would otherwise round away in pro rata claims, typically a thin
-    //   item such as an NFT or a wrapped position. Nothing values it, so the price is not measured
-    //   against the currency held: it falls in a straight line from repayment * opening / 10000 to
-    //   zero over the auction length, and a sale must pay more than zero. Once it reaches zero the
-    //   auction is over: claims open and take the lot in kind. Holders wait at most the length.
+    //   so only the thin items are sold: lot tokens under the threshold, and for a token currency
+    //   the nanoERG above 1000000 if that is under the threshold too. Those would otherwise round
+    //   away in pro rata claims (typically an NFT or a wrapped position). Every other item stays and
+    //   splits pro rata, so one thin item cannot put the rest of the collateral up for a falling
+    //   price. With the Dutch threshold every item is thin, so the whole lot is sold, as in state 1.
+    //   Nothing values the thin items, so the price is not measured against the currency held: it
+    //   falls in a straight line from repayment * opening / 10000 to zero over the auction length,
+    //   and a sale must pay more than zero. Once it reaches zero the auction is over: claims open
+    //   and take everything in kind. Holders wait at most the length.
     //   An opening of 0 opens no excess auction.
     // The case is fixed at the pull and recorded in the state, so nothing later (a refresh's bounty
     // out of an ERG currency, say) can move an auction from one case to the other.
@@ -71,8 +75,10 @@
     //   is the continuation's whole value. Opening an auction records its start height, within 8
     //   blocks of HEIGHT, since a script cannot pin HEIGHT exactly.
     // SALE (burned = 0, after the pull, state 1 or 4; anyone). Context var 0: Int continuation index.
-    //   Takes the lot, takes no currency, and leaves the reserve and the currency alone. The state
-    //   becomes 2. State 1: brings the vault's currency up to at least the current target.
+    //   State 1 takes the whole lot; state 4 takes only its thin items. Neither takes currency. The
+    //   continuation holds the reserve, then (token currency) the currency, then every lot token that
+    //   stays, in the vault's order; a state 4 sale keeps a token currency's nanoERG unless it is thin.
+    //   The state becomes 2. State 1: brings the vault's currency up to at least the current target.
     //   State 4: adds at least the current excess price, strictly before the end of the fall.
     // PARTIAL CLAIM (0 < burned < outstanding, after the pull).
     //   Context var 0: Int continuation index; 1: Int payout index, distinct.
@@ -93,7 +99,11 @@
     //   holders: at most 0.01 ERG per two years.
     //
     // ASSUMPTIONS AND LIMITS
-    // - The lot is sold whole, to one buyer. There are no partial purchases.
+    // - The lot (state 1) or its thin items (state 4) go whole, to one buyer. There are no partial
+    //   purchases.
+    // - A state 4 sale reads the thin items from the vault as it stands. Tokens never change before
+    //   the sale, but a refresh's bounty can lower a token currency's nanoERG by up to 0.01 ERG, and
+    //   with it below the threshold that nanoERG is sold as well.
     // - Share holders wait out a state 1 auction's expiry, or a state 4 auction's length, before they
     //   can claim in kind. After that the lot can still be bought until the first partial claim:
     //   at the floor in state 1, and in state 4 never, since its price has reached zero.
@@ -248,6 +258,7 @@
                         val openingBps = auction(1)
                         val floorBps = auction(2)
                         val length = auction(3)
+                        val threshold = auction(5)
                         val began = auction(6)
                         val sinceRaw = HEIGHT.toLong - began
                         val since = if (sinceRaw < 0L) 0L else if (sinceRaw > length) length else sinceRaw
@@ -261,11 +272,25 @@
                         })
                         val after = if (paysERG) {
                             next.value
-                        } else if (next.tokens.size == 2 && next.tokens(1)._1 == currency) {
+                        } else if (next.tokens.size > 1 && next.tokens(1)._1 == currency) {
                             next.tokens(1)._2
                         } else -1L
-                        val onlyCurrencyLeft = if (paysERG) next.tokens.size == 1
-                            else next.tokens.size == 2 && next.value >= 1000000L
+                        // State 1 sells the whole lot. State 4 sells only its thin items, those under the
+                        // in-kind threshold: every other lot token stays, and so does a token currency's
+                        // nanoERG unless it is thin too. What stays splits pro rata in the claims.
+                        val excess = state == 4.toByte
+                        val kept = assets.filter { (t: (Coll[Byte], Long)) =>
+                            excess && t._1 != currency && t._2 >= threshold
+                        }
+                        val keepsERG = excess && !paysERG && SELF.value - 1000000L >= threshold
+                        // The vault keeps, in this order: the reserve, the currency (token currency), the
+                        // items that stay. With an ERG currency the nanoERG is the currency and stays anyway.
+                        val leftOver = if (paysERG) {
+                            next.tokens == SELF.tokens.slice(0, 1).append(kept)
+                        } else {
+                            next.tokens == SELF.tokens.slice(0, 1).append(Coll((currency, after))).append(kept) &&
+                            next.value >= (if (keepsERG) SELF.value else 1000000L)
+                        }
                         // State 1: the vault reaches the target. State 4: the buyer adds the excess
                         // price, repayment * opening * (length - since) / (10000 * length), which
                         // must still be above zero, so a sale ends strictly before the fall does.
@@ -277,8 +302,7 @@
                                 repayment.toBigInt * openingBps.toBigInt * (length - since).toBigInt
                         }
                         sigmaProp(
-                            carried && nextAuction(6) == began &&
-                            next.tokens(0) == SELF.tokens(0) && onlyCurrencyLeft &&
+                            carried && nextAuction(6) == began && leftOver &&
                             next.R6[Byte].get == 2.toByte &&
                             length >= 1L && after >= before && priced
                         )

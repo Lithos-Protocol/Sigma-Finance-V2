@@ -252,7 +252,8 @@ object ExchangeCommands {
     }
     vaults.foreach { v =>
       val kind = if (!v.dutch) "plain fractional" else if (v.threshold == StandardProtocol.DutchThreshold) "Dutch" else "Selective"
-      println(s"Share ${v.shareId}  vault ${v.box.id}  ($kind)")
+      println(s"Share ${v.shareId}  vault ${v.box.id}  ($kind)" +
+        (if (app.shareVerified(v)) "" else " (WARNING: not minted by a standard share mint: this vault proves nothing)"))
       println(s"  bond ${v.bondAsset}: ${v.outstanding} of ${v.n} shares outstanding")
       metadataLine(app.shareMetadataIssues(v.shareId))
       val status =
@@ -313,6 +314,8 @@ object ExchangeCommands {
       app.bondOf(a.token.id).foreach { case (asset, n) =>
         println(s"  a claim on bond $asset" + (if (n > 1L) s" ($n shares per bond)" else ""))
       }
+      if (app.unverifiedShares(a.token.id))
+        println("  WARNING: a share vault names a bond for this token, but no standard share mint minted it: it claims nothing")
       if (app.isOwnHash(a.sellerHash)) println("  (your ask)")
     }
   }

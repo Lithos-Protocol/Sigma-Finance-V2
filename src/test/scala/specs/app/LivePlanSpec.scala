@@ -40,7 +40,7 @@ class LivePlanSpec extends AnyPropSpec with Matchers {
 
   /** A stand-in value for each variable: box and token ids are 64 hex characters, heights numbers. */
   private val sample: Map[String, String] =
-    plan.flatMap(_.reads).distinct.map(n => n -> (if (n == "T0" || n == "M") "1000000" else "ab" * 32)).toMap
+    plan.flatMap(_.reads).distinct.map(n => n -> (if (Set("T0", "M", "V")(n)) "1000000" else "ab" * 32)).toMap
 
   private val standardCommands = ExchangeCommands.Commands ++ Set("info", "orders", "bonds", "claims", "create-order",
     "cancel-order", "refund-order", "repay", "recollateralize", "fill-order", "claim", "liquidate")
@@ -133,6 +133,27 @@ class LivePlanSpec extends AnyPropSpec with Matchers {
     args("K1").opt("end-yield") shouldBe Some("10")
     args("K3").opt("yield").isDefined shouldBe true
     args("O1").opt("curve").isDefined shouldBe true
+  }
+
+  property("window orders are filled at a chosen maturity and at zcs1's default, and a Dutch vault opens an excess auction") {
+    def args(id: String) = Args.parse(Args.tokenize(LivePlan.fill(byId(id).command, sample).right.get))
+    Seq("V1", "V6").foreach { id =>
+      withClue(s"$id: ") {
+        args(id).opt("window").isDefined shouldBe true
+        args(id).opt("curve").isDefined shouldBe true
+      }
+    }
+    args("V3").opt("maturity") shouldBe Some("1000000")
+    args("V7").opt("maturity") shouldBe None
+    Seq("V3", "V7").foreach(id => byId(id).check shouldBe a[Check.PricedFill])
+    // Maturity V must sit inside V's window for a fill soon after the setup.
+    val Array(lo, hi) = args("V1").opt("window").get.split(":").map(_.toLong)
+    LivePlan.WindowMaturityBlocks.toLong should (be > lo + 100L and be < hi)
+    byId("D3").command should include("--dutch")
+    byId("D5").check shouldBe Check.VaultState("vaultD", 4)
+    byId("D7").check shouldBe Check.VaultState("vaultD", 2)
+    byId("E12").check shouldBe Check.VaultState("vaultE", 1)
+    plan.exists(s => s.kind == Kind.Refusal && s.command.startsWith("refresh")) shouldBe true
   }
 
   property("every step explains itself in a sentence or two, and every explanation belongs to a step") {

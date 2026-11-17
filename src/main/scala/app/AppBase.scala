@@ -265,10 +265,12 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
    * and tokens the outputs, burns and fee need beyond what those inputs carry. Change returns to this
    * wallet; a surplus too small for a change box, with no tokens to carry, goes to the miner. Wallet boxes
    * holding a token being burned are never picked: the leftover would reach the change box, and every
-   * burn here requires that no output carries the token.
+   * burn here requires that no output carries the token. With `madeBy`, only wallet boxes made at or before
+   * that height are picked: an output stamped then may not sit below any input (EIP-39).
    */
   protected def plan(spends: Seq[InputUTXO], outputs: Seq[UTXO], burn: Seq[Token] = Seq.empty,
-                     minted: Option[ErgoId] = None, dataInputs: Seq[InputUTXO] = Seq.empty): Plan = {
+                     minted: Option[ErgoId] = None, dataInputs: Seq[InputUTXO] = Seq.empty,
+                     madeBy: Option[Long] = None): Plan = {
     def left(inputs: Seq[InputUTXO]): (Long, Map[ErgoId, Long]) = {
       val erg = inputs.map(_.value).sum - outputs.map(_.value).sum - settings.fee
       val held = tally(inputs.flatMap(_.tokens))
@@ -282,7 +284,7 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
     val selfFunded = short.isEmpty && (erg >= MinBox || (erg >= 0 && !carries))
     val wallet =
       if (selfFunded) Seq.empty
-      else selectWallet(math.max(0L, MinBox - erg), short, spends.map(_.id).toSet, burn.map(_.id).toSet)
+      else selectWallet(math.max(0L, MinBox - erg), short, spends.map(_.id).toSet, burn.map(_.id).toSet, madeBy)
 
     val (finalErg, finalTokens) = left(spends ++ wallet)
     val dust = if (finalErg > 0 && finalErg < MinBox && !finalTokens.exists(_._2 > 0)) finalErg else 0L
@@ -304,8 +306,11 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
    * boxes always come before unconfirmed ones.
    */
   private def selectWallet(erg: Long, tokens: Map[ErgoId, Long], exclude: Set[ErgoId],
-                           avoidTokens: Set[ErgoId]): Seq[InputUTXO] = {
+                           avoidTokens: Set[ErgoId], madeBy: Option[Long] = None): Seq[InputUTXO] = {
     val pool = walletBoxes.filterNot(b => exclude.contains(b.id) || b.tokens.exists(t => avoidTokens.contains(t.id)))
+      .filter(b => madeBy.forall(h => b.input.getCreationHeight.toLong <= h))
+    val aged = madeBy.fold("")(h => s" made by height $h (an output here is stamped then, and EIP-39 forbids a younger " +
+      "input: send yourself a box and use it once it is that old)")
     val chosen = mutable.LinkedHashSet.empty[InputUTXO]
     def held(id: ErgoId): Long = chosen.toSeq.flatMap(_.tokens).filter(_.id == id).map(_.amount).sum
     def amountIn(b: InputUTXO, id: ErgoId): Long = b.tokens.filter(_.id == id).map(_.amount).sum
@@ -313,14 +318,14 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
     tokens.foreach { case (id, need) =>
       pool.filter(amountIn(_, id) > 0).sortBy(b => (unconfirmed(b), -amountIn(b, id)))
         .foreach(b => if (held(id) < need) chosen += b)
-      if (held(id) < need) fail(s"the wallet holds ${held(id)} of token $id; this needs $need")
+      if (held(id) < need) fail(s"the wallet holds ${held(id)} of token $id$aged; this needs $need")
     }
     pool.filterNot(chosen.contains).sortBy(b => (unconfirmed(b), -b.value)).foreach { b =>
       if (chosen.toSeq.map(_.value).sum < erg) chosen += b
     }
     val value = chosen.toSeq.map(_.value).sum
     if (value < erg)
-      fail(s"the wallet's spendable boxes hold ${Fmt.erg(pool.map(_.value).sum)}; this needs ${Fmt.erg(erg)} " +
+      fail(s"the wallet's spendable boxes$aged hold ${Fmt.erg(pool.map(_.value).sum)}; this needs ${Fmt.erg(erg)} " +
         "from them, the fee and a change box included")
     chosen.toSeq
   }

@@ -37,7 +37,8 @@
     // INPUTS(0) = SELF: the share id is this box's id. Exactly 2*N+1 shares are minted.
     // OUTPUTS(0): N shares at tokens(0), at the owner script. R4, R5, R6 = the three items of R9.
     // OUTPUTS(1): ZC_Standard_FractionalVault with tokens ((share, N+1), (bond asset, 1)),
-    //   R4 = bond asset id, R5: Coll[Long] = (N, N, pull fee).
+    //   R4 = bond asset id, R5: Coll[Long] = (N, N, pull fee), and no R6. The vault's refresh reads R6 as
+    //   a Byte, so a register of any other type there would block the refresh until the pull.
     //
     // CANCEL
     // Nothing is minted, and a co-spent box guarded by the owner script releases this box.
@@ -101,7 +102,11 @@
                 vault.value + shareOut.value >= SELF.value - mintFee &&
                 vault.tokens == Coll((SELF.id, shares + 1L), bondUnit) &&
                 vault.R4[Coll[Byte]].get == bondUnit._1 &&
-                vault.R5[Coll[Long]].get == Coll(shares, shares, pullFee)
+                vault.R5[Coll[Long]].get == Coll(shares, shares, pullFee) &&
+                // No R6: the vault's refresh reads R6 as a Byte, and a register of another type would make
+                // that read fail, leaving the box to storage rent until the pull. Registers are dense, so
+                // without R6 there is nothing after it either.
+                vault.R6[Byte].isDefined == false
 
             sigmaProp(termsValid && mintValid && sharesPaid && vaultValid)
         }

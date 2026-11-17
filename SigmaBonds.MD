@@ -286,11 +286,15 @@ liquidated, the pull opens an auction that sells the collateral for the bond's r
 - If the vault holds less currency than the floor target, it is the floor auction (state 1). The lot
   stays on sale at the floor from the end of the fall until the **expiry**. Partial claims wait for the
   expiry; a claim after that takes the unsold collateral in kind and closes the auction.
-- If the vault already holds the floor target, it is the **excess auction** (state 4). The thin items
-  are surplus that pro rata claims would round away, leaving them all to the last claimant: an NFT, a
-  wrapped LithosDex receipt. Nothing values them, so the price is not measured against the currency
-  held: it falls from `opening × repayment` to zero over the length, and a sale must pay more than
-  zero. When it reaches zero, claims open and take the lot in kind. An opening of 0 opens no auction.
+- If the vault already holds the floor target, it is the **excess auction** (state 4). Only the thin
+  items are sold: the lot tokens under the threshold, and for a token currency the nanoERG if that is
+  under it too. They are surplus that pro rata claims would round away, leaving them all to the last
+  claimant: an NFT, a wrapped LithosDex receipt. Every other item stays in the vault and splits pro
+  rata, so one thin item (a dust token a borrower put in the collateral, say) cannot put the rest of
+  the collateral up at a falling price. With the Dutch threshold every item is thin, so the whole lot
+  is sold. Nothing values the thin items, so the price is not measured against the currency held: it
+  falls from `opening × repayment` to zero over the length, and a sale must pay more than zero. When
+  it reaches zero, claims open and take everything in kind. An opening of 0 opens no auction.
 - Which auction opens is fixed at the pull and recorded in R6, so nothing later (a refresh's bounty
   out of an ERG currency) can move an auction from one case to the other. The final claim works in
   every state.
@@ -302,8 +306,10 @@ excess auction, or a floor auction expires unsold; both are unavoidable without 
 and the floor is the lenders' own reserve, which offers rely on.
 
 The vault's state is R6: 0 repaid, 1 floor auction open, 2 sold or nothing to sell, 3 paid out in
-kind, 4 excess auction open. Registers are dense, so the mint places some R6 to carry R7 and R8;
-nothing reads it before the pull.
+kind, 4 excess auction open. Registers are dense, so the mint places R6 to carry R7 and R8, and pins
+it to the byte 0: the vault's refresh reads it as a byte before the pull, and a register of another
+type would make that read fail and leave the box to storage rent. The plain fractional mint, for the
+same reason, gives its vault no R6.
 
 ## Custody wraps
 
@@ -403,7 +409,8 @@ holds there until the expiry, when anyone may refund the lot to the seller for t
 price only falls, so a purchase priced now stays valid. Prices are absolute; a client may set them
 from an oracle. It is how a holder paid collateral in kind, by a Selective vault, a Dutch auction past
 its expiry or several bonds at once, gets the repayment asset back without staying online. It does
-not follow the ask convention, so lend offers never buy from it.
+not follow the ask convention: its payout carries R4 and no R5, and a lend offer requires the payout's
+R5 to state the units it receives, so no offer can be matched against a lot.
 
 ### Lend offer
 
@@ -628,3 +635,24 @@ Cost and size figures above were remeasured after the change that follows.
 Every tree that pins another changed with them: the bond (through the vault), both orders, the offer,
 the Dutch mint and both share mints. Existing boxes keep their old scripts. Validation is offline
 (521 tests across 30 suites); nothing has run on a live node.
+
+## Audit fixes (2026-11-17)
+
+From [the audit](./docs/ZC_STANDARD_AUDIT_2026-11-17.md):
+
+- **Share mints pin the vault's R6.** `FractionalMint` gives its vault no R6; `DutchAuctionMint` pins it to
+  the byte 0. Before, a minter could put a register of another type there, which made the holding vault's
+  refresh fail and left it to storage rent.
+- **Excess auctions sell only thin items.** In state 4 a sale takes only the lot items under the threshold;
+  every other token, and a token currency's nanoERG unless it is thin, stays in the vault for pro rata
+  claims. With the Dutch threshold every item is thin, so a Dutch vault sells everything as before.
+- **Lot payouts carry no R5**, so no lend offer can be matched against a `LotAuction`.
+- **Bond refresh inputs.** The bond's tree is unchanged; its header now says that every input of a refresh
+  must be at least 60 blocks old (EIP-39), and the client picks only such inputs.
+- **Client.** Wallet buys, sells, offer matches and listings verify a share's origin before treating it as
+  a claim on a bond.
+
+Changed trees: `FractionalMint`, `DutchAuctionVault`, `DutchAuctionMint`, `LotAuction`, and through the
+Dutch mint's hash, `LendOffer`. The bond, bond vault, orders and asks keep their trees. Existing boxes keep
+their old scripts. Validation is offline (524 tests across 30 suites, plus throwaway probes of each fix);
+nothing has run on a live node.

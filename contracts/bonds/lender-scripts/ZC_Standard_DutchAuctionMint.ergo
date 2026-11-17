@@ -38,9 +38,10 @@
     //     offer can set them without knowing which bond it will buy.
     //   5 auction length in blocks, 1..1000000. The vault's currency target falls in a straight
     //     line from the opening to the floor over this many blocks and then stays at the floor.
-    //     When the vault already holds the floor target, an excess auction's price falls from the
-    //     opening to zero over the same length instead. See ZC_Standard_DutchAuctionVault: an
-    //     opening of 0 never opens an auction, and a floor of 0 auctions thin items with no reserve.
+    //     When the vault already holds the floor target, an excess auction sells only the items under
+    //     the threshold, its price falling from the opening to zero over the same length instead.
+    //     See ZC_Standard_DutchAuctionVault: an opening of 0 never opens an auction, and a floor of 0
+    //     auctions thin items with no reserve.
     //   6 auction expiry in blocks from the auction's start, length..1000000. The lot stays on
     //     sale at the floor from the end of the fall until then; share holders cannot claim the
     //     unsold lot in kind before it. It counts from the start because the start is only known
@@ -70,10 +71,11 @@
     //   runtime, as for the origin check in ZC_Standard_LendOffer.
     // OUTPUTS(0): N shares at tokens(0), at the owner script. R4, R5, R6 = the three items of R9.
     // OUTPUTS(1): ZC_Standard_DutchAuctionVault with tokens ((share, N+1), (bond asset, 1)),
-    //   R4 = bond asset id, R5 = (N, N, pull fee), R6 any value,
+    //   R4 = bond asset id, R5 = (N, N, pull fee), R6: Byte = 0,
     //   R7 = (repayment, opening bps, floor bps, length, expiry, threshold, 0), R8 = CONST_REPAYMENT_TOKEN.
-    //   Registers are dense, so R6 must exist to carry R7 and R8. Nothing reads it until the pull
-    //   sets the vault's state, so this script leaves it free.
+    //   Registers are dense, so R6 must exist to carry R7 and R8. The pull overwrites it with the
+    //   vault's state, but the vault's refresh reads it as a Byte before then, so it is pinned here: a
+    //   register of another type would make that read fail and leave the box to storage rent.
     //
     // CANCEL
     // Nothing is minted, and a co-spent box guarded by the owner script releases this box.
@@ -169,6 +171,7 @@
                     vault.tokens == Coll((SELF.id, shares + 1L), bondUnit) &&
                     vault.R4[Coll[Byte]].get == bondUnit._1 &&
                     vault.R5[Coll[Long]].get == Coll(shares, shares, pullFee) &&
+                    vault.R6[Byte].get == 0.toByte &&
                     vault.R7[Coll[Long]].get == Coll(repayment, openingBps, floorBps, length, expiry, threshold, 0L) &&
                     vault.R8[Coll[Byte]].get == CONST_REPAYMENT_TOKEN
 

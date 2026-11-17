@@ -513,7 +513,7 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
              |Wallet $address holds ${Fmt.erg(balance)}. Height $height; the oracle price is $age blocks old.
              |
              |The live test submits about $txs transactions on MAINNET from this wallet, which is borrower, lender,
-             |seller, buyer and batcher throughout. Loans are 0.1 ERG. At most about 2.7 ERG sits in contracts at
+             |seller, buyer and batcher throughout. Loans are 0.1 ERG. At most about 3.2 ERG sits in contracts at
              |once, and all of it comes back to this wallet; the cost is the miner fees, about ${txs + 10} x 0.001 ERG.
              |The setup mints $TokenAmount "$TokenName" tokens (worthless test collateral).
              |
@@ -572,10 +572,12 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
         set(s.id)(ss => ss.copy(attempts = ss.attempts + 1))
         finish(s, Failed, s"the node wallet did not send it: ${e.getMessage}")
       case Success(txId) =>
-        state = state.bind("T0" -> v.height.toString, "M" -> (v.height + state.maturityBlocks).toString)
+        state = state.bind("T0" -> v.height.toString, "M" -> (v.height + state.maturityBlocks).toString,
+          "V" -> (v.height + LivePlan.WindowMaturityBlocks).toString)
         set(s.id)(ss => ss.copy(status = InFlight, txs = Vector(txId), attempts = ss.attempts + 1, ranAt = Some(v.height),
           command = Some("POST /wallet/transaction/send")))
-        say(s"[${s.id}] submitted: $txId. T0 = ${v.height}; bonds D and E mature at M = ${v.height + state.maturityBlocks}")
+        say(s"[${s.id}] submitted: $txId. T0 = ${v.height}; bonds D and E mature at M = ${v.height + state.maturityBlocks}; " +
+          s"window bond V at V = ${v.height + LivePlan.WindowMaturityBlocks}")
         if (!readSetup(txId)) say(s"[${s.id}] the token id is read once the transaction confirms")
     }
   }

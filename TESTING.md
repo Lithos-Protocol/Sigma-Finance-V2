@@ -241,3 +241,23 @@ live and settled, in `ZcStandardDutchAuctionSpec`; the wrap and curve-order cros
 
 On 2026-11-16 all 521 tests across 30 suites passed. Costs from `SIGMAFI_COST` are in SigmaBonds.MD,
 "Cost and size". No live-node transactions were broadcast.
+
+### Live plan: window orders and the Dutch excess auction (2026-11-17)
+
+The live plan gained track V (a window order filled from the wallet at maturity `V`, a setup variable
+600 blocks after the setup; a second matched by a lend offer at zcs1's default maturity; refusals of a
+moving yield on a window order and of a maturity outside the window), a Dutch excess auction on bond D
+(pull to state 4, a claim refused while it runs, the lot bought, the final claim) and an end check
+that no wraps are left. `LivePlanSpec` asserts these paths; `LivePricingSpec` signs the V commands and
+D's Dutch request offline. All 524 tests passed. Nothing was broadcast.
+
+## Audit fixes (2026-11-17)
+
+The fixes from `docs/ZC_STANDARD_AUDIT_2026-11-17.md` changed the fractional and Dutch mints, the Dutch vault
+and the lot auction (and so the lend offer's tree); pins and the reference were regenerated. The existing 524
+tests pass unchanged. Each fix was also checked by throwaway probes, not kept in the suite: both mints refuse a
+vault R6 of the wrong type or value; a Selective excess sale must leave its fat token (ERG currency) and its
+nanoERG (SigUSD currency) and claims then split them, while a Dutch one still sells everything; a lot payout
+with an R5 is refused; the client refuses a hand-made share vault naming a genuine bond, and a bond refresh
+beside a box younger than its stamp. Dedicated specs for these are listed in the audit report as test cases
+to add.

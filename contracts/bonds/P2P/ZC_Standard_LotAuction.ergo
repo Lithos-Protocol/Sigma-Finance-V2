@@ -6,7 +6,9 @@
     // kind (a Selective vault whose collateral split pro rata, a Dutch vault after its expiry, or
     // several bonds' collateral at once) who wants the repayment currency back without staying
     // online. It does not follow the ask convention, because it sells a basket rather than one
-    // token, so ZC_Standard_LendOffer never buys from it.
+    // token. Its payout carries R4 only: an R5 is refused, and ZC_Standard_LendOffer requires the
+    // payout's R5 to state the units it receives, so no lend offer can be matched against a lot (and
+    // a batcher cannot sell it one token of the basket while keeping the rest).
     //
     // CONSTANTS
     // CONST_PAYMENT_TOKEN: Coll[Byte] - the currency the seller is paid in; EMPTY for ERG. One address
@@ -31,7 +33,7 @@
     //
     // BUY (anyone, before expiry)
     // Context var 0: Int payout index. The payout is at the seller script with R4 = SELF.id, so one
-    // payout cannot pay for two lots, and holds the price:
+    // payout cannot pay for two lots, and no R5 (nor any later register), and holds the price:
     //   ERG currency: at least this box's value plus the price, in nanoERG.
     //   Token currency: tokens(0) = (currency, at least the price); the buyer funds its nanoERG.
     // The buyer takes the lot: no other output is constrained. Checked without division, with
@@ -39,8 +41,8 @@
     //   paid * L >= opening * L - (opening - floor) * (at - start).
     //
     // EXPIRY REFUND (anyone, once HEIGHT >= expiry)
-    // Context var 0: Int refund index. The refund is at the seller script with R4 = SELF.id, every
-    // token of this box, and at least this value less the refund fee R5(5). The tag lets a seller
+    // Context var 0: Int refund index. The refund is at the seller script with R4 = SELF.id and no R5,
+    // every token of this box, and at least this value less the refund fee R5(5). The tag lets a seller
     // that is a contract, which cannot co-sign a cancel, recognise its lot.
     //
     // CANCEL
@@ -66,9 +68,12 @@
             sigmaProp(false)
         } else {
             val payout = OUTPUTS(payoutIndex)
+            // R4 only. Registers are dense, so no R5 means no register after R4; an R5 of any other
+            // type fails the read. Without R5 the payout cannot pass a lend offer's ask check.
             val toSeller =
                 blake2b256(payout.propositionBytes) == sellerHash &&
-                payout.R4[Coll[Byte]].get == SELF.id
+                payout.R4[Coll[Byte]].get == SELF.id &&
+                payout.R5[Long].isDefined == false
             if (HEIGHT.toLong >= terms(4)) {
                 // Expiry refund, by anyone: the whole lot goes back to the seller, less the fee.
                 sigmaProp(toSeller && payout.tokens == SELF.tokens && payout.value >= SELF.value - terms(5))

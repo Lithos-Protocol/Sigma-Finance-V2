@@ -82,6 +82,9 @@
     // this script, the same tokens and registers, and a creation height between 1000 and 60 blocks
     // before HEIGHT, so the next refresh is about two years away. The bounty comes out of collateral
     // ERG, so it can lower an oracle cover by up to 0.01 ERG.
+    // No output may be stamped below any input's creation height (EIP-39, from block version 3), so
+    // every input of a refresh transaction must be at least 60 blocks old. A refresher that needs a
+    // box for the miner fee (a bond at its floor pays no bounty) keeps an aged one for it.
     // A refresh moves the bond, so pending transactions against the old box id must be rebuilt.
     // Two limits keep a third party from using that against the borrower:
     // - The stamp is at least 60 blocks old, so the refreshed bond has already rested and the

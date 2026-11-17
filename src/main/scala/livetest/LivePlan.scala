@@ -110,7 +110,10 @@ case class Step(id: String, track: String, title: String, kind: Kind, command: S
  *  - B: on-close yield issuance with token collateral, recollateralized after the 60-block wait, repaid from collateral
  *  - C: an oracle-rule bond below its ratio, refused by an offer, liquidated early in a pack with a refund
  *  - D/E: a curve lend offer filling a rising-yield order, buying the unit from a yield ask and guarded yield-priced
- *    Dutch shares; two bonds liquidated at maturity together; the Dutch auction pulled, its lot bought, the shares claimed
+ *    Dutch shares; two bonds liquidated at maturity together; E's Dutch auction pulled, its lot bought, the shares
+ *    claimed; D's Dutch vault already holds its floor, so its thin lot goes to an excess auction (state 4)
+ *  - V: window orders, where the lender picks the maturity: one filled from the wallet at a chosen maturity, one
+ *    matched by a lend offer at zcs1's default maturity; both repaid and claimed
  *  - K: expiry refunds and cancels of orders, offers and asks, and a SigUSD-market order and ask
  *  - L: a lot auction of test tokens bought by this wallet, and one refunded after its expiry
  *  - W: a test token wrapped, its receipt minted and unwrapped, a refresh refused as too early, a wrap cancelled
@@ -122,7 +125,8 @@ case class Step(id: String, track: String, title: String, kind: Kind, command: S
  * above the offer's yield for the offer's 0.005 ERG batcher fee to fit.
  *
  * Variables bound by the setup: `token` (the test token, collateral that the oracle values at nothing),
- * `T0` (the height the setup ran at) and `M` (T0 plus the maturity blocks: when bonds D and E mature).
+ * `T0` (the height the setup ran at), `M` (T0 plus the maturity blocks: when bonds D and E mature) and `V`
+ * (T0 plus `WindowMaturityBlocks`: the maturity the lender chooses for window order V).
  */
 object LivePlan {
 
@@ -130,7 +134,13 @@ object LivePlan {
   import Gate._
 
   /** Variables the setup binds. */
-  val SetupVars: Seq[String] = Seq("token", "T0", "M")
+  val SetupVars: Seq[String] = Seq("token", "T0", "M", "V")
+
+  /**
+   * Blocks from the setup to the maturity chosen for window order V. Its window is 30 to 1000 blocks after the fill,
+   * so the fill can land up to 570 blocks after the setup and still choose it. The bond is repaid at once.
+   */
+  val WindowMaturityBlocks = 600
 
   /** Blocks from the setup to the maturity of bonds D and E, unless the runner is told otherwise. */
   val DefaultMaturityBlocks = 40
@@ -202,8 +212,9 @@ object LivePlan {
       s"create-order --principal 0.1 --repayment 0.12 --collateral-erg 0.25 --collateral-token {token}:1000 " +
         s"$oracleOrder --maturity {M} --exact-maturity --expires-in 30 --yield 100000 --end-yield 120000",
       after = Seq("S1"), binds = Seq(out("orderE", 0))),
-    tx("D1", "D/E Dutch", "Order D: borrow 0.1, repay 0.11, 0.15 ERG, maturity rule, matures at M",
-      "create-order --principal 0.1 --repayment 0.11 --collateral-erg 0.15 --maturity {M} --exact-maturity --expires-in 30",
+    tx("D1", "D/E Dutch", "Order D: borrow 0.1, repay 0.11, 0.15 ERG and 500 test tokens, maturity rule, matures at M",
+      "create-order --principal 0.1 --repayment 0.11 --collateral-erg 0.15 --collateral-token {token}:500 --maturity {M} " +
+        "--exact-maturity --expires-in 30",
       after = Seq("S1"), binds = Seq(out("orderD", 0))),
 
     // ─── C, first part: the offer must refuse an undercollateralized order ───
@@ -245,8 +256,21 @@ object LivePlan {
     tx("E11", "D/E Dutch", "Cancel what is left of the offer", "cancel-offer {offer1}", after = Seq("E10")),
     tx("DE1", "D/E Dutch", "Liquidate bonds D and E together at maturity", "liquidate {bondD} {bondE}",
       after = Seq("D2", "E10"), gate = Reached("M")),
-    tx("D3", "D/E Dutch", "Claim liquidated bond D with its unit", "claim {orderD}", after = Seq("DE1"),
-      check = Check.TokenGone("orderD")),
+    tx("D3", "D/E Dutch", "Fractionalize bond D's unit into Dutch shares: 20% down to 10%, under the ERG it holds",
+      "fractionalize {orderD} --dutch --auction-opening 20 --auction-floor 10 --auction-length 30 --auction-expiry 30",
+      settled = Seq("D2"), binds = Seq(out("reqD", 0))),
+    tx("D4", "D/E Dutch", "Mint bond D's Dutch shares (this wallet as batcher)", "mint-shares {reqD}", after = Seq("D3"),
+      binds = Seq(out("vaultD", 1))),
+    tx("D5", "D/E Dutch", "Pull liquidated bond D: the floor is already held, so an excess auction opens (state 4)",
+      "pull {vaultD}", after = Seq("DE1", "D4"), binds = Seq(out("vaultD", 0)), check = Check.VaultState("vaultD", 4)),
+    read("D6", "D/E Dutch", "The excess auction lists with its falling price", "shares --mine", Seq("EXCESS AUCTION OPEN"),
+      after = Seq("D5")),
+    refusal("D6x", "D/E Dutch", "Claims wait for the excess auction's end", s"claim-shares {reqD} --amount ${10 * SharePct}",
+      "excess auction runs until", after = Seq("D5")),
+    tx("D7", "D/E Dutch", "Buy the excess auction's lot (the 500 test tokens) at its current price", "buy-lot {vaultD}",
+      after = Seq("D5", "D6", "D6x"), binds = Seq(out("vaultD", 0)), check = Check.VaultState("vaultD", 2)),
+    tx("D8", "D/E Dutch", "Final claim on bond D's Dutch shares", "claim-shares {reqD}", after = Seq("D7"),
+      check = Check.TokenGone("reqD")),
     tx("E12", "D/E Dutch", "Pull bond E's liquidation into the Dutch vault: the auction opens",
       "pull {vaultE}", after = Seq("DE1", "E8"), binds = Seq(out("vaultE", 0)), check = Check.VaultState("vaultE", 1)),
     read("E13", "D/E Dutch", "The open auction lists with its price", "shares --mine", Seq("AUCTION OPEN"),
@@ -367,6 +391,36 @@ object LivePlan {
       "--opening 1 --floor 0.5", after = Seq("S1"), binds = Seq(out("lot3", 0))),
     tx("L7", "L lots", "Cancel the lot", "cancel-lot {lot3}", after = Seq("L6")),
 
+    // ─── V: window orders, the lender picks the maturity ─────────────────────
+    tx("V1", "V window", "Window order V: repay 0.12 within 30 to 1000 blocks, priced from 5000% to 8000% on a curve",
+      "create-order --principal 0.1 --repayment 0.12 --collateral-erg 0.15 --window 30:1000 --expires-in 200 " +
+        "--curve 5000:30,8000:1000", after = Seq("S1"), binds = Seq(out("orderV", 0))),
+    refusal("V1x", "V window", "A window order's yield cannot move with time",
+      "create-order --principal 0.1 --repayment 0.12 --collateral-erg 0.15 --window 30:1000 --yield 5 --end-yield 10",
+      "does not move with time"),
+    read("V2", "V window", "The window order lists with its window, curve and zcs1's default maturity", "orders --mine",
+      Seq("{orderV}", "maturity window", "the lender's choice", "curve: at most"), after = Seq("V1")),
+    refusal("V2x", "V window", "A maturity outside the window is refused", "fill-order {orderV} --maturity {T0}",
+      "outside the order's window", after = Seq("V1")),
+    tx("V3", "V window", "Fill window order V from the wallet, choosing maturity V", "fill-order {orderV} --maturity {V}",
+      after = Seq("V2", "V2x"), binds = Seq(out("bondV", 1), out("principalV", 2)),
+      check = Check.PricedFill("orderV", "bondV", "principalV")),
+    tx("V4", "V window", "Repay bond V at once, long before its maturity", "repay {bondV}", after = Seq("V3")),
+    tx("V5", "V window", "Claim repaid bond V", "claim {orderV}", after = Seq("V4"), check = Check.TokenGone("orderV")),
+    tx("V6", "V window", "Window order W: repay 0.12 within 30 to 200 blocks, oracle rule, curve 50000% to 80000%",
+      s"create-order --principal 0.1 --repayment 0.12 --collateral-erg 0.25 $oracleOrder --window 30:200 --expires-in 200 " +
+        "--curve 50000:30,80000:200", after = Seq("V5"), binds = Seq(out("orderW", 0))),
+    tx("O4", "V window", "Lend offer of 0.3 ERG at 5% for oracle-rule bonds at 150%",
+      s"create-offer --capital 0.3 $offerTerms --expires-in 300", after = Seq("V5"), binds = Seq(out("offer5", 0))),
+    tx("V7", "V window", "The offer fills window order W at zcs1's default maturity",
+      "match-offer {offer5} --order {orderW}", after = Seq("V6", "O4"),
+      binds = Seq(out("bondW", 1), out("principalW", 2), out("offer5", 3)),
+      check = Check.PricedFill("orderW", "bondW", "principalW")),
+    tx("V8", "V window", "Cancel what is left of the offer", "cancel-offer {offer5}", after = Seq("V7")),
+    tx("V9", "V window", "Repay bond W", "repay {bondW}", after = Seq("V7")),
+    tx("V10", "V window", "Claim repaid bond W with the unit the offer delivered", "claim {orderW}", after = Seq("V9"),
+      check = Check.TokenGone("orderW")),
+
     // ─── W: custody wraps and the paid refresh ────────────────────────────────
     tx("W1", "W wraps", "Wrap 1 test token: a request a batcher mints into a receipt and a vault",
       "wrap {token} --amount 1 --refresh-reserve 0.01", after = Seq("S1"), binds = Seq(out("wrapReq1", 0))),
@@ -416,6 +470,7 @@ object LivePlan {
     end("Z4", "No asks left", "asks --mine", "No asks."),
     end("Z5", "No share requests or vaults left", "shares --mine", "No share requests or vaults."),
     end("Z7", "No lots left", "lots --mine", "No lots."),
+    end("Z8", "No wraps left", "wraps --mine", "No wrap requests or vaults."),
     end("Z6", "Nothing left to claim", "claims", "Nothing to claim.")
   )
 
@@ -440,8 +495,8 @@ object LivePlan {
     "E1" -> ("A yield-priced order: 0.1 ERG floor, 0.12 repayment, yield rising from 100000% to 120000% by its expiry, " +
       "so its principal falls while it waits. The rate is huge because the loan lasts about 40 blocks; it leaves room " +
       "for the offer's fee. A fill guard protects its collateral."),
-    "D1" -> ("A plain order for 0.1 ERG, repaying 0.11 at height M, under the maturity liquidation rule. This wallet " +
-      "fills it by hand, and it is liquidated at maturity together with bond E."),
+    "D1" -> ("A plain order for 0.1 ERG, repaying 0.11 at height M, with 0.15 ERG and 500 test tokens under the " +
+      "maturity liquidation rule. This wallet fills it by hand, and it is liquidated at maturity together with bond E."),
     "C1" -> ("An order backed by only 0.1 ERG against a 0.12 ERG repayment, about 83%, well under its 150% oracle " +
       "ratio. It exists to be refused by an offer, then filled by hand and liquidated early: it leaves out the fill " +
       "guard, and --allow-liquidatable lets the CLI post it."),
@@ -473,8 +528,17 @@ object LivePlan {
       "at any time."),
     "DE1" -> ("Waits for height M, then liquidates bonds D and E in one transaction. Shows two bonds with different " +
       "rules (maturity, and oracle at maturity) settled together for one miner fee."),
-    "D3" -> ("Claims liquidated bond D with its unit: the collateral goes to the unit's holder, and all three bond " +
-      "units burn. Shows the lender's side of a liquidation."),
+    "D3" -> ("Puts bond D's unit into a Dutch mint request whose floor, 10% of the repayment, is far under the 0.15 ERG " +
+      "the bond holds. After the liquidation the floor is already held, so the thin test tokens go to an excess auction."),
+    "D4" -> "Mints bond D's Dutch shares, with this wallet as the batcher keeping the mint fee.",
+    "D5" -> ("Pulls liquidated bond D into its Dutch vault. The vault holds the floor, and the test tokens are thin, so " +
+      "it opens an excess auction (state 4), falling from 20% of the repayment to nothing over 30 blocks."),
+    "D6" -> "Lists the vault with its excess auction open and the current price.",
+    "D6x" -> ("Tries a partial claim during the excess auction, which the CLI must refuse: claims wait until the " +
+      "auction is sold or its price reaches zero, so no holder takes a thin item in kind early."),
+    "D7" -> ("Buys the excess auction's lot at its falling price, paying ERG into the vault. Shows thin collateral " +
+      "sold for ERG even when the floor is already held, rather than paid out in kind."),
+    "D8" -> "Claims with every share, taking the vault's ERG and closing it.",
     "E12" -> ("Pulls bond E's liquidated collateral into its Dutch share vault; anyone can, for the pull fee. The vault " +
       "holds less ERG than the auction floor, so the auction of the test tokens opens."),
     "E13" -> "Lists the share vault with its auction open and the current price. Shows the falling price as readers see it.",
@@ -589,6 +653,28 @@ object LivePlan {
     "W5" -> "A second wrap request, without a refresh reserve, set up to be cancelled.",
     "W6" -> "Cancels the wrap request before a batcher mints it, returning the token.",
 
+    // V: window orders
+    "V1" -> ("A window order: the lender picks the maturity, 30 to 1000 blocks after the fill, and pays the principal " +
+      "the borrower's curve prices there, 5000% at 30 blocks rising to 8000% at 1000, never under 0.1. Repayment stays " +
+      "fixed at 0.12, so a longer loan pays the borrower less now."),
+    "V1x" -> ("Tries a window order whose yield moves with time, which the CLI must refuse: a window order is priced " +
+      "by a curve over maturities, and YieldOrder_Pricing refuses the window mode."),
+    "V2" -> "Lists the window order with its window, its curve and the maturity zcs1 would pick now.",
+    "V2x" -> ("Tries to fill order V at height T0, which the CLI must refuse: the chosen maturity must lie in the " +
+      "window, counted from the fill."),
+    "V3" -> ("This wallet fills order V choosing maturity V, about 600 blocks out, and the check confirms the principal " +
+      "paid is the one recorded, with every borrower term unchanged."),
+    "V4" -> "Repays bond V straight away: a window bond, like any other, can be repaid before its maturity.",
+    "V5" -> "Claims repaid bond V with its unit. All three bond units burn.",
+    "V6" -> ("A second window order, 30 to 200 blocks, under the oracle rule at 150% so a lend offer can buy it, " +
+      "priced high enough to leave room for the offer's fee."),
+    "O4" -> "A small lend offer at 5% that fills window order W.",
+    "V7" -> ("The offer fills window order W without a maturity: the CLI takes zcs1's choice, a grid height if one is " +
+      "in both windows, else the widest gap between the yield the offer earns and the one it requires, else the shorter."),
+    "V8" -> "Cancels what is left of the offer.",
+    "V9" -> "The borrower repays bond W.",
+    "V10" -> "Claims repaid bond W with the unit the offer delivered to this wallet.",
+
     // G: a batch run
     "G1" -> ("An on-close order priced at a 50000% yield, repaying 0.12 after 60 blocks: on a 60-block loan that " +
       "discount leaves room for the offer's fee. It is the order the batch run fills."),
@@ -611,6 +697,7 @@ object LivePlan {
     "Z4" -> "Checks this wallet has no asks left.",
     "Z5" -> "Checks this wallet has no share requests or vaults left.",
     "Z6" -> "Checks nothing is left for this wallet to claim.",
-    "Z7" -> "Checks this wallet has no lots left."
+    "Z7" -> "Checks this wallet has no lots left.",
+    "Z8" -> "Checks this wallet has no wrap requests or vaults left."
   )
 }

@@ -40,10 +40,17 @@ trait StandardAsks extends AppBase { self: StandardApp =>
     (decoded(nodeApi.unspentByTemplateHash(Base16.encode(protocol.askTemplateHash))) ++
       decoded(nodeApi.unspentByTemplateHash(Base16.encode(protocol.pricedAskTemplateHash)))).flatMap(protocol.asAsk)
 
-  /** A bond asset and how many raw units make one bond: the unit itself (1), or a share (N of its vault). */
+  /**
+   * A bond asset and how many raw units make one bond: the unit itself (1), or a share (N of its vault). Only
+   * genuine ones: a unit minted by a standard order, or a share minted by a standard share mint.
+   */
   def bondOf(token: ErgoId): Option[(ErgoId, Long)] =
     if (assetMarket(token).isDefined) Some(token -> 1L)
-    else shareVault(token).map(v => v.bondAsset -> v.n)
+    else verifiedShareVault(token).map(v => v.bondAsset -> v.n)
+
+  /** A token some share vault names a bond for, though no standard share mint minted it: the vault proves nothing. */
+  def unverifiedShares(token: ErgoId): Boolean =
+    assetMarket(token).isEmpty && shareVault(token).exists(v => !shareVerified(v))
 
   /** The live bond a yield ask prices, which its expression reads as a data input. */
   def pricedBond(ask: StdAsk): StdBond = {
@@ -217,6 +224,9 @@ trait StandardAsks extends AppBase { self: StandardApp =>
     val ask = protocol.asAsk(unspent(askId)).getOrElse(fail(s"$askId is not a ZC Standard ask"))
     val n = units.getOrElse(ask.token.amount)
     checkFill(ask, n)
+    if (unverifiedShares(ask.token.id))
+      fail(s"${ask.token.id} sits in a share vault that names a bond, but no standard share mint minted it: anyone can " +
+        "make such a vault, so it claims nothing. This client does not buy it")
     val coverNotes = liveBondOf(ask.token.id).toSeq.flatMap(b => coverCheck(b, allowLiquidatable, s"bond ${b.box.id} is",
       s"Liquidate it instead (`liquidate ${b.box.id}`): its holder, the seller, then claims all the collateral"))
     val (paid, bond) = askPrice(ask, n)

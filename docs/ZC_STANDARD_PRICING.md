@@ -291,11 +291,12 @@ so a holder paid collateral in kind can turn it back into the repayment asset. S
 |---|---|
 | A | Fixed-maturity order at a yield falling from 50% to 20%; Selective shares sold at a yield rising from 5% to 10%, partial wallet fill, repayment and claims |
 | B | On-close order at a 50% yield; recollateralization and repayment from collateral |
-| D/E | A curve offer fills a guarded order whose yield rises from 100000% to 120000%, buys the unit back from an ask falling from 100000% to 80000%, and buys guarded Dutch shares at 400000% |
+| D/E | A curve offer fills a guarded order whose yield rises from 100000% to 120000%, buys the unit back from an ask falling from 100000% to 80000%, and buys guarded Dutch shares at 400000%; bond D's Dutch vault already holds its floor, so its thin lot sells in an excess auction (state 4) |
 | G | On-close order at 50000%, matched by the batch runner with delivery into Selective shares |
 | K | A rising-yield order refunded at expiry, and a SigUSD yield order cancelled after a refused guarded fill |
 | L | Lot auctions: one bought, one refunded after expiry, one cancelled |
-| (none) | Window orders are covered offline only (`ZcStandardPricedOrderSpec`, `StandardWindowRefreshWrapAppSpec`) |
+| V | Window orders priced by a curve: one filled from the wallet at a chosen maturity about 600 blocks out (5000% to 8000%), one matched by a 5% lend offer at zcs1's default maturity (50000% to 80000%); a moving yield on a window order and a maturity outside the window are refused |
+| W | No pricing: wraps, and a refresh refused as too early |
 
 The live loans last tens to hundreds of blocks, so yields that leave room for batcher fees are in the
 thousands of percent. Confirmation checks compare actual principal payments with the bond records,

@@ -13,8 +13,11 @@ import scala.util.Try
  * One piece of batchable work: what it does, the CLI command that does it alone, the nanoERG it pays whoever
  * runs it (before the miner fee), and the boxes it spends, so a batch run never spends a box twice. A refund
  * or a liquidation also names its `packBox`: such work shares a transaction with others through `pack`.
+ * `agedInputs` marks a bond refresh, whose transaction may spend only boxes at least 60 blocks old (EIP-39), so
+ * it packs only with other bond refreshes.
  */
-case class Work(summary: String, command: String, reward: Long, spends: Set[String], packBox: Option[String] = None) {
+case class Work(summary: String, command: String, reward: Long, spends: Set[String], packBox: Option[String] = None,
+                agedInputs: Boolean = false) {
   def packable: Boolean = packBox.isDefined
 }
 
@@ -23,10 +26,12 @@ case class BatchScan(work: Seq[Work], skipped: Seq[String])
 
 /**
  * Part of a packed transaction: one protocol input, given the position of its first output, the outputs it
- * names, the fee it leaves the runner, and the oracle box it reads as data input 0, if any.
+ * names, the fee it leaves the runner, and the oracle box it reads as data input 0, if any. `stamp` is the
+ * creation height a piece gives an output below the current height (a bond refresh's successor): no output may be
+ * stamped below an input (EIP-39), so every input of its transaction must have been made at or before it.
  */
 case class Piece(boxId: String, input: Int => InputUTXO, outputs: Seq[UTXO], reward: Long, note: String,
-                 oracle: Option[OracleState] = None)
+                 oracle: Option[OracleState] = None, stamp: Option[Long] = None)
 
 /**
  * Everything in the standard set that waits on someone other than its owner: share mints and pulls, expiry
@@ -140,7 +145,8 @@ trait StandardBatch extends AppBase { self: StandardApp =>
     val value = refreshedValue(box.value, floor)
     val successor = UTXO(Contract(box.input.getErgoTree), value, box.tokens, box.registers, Some(stamp.toInt))
     Piece(box.id.toString, i => box.withCtxVar(9.toByte, intValue(i)), Seq(successor), box.value - value,
-      s"refreshes $what, made at height $created, for a ${Fmt.erg(box.value - value)} bounty")
+      s"refreshes $what, made at height $created, for a ${Fmt.erg(box.value - value)} bounty",
+      stamp = if (stamp < now) Some(stamp) else None)
   }
 
   /** Refresh boxes old enough for it: several bonds and vaults pack into one transaction; a wrap vault goes alone. */
@@ -166,7 +172,18 @@ trait StandardBatch extends AppBase { self: StandardApp =>
     val starts = pieces.scanLeft(0)(_ + _.outputs.size)
     val inputs = pieces.zip(starts).map { case (p, at) => p.input(at) }
     val price = pieces.flatMap(_.oracle).headOption
-    prepare(title, plan(inputs, pieces.flatMap(_.outputs), dataInputs = price.map(_.box).toSeq),
+    // A bond refresh stamps its successor 60 blocks back, and no output may be stamped below an input (EIP-39):
+    // every input, the wallet's included, must have been made by then.
+    val madeBy = pieces.flatMap(_.stamp).reduceOption(_ min _)
+    madeBy.foreach { stamp =>
+      pieces.zip(inputs).foreach { case (p, in) =>
+        val made = in.input.getCreationHeight.toLong
+        if (made > stamp) fail(s"box ${p.boxId} was made at height $made, but a bond refresh here stamps its successor " +
+          s"at height $stamp, and no output may be stamped below an input (EIP-39): refresh bonds in a transaction of " +
+          "their own")
+      }
+    }
+    prepare(title, plan(inputs, pieces.flatMap(_.outputs), dataInputs = price.map(_.box).toSeq, madeBy = madeBy),
       pieces.map(_.note) ++
         price.map(o => s"oracle price: ${o.price} nanoERG per USD, from height ${o.created}") ++
         Seq(s"you keep ${Fmt.erg(pieces.map(_.reward).sum)} in fees, less the miner fee"))
@@ -248,7 +265,7 @@ trait StandardBatch extends AppBase { self: StandardApp =>
     liveBonds.filter(b => old(b.box) && !liquidating(b.box.id.toString) &&
       (now >= b.maturity || next < b.maturity - RefreshMaturityGap) && bounty(b.box, b.feeReserve + MinBox) > 0L).foreach { b =>
       work += packWork(s"refresh bond ${b.box.id}, made at height ${b.box.input.getCreationHeight}", s"refresh ${b.box.id}",
-        bounty(b.box, b.feeReserve + MinBox), b.box.id.toString)
+        bounty(b.box, b.feeReserve + MinBox), b.box.id.toString).copy(agedInputs = true)
     }
     (settlements().map(s => s.box -> MinBox) ++
       shareVaults().map(v => v.box -> (if (v.holding) MinBox + v.pullFee else MinBox)))
@@ -344,8 +361,9 @@ trait StandardBatch extends AppBase { self: StandardApp =>
   // ═══ RUN ══════════════════════════════════════════════════════════════════
 
   /**
-   * Run the work, in rounds. Each round scans again, packs the refunds and liquidations into transactions of
-   * at most PackLimit pieces that together pay more than the miner fee, and runs everything else one by one.
+   * Run the work, in rounds. Each round scans again, packs the refunds, liquidations and refreshes into
+   * transactions of at most PackLimit pieces that together pay more than the miner fee (bond refreshes only with
+   * each other, since they spend aged boxes alone), and runs everything else one by one.
    * A later round finds what an earlier one made, such as an offer's continuation, so several fills of one
    * offer chain in a single run; with a node that reads the mempool they can land in one block. A box is
    * spent at most once, and a command that failed is not tried again. `run` executes a command line and
@@ -362,7 +380,9 @@ trait StandardBatch extends AppBase { self: StandardApp =>
       progress = false
       val fresh = batchScan().work.filterNot(_.spends.exists(spent.contains))
       val (packable, single) = fresh.partition(_.packable)
-      val packs = packable.grouped(PackLimit).filter(_.map(_.reward).sum > minerFee)
+      // Bond refreshes may spend only aged boxes (EIP-39), so they pack among themselves.
+      val (aged, rest) = packable.partition(_.agedInputs)
+      val packs = (aged.grouped(PackLimit) ++ rest.grouped(PackLimit)).filter(_.map(_.reward).sum > minerFee)
         .map(chunk => (s"pack ${chunk.flatMap(_.packBox).mkString(" ")}", chunk.flatMap(_.spends).toSet, chunk)).toSeq
       def attempt(command: String, spends: Set[String]): Boolean =
         !spends.exists(spent.contains) && !failed.contains(command) && {
