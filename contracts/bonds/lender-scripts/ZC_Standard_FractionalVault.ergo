@@ -2,7 +2,12 @@
     // Standard fractional vault.
     // Created only by ZC_Standard_FractionalMint. Holds one circulating bond unit on behalf of N shares,
     // pulls the bond's settlement out of ZC_Standard_BondVault, and pays share holders pro rata.
-    // No constants.
+    //
+    // CONSTANTS
+    // CONST_VAULT_HASH: Coll[Byte] - blake2b256 of ZC_Standard_BondVault (shared across all markets,
+    //   so this vault remains one universal address across all markets). Pinned on PULL so that a
+    //   live ZC_Standard_Bond's Extinguish path (which can also burn all 3 bond units with borrowerAuth)
+    //   can never satisfy PULL, and safety never rests on register-type mismatches.
     //
     // TOKENS
     // tokens(0): (share, N+1) - the reserve, kept through every transition and burned only by the
@@ -19,11 +24,11 @@
     //
     // PATHS, selected by the shares burned = transaction-wide share inputs minus share outputs
     // PULL (burned = 0, anyone). Context var 0: Int continuation index.
-    //   Spends this box with the one other input carrying the bond asset, which is the settled
-    //   ZC_Standard_BondVault: only it can hold the other 2 units, at tokens(0). All 3 bond units are
-    //   burned. The continuation keeps this script, R4, R5 and the reserve, takes ALL of the bond
-    //   vault's tokens(1..) and value, and records the bond vault's path in R6. The puller may
-    //   keep up to the pull fee R5(2) out of the combined value as its batching fee.
+    //   Spends this box with the one other input carrying the bond asset, verified to sit under
+    //   CONST_VAULT_HASH (the settled ZC_Standard_BondVault holding the other 2 units at tokens(0)).
+    //   All 3 bond units are burned. The continuation keeps this script, R4, R5 and the reserve, takes
+    //   ALL of the bond vault's tokens(1..) and value, and records the bond vault's path in R6. The
+    //   puller may keep up to the pull fee R5(2) out of the combined value as its batching fee.
     // PARTIAL CLAIM (0 < burned < outstanding, after the pull only).
     //   Context var 0: Int continuation index; 1: Int payout index, distinct.
     //   Pays floor(balance * burned / outstanding) of nanoERG and of EACH token; the rest stays
@@ -128,6 +133,7 @@
                 val source = sources(0)
                 val next = OUTPUTS(nextIndex)
                 val pulled =
+                    blake2b256(source.propositionBytes) == CONST_VAULT_HASH &&
                     source.tokens(0)._1 == bondAsset &&
                     numTokenInOutputs(bondAsset) == 0L &&
                     next.propositionBytes == SELF.propositionBytes &&

@@ -74,9 +74,12 @@
     //
     // STATE-BOX RULE (the reason for 3 units)
     // Supply is exactly 3 and 2 stay together for the asset's whole life: in the bond, then in the
-    // vault. The holder of the 1 circulating unit can never assemble 2. So for a genuine asset X,
-    // "the box holding 2 units of X" IS the bond's state box, before and after settlement: one
-    // unspent-by-token-id lookup off-chain, one data-input check on-chain. No ancestry walk.
+    // vault (or burned together with the circulating unit on the bond's Extinguish path). The holder
+    // of the 1 circulating unit can never assemble 2. So for a genuine asset X, "the box holding 2
+    // units of X" IS the bond's state box, before and after settlement: one unspent-by-token-id
+    // lookup off-chain, one data-input check on-chain. No ancestry walk. Because a live bond can
+    // also burn all 3 units on Extinguish, any contract holding (X, 1) with a permissionless pull
+    // must pin ZC_Standard_BondVault's hash rather than treating a 3-unit burn alone as settlement.
     // Genuineness of X itself is a separate, one-time check: the box with id X must have been
     // spent as an order with this exact script (and CONST_BOND_HASH). Storage-rent collection
     // is outside script evaluation and is not modelled.

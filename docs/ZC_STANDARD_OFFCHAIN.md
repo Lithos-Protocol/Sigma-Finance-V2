@@ -303,6 +303,9 @@ to maturity, not by height, so it needs no grid either.
 What the grid gives is identical maturities. Bonds can only be pooled into one fungible token when
 they mature at the same height. Series, a planned layer, group bonds of one market, one maturity
 height and one collateral policy that way, and a series pool can require `maturity % 21600 == 0`.
+Because `ZC_Standard_Bond`'s Extinguish path can burn all 3 bond units with a borrower co-spend,
+any future series pool or pullable vault holding `(asset, 1)` must explicitly pin `CONST_VAULT_HASH`
+on its pull/sweep path rather than treating a 3-unit burn alone as proof of settlement.
 The default puts most new bonds on series heights, so they can join a series later. An off-grid bond
 trades on its own, as every bond does today, and stays outside series.
 
@@ -496,7 +499,10 @@ opening and floor of a lot.
    CLI does not yet; LithosDex's guard reads context variable 64, which this profile reserves for script
    disclosure on `INPUTS(0)`, so keep provision boxes off `INPUTS(0)` in ZC transactions.
 7. Nautilus (ErgoTree v2 only) users: v2 intent contracts batched by Lithos clients. Edge contracts,
-   planned after the standard is final; notes in the local plan.
+   planned after the standard is final; notes in the local plan. Note that because `ZC_Standard_Bond`'s
+   Extinguish path releases a live bond with unconstrained outputs on `borrowerAuth` + a 3-unit burn,
+   any contract borrower (including a Nautilus v2 borrower proxy) must isolate batcher-spendable intent
+   boxes from `borrowerHash` or pin `INPUTS` on every permissionless spend path.
 
 ## CLI status
 
@@ -515,5 +521,6 @@ opening and floor of a lot.
 | Refresh | `refresh <box id ...>` (bonds, bond vaults and share vaults pack; a wrap vault alone); `pack` refreshes old bonds that are not due and old vaults; `batch` lists every refresh that pays. Bonds are stamped 60 back and disclose their borrower; a borrower is also found through the fill. A transaction with a bond refresh spends only boxes made by its stamp (EIP-39): wallet boxes are picked by age, `pack` refuses younger boxes beside it, and `batch --run` packs bond refreshes apart. |
 | Share verification | `asks`, `buy`, `sell`, `match-offer` and the batch scan treat a token as shares of a bond only when the box whose id it is was spent as a standard share mint request holding that bond's unit, with the vault's share count, and the bond asset is genuine. `buy` and `match-offer` refuse a token whose share vault fails that; `asks` and `shares` flag it. |
 | Wraps | `wrap`, `mint-wrap` (the request as the only input), `cancel-wrap`, `unwrap`, `wraps` (with receipt verification and refresh height); `batch` lists mints. Raw capability tokens are not yet recognized and refused. |
+| Extinguish | `extinguish <bond box id>` burns the live bond's 2-unit reserve with the circulating unit the borrower holds (at any height), unlocking collateral and the fee reserve directly without passing repayment through `BondVault`. |
 | Batching | `pack` for refunds, liquidations and refreshes; `batch --run` packs, ranks offers and their sources, and runs up to 5 rounds with mempool lookups. `--mempool` turns those lookups on for any command. |
 | Defaults | As in the table above |

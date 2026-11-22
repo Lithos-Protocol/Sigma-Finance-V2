@@ -60,10 +60,14 @@ without migrating anything.
 
 **The 3-unit rule.** A fill mints exactly 3 units of the bond asset: 2 locked in the bond and 1
 circulating. The 2 units never split. They move from the bond to the vault at settlement and are
-burned only when the holder claims. The holder of the circulating unit can never assemble 2. So
-for a genuine asset X, *the box holding 2 units of X is the bond's state box*: the live bond before
-settlement, the vault after. That is one lookup by token id off-chain and one data-input check
-on-chain, with no ancestry walk.
+burned when the holder claims the vault—or directly on the bond's **extinguish** path, when the
+borrower and the circulating unit's holder burn all 3 units together. The holder of the circulating
+unit can never assemble 2. So for a genuine asset X, *the box holding 2 units of X is the bond's
+state box*: the live bond before settlement, the vault after. That is one lookup by token id
+off-chain and one data-input check on-chain, with no ancestry walk. Because a live bond can also
+burn all 3 units on extinguish, **burning all 3 units no longer proves `BondVault` was spent**: any
+contract holding `(X, 1)` with a permissionless pull or sweep path (such as `FractionalVault`,
+`DutchAuctionVault`, or a future Bond Series Pool) must explicitly pin `CONST_VAULT_HASH`.
 
 **One asset per loan.** A standard loan is lent and repaid in the same single asset, the bond's
 repayment asset. Every bond therefore has its principal P and repayment R in one unit, so rate,
@@ -164,7 +168,7 @@ chain says which maturity a batcher picks; zcs1 does (see the off-chain rules be
 | R8 | Liquidation expression hash |
 | R9 `Coll[Long]` | Lender values: (liquidation fee reserve, start height, maturity height) |
 
-Constants: `CONST_VAULT_HASH` and `CONST_REPAYMENT_TOKEN`. The bond has three paths, chosen by
+Constants: `CONST_VAULT_HASH` and `CONST_REPAYMENT_TOKEN`. The bond has five paths, chosen by
 context variables:
 
 1. **Repayment** (variables 1 and 2), anyone, before maturity. The settlement pays the vault with
@@ -195,6 +199,17 @@ context variables:
    rent and refresh" below. A bond's refresh stamps its successor 60 to 999 blocks back, so the
    borrower may recollateralize at once, and is not allowed in the 720 blocks before maturity, where
    voiding a pending repayment could push the borrower into liquidation.
+5. **Extinguish** (variables 0, 1, 3 and 9 all absent), the borrower and the circulating unit's
+   holder, at any height (before or after maturity). Requires a borrower-script co-spend,
+   `tokens(0) == (R4, 2)`, more than 2 units of the bond asset in `INPUTS`, and 0 units in `OUTPUTS`
+   (all 3 units burned). Outputs are unconstrained, releasing the collateral and lender fee reserve
+   directly without passing full repayment through `BondVault`. This lets a borrower who acquires
+   their own bond unit (e.g. at a discount on a `SaleOrder` or `LotAuction`, via an OTC workout, or
+   after un-fractionalizing shares) close the debt and unlock collateral without sourcing face-value
+   repayment cash—and even fund a `SaleOrder`/OTC buyback by swapping part of the unlocked
+   collateral or atomically unwrap a `WrapVault` receipt in the same transaction. (See "Extension
+   and composition rules for Extinguish" below for important constraints on future vaults, contract
+   borrowers, `PricedAsk` single-tx buybacks, and settlement-receipt derivatives.)
 
 ### Vault and claim
 
@@ -241,10 +256,11 @@ request's box id. A fill can deliver its unit straight into a request.
 The mint creates 2N+1 shares: N to the owner, and N+1 locked in a `FractionalVault` with the bond
 unit. As with the bond, the box holding N+1 shares is the shares' state box.
 
-`FractionalVault` paths:
+`FractionalVault` pins `CONST_VAULT_HASH` (one shared constant across all markets, keeping one
+universal vault address). Paths:
 
-- **Pull** (anyone, for the pull fee): spends the settled bond vault with this vault, burns all 3 bond
-  units, and takes the settlement in.
+- **Pull** (anyone, for the pull fee): spends the settled bond vault (verified under
+  `CONST_VAULT_HASH`) with this vault, burns all 3 bond units, and takes the settlement in.
 - **Partial claim**: burn u shares and take `floor(balance * u / outstanding)` of the nanoERG and of
   each token. Small claims can round an asset to zero; the dust stays for later claimants.
 - **Final claim**: burn every outstanding share and the reserve, and take everything. Before the pull,
@@ -274,7 +290,8 @@ collateral token but its repayment token (the auction's currency, which the test
 never lowers an amount, so a borrower cannot flip a vault either way after the fill. The plain
 `FractionalMint` still works, but pays any collateral in kind, so lend offers no longer buy its shares.
 
-`DutchAuctionVault` pays out exactly as the fractional vault when the bond was repaid. When it was
+`DutchAuctionVault` likewise pins `CONST_VAULT_HASH` on its pull path (one universal address across
+all markets) and pays out exactly as the fractional vault when the bond was repaid. When it was
 liquidated, the pull opens an auction that sells the collateral for the bond's repayment asset:
 
 - The auction sets a **target** for the currency the vault must hold after a sale: the repayment
@@ -493,7 +510,7 @@ Every box that waits on someone has a way out.
 | Sale order, priced ask | Seller cancels | From expiry: refund to the seller for the nanoERG funded above 0.001 ERG |
 | Fractional, Selective or Dutch mint request | Owner cancels | The mint itself, for the mint fee, at any time |
 | Wrap request | Owner cancels | The mint itself, for the mint fee, at any time |
-| Bond | Borrower repays or recollateralizes | Liquidation, paid by the lender's reserve; refresh after two years |
+| Bond | Borrower repays, recollateralizes, or extinguishes with the circulating unit | Liquidation, paid by the lender's reserve; refresh after two years |
 | Bond vault, fractional, Selective and Dutch vaults | Holders claim | Pulls, for the pull fee; auction purchases; refresh after two years |
 | Wrap vault | Receipt holder unwraps | Refresh after two years, as the only input |
 | Lot auction | Seller cancels | Purchase at the current price; from expiry, refund to the seller for the refund fee |
@@ -508,25 +525,27 @@ Measured in the offline harness with appkit's signing estimate (see [TESTING.md]
 The reference node's default per-transaction limit is 1,000,000; mainnet's block limits are a cost
 of 7,030,268 and a size of 1,271,009 bytes.
 
-Highest cost and size per shape, measured 2026-11-16 over the whole suite (521 tests):
+Highest cost and size per shape, measured 2026-11-22 over the whole suite (533 tests):
 
 | Transaction | Cost | Bytes |
 |---|---|---|
-| Two offers buying from two priced asks in one transaction | 37,343 | 12,352 |
-| Two offers buying from two sale orders in one transaction | 34,547 | 12,150 |
-| Offer fills a new SigUSD bond, with policy and oracle | 27,684 | 5,313 |
-| Offer buys shares from a SigUSD priced ask (two serialized boxes, oracle) | 26,304 | 7,578 |
-| Offer fills a priced order (curve offer, up to 20 points) | 26,115 | 2,161 |
-| Offer fills a new ERG bond | 25,907 | 5,434 |
+| Two offers buying from two priced asks in one transaction | 37,345 | 12,376 |
+| Two offers buying from two sale orders in one transaction | 34,549 | 12,174 |
+| Offer fills a new SigUSD bond, with policy and oracle | 27,685 | 5,519 |
+| Offer buys shares from a SigUSD priced ask (two serialized boxes, oracle) | 26,311 | 7,578 |
+| Offer fills a priced order (curve offer, up to 20 points) | 26,116 | 2,367 |
+| Offer fills a new ERG bond | 25,907 | 5,640 |
 | Two expired offers refunded together | 26,333 | 490 |
-| Priced order filled by a wallet (two-point or window curve) | 21,179 | 2,643 |
-| Order filled by a wallet | 20,197 | 2,600 |
-| Bond repayment / oracle liquidation | 19,605 / 17,350 | 929 / 1,205 |
-| Dutch vault claim / sale / pull | 18,870 / 16,517 / 18,580 | up to 2,714 |
+| Priced order filled by a wallet (two-point or window curve) | 21,180 | 2,849 |
+| Bond extinguish + WrapVault unwrap (1 tx) | 21,066 | 358 |
+| SaleOrder buyback + bond extinguish (1 tx) | 20,950 | 443 |
+| Bond extinguish (borrower + circulating unit) | 20,689 | 358 |
+| Order filled by a wallet | 20,198 | 2,806 |
+| Bond repayment / oracle liquidation | 20,021 / 17,762 | 2,183 / 2,021 |
+| Dutch vault claim / sale / pull | 18,870 / 16,544 / 18,590 | up to 2,866 |
 | Unwrap (vault, receipt, wallet) | 17,933 | 458 |
-| Bond refresh | 16,100 | 1,814 |
 | Lot auction purchase | 15,824 | 443 |
-| Dutch, fractional, bond and wrap vault refresh | 13,478 / 13,434 / 13,245 / 13,215 | 2,443 / 1,511 / 683 / 628 |
+| Dutch, fractional, bond and wrap vault refresh | 13,478 / 13,434 / 13,245 / 13,215 | 2,568 / 1,558 / 683 / 628 |
 | Wrap mint (the request alone) | 13,297 | 657 |
 | Wallet-to-wallet payment, for scale | 12,205 | 166 |
 
@@ -592,6 +611,43 @@ input. In brief:
   wrap it first. Clients cannot yet tell a LithosDex owner NFT from any other token by themselves.
 - Nothing has run on a live node yet; the offline harness runs the real interpreter.
 
+### Extension and composition rules for Extinguish
+
+Because `Bond` can burn all 3 bond units directly on Extinguish (unconstrained outputs, skipping
+`BondVault`), future protocol extensions and consuming contracts must observe four rules:
+
+1. **Pullable lender vaults and Series Pools must pin `CONST_VAULT_HASH`.** Do not rely on
+   `numTokenInOutputs(bondAsset) == 0L` (or an accidental `R5` type mismatch) to assume the other
+   input holding `bondAsset` is `BondVault`. Every future contract holding `(asset, 1)` with a
+   permissionless pull/sweep path—such as Bond Series Pools, Senior/Junior Tranche Vaults, Rolling
+   Ladder Vaults, or margin vaults—must verify `blake2b256(source.propositionBytes) == CONST_VAULT_HASH`.
+   Both `FractionalVault` and `DutchAuctionVault` enforce this check explicitly; because `BondVault`
+   has no constants, pinning `CONST_VAULT_HASH` does not split vaults by market.
+2. **Contract borrowers must treat `borrowerHash` as full-custody over live bonds.** Because
+   Extinguish leaves outputs unconstrained, `borrowerAuth` releases a live bond completely (matching
+   `Order`/`PricedOrder` cancel), extending that full-custody surface from the order-open window to
+   the bond's entire life whenever an adversary can acquire `(asset, 1)`. Any smart contract used as
+   `borrowerHash` (e.g., a Nautilus v2 intent proxy, DAO treasury, Refinance Router, or self-repaying
+   `WrapVault` borrower) must either keep permissionless/batcher-spendable intent boxes under a
+   separate script hash, or pin exact `INPUTS` on every permissionless path—pinning outputs alone is
+   not enough, because an attacker can attach the live bond plus `(asset, 1)` and append an output.
+3. **`PricedAsk` single-tx buyback caveat (`INPUTS` vs `CONTEXT.dataInputs`).** Fixed `SaleOrder`,
+   `LotAuction`, and OTC lender swaps combine cleanly with Extinguish in one transaction (allowing
+   zero-cash collateral-to-DEX buybacks), and `WrapVault` unwraps compose atomically as well.
+   However, `YieldAsk_Pricing` and `ERG_SigUSD_GuardedYield_Pricing` require the live `Bond` box in
+   `CONTEXT.dataInputs` while Extinguish spends that same box in `INPUTS`. Do not assume single-tx
+   `PricedAsk` + Extinguish works across node validation (`UtxoState`/`DigestState`), SDKs, and
+   EIP-12 wallets without testing on a live node; a 2-tx buy-then-extinguish still avoids sourcing
+   face-value repayment `R`. Fractionalized bonds also require 2 txs because `Final Claim` outputs
+   `(asset, 1)` intact.
+4. **Settlement receipts and derivatives (CDS / credit scoring).** Extinguish burns all 3 units
+   without creating a `BondVault` (`R5 = 0/1`). Vault-held CDS / insurance contracts (which custody
+   `(asset, 1)` themselves) are unaffected because the borrower cannot obtain the unit to extinguish.
+   Naked third-party derivatives or rebate contracts waiting on a `BondVault` data input will never
+   observe one for an extinguished bond (and already face fast lender claims destroying `BondVault`
+   after settlement); off-chain indexers can distinguish repaid, liquidated, and extinguished bonds
+   from the final `Bond` box's spending transaction.
+
 Lenders and borrowers must evaluate collateral authenticity and their own risk before agreeing to a
 loan.
 
@@ -656,3 +712,27 @@ Changed trees: `FractionalMint`, `DutchAuctionVault`, `DutchAuctionMint`, `LotAu
 Dutch mint's hash, `LendOffer`. The bond, bond vault, orders and asks keep their trees. Existing boxes keep
 their old scripts. Validation is offline (524 tests across 30 suites, plus throwaway probes of each fix);
 nothing has run on a live node.
+
+## Early extinguish and pull-vault pinning (2026-11-22)
+
+- **Extinguish on `Bond`.** `ZC_Standard_Bond` gained a 5th path (context vars 0, 1, 3 and 9 all absent):
+  with `borrowerAuth`, `tokens(0) == (R4, 2)`, more than 2 units of that asset in `INPUTS`, and 0 units in
+  `OUTPUTS` (all 3 units burned), the bond releases unconditionally at any height. Token counts run lazily
+  only inside this branch, adding zero runtime cost to existing paths and +206 bytes to the bond ErgoTree
+  (1,529 B ERG / 1,561 B SigUSD, shared template hash preserved).
+- **`CONST_VAULT_HASH` on share vaults.** `FractionalVault` (1,233 B) and `DutchAuctionVault` (2,211 B)
+  now pin `CONST_VAULT_HASH` on `PULL` (`blake2b256(source.propositionBytes) == CONST_VAULT_HASH`), keeping
+  both as one universal address across all markets while ensuring a live bond's Extinguish path—or any
+  non-`BondVault` box carrying a `Byte` R5—can never satisfy `PULL`.
+- **CLI and live plan.** Added `extinguish <bond box id>` to the CLI (`StandardApp.extinguish`), and
+  updated live-test Track G (`G6`) to extinguish bond G directly after un-fractionalizing its shares in `G5`.
+- **Extension rules documented.** Added "Extension and composition rules for Extinguish" covering mandatory
+  `CONST_VAULT_HASH` pinning for future pullable vaults/Series Pools, `INPUTS`-pinning/script-isolation
+  requirements for future contract borrowers (e.g. Nautilus v2 proxies, DAOs, routers), the `PricedAsk`
+  `INPUTS`/`CONTEXT.dataInputs` overlap caveat, and `BondVault` receipt behavior for derivatives.
+
+Changed trees and expressions: `Bond`, `Order`, `PricedOrder`, `FractionalVault`, `FractionalMint`,
+`DutchAuctionVault`, `DutchAuctionMint`, `LendOffer`, `YieldAsk_Pricing`, and
+`ERG_SigUSD_GuardedYield_Pricing`. `BondVault`, `SaleOrder`, `PricedAsk` (shell), `LotAuction`, `Wrap*`,
+liquidation rules, collateral policies, fill guards, and order pricing expressions are unchanged.
+Validation is offline (533 tests across 30 suites); nothing has run on a live node.

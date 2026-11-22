@@ -9,7 +9,12 @@
     // The auction lives here, on the lender's side, so the bond and its liquidation expression are
     // unchanged. It sells collateral the lender side already owns: it returns no surplus to the
     // borrower, which stays a matter for the bond's liquidation expression.
-    // No constants.
+    //
+    // CONSTANTS
+    // CONST_VAULT_HASH: Coll[Byte] - blake2b256 of ZC_Standard_BondVault (shared across all markets,
+    //   so this vault remains one universal address across all markets). Pinned on PULL so that a
+    //   live ZC_Standard_Bond's Extinguish path (which can also burn all 3 bond units with borrowerAuth)
+    //   can never satisfy PULL, and safety never rests on register-type mismatches.
     //
     // TOKENS
     // tokens(0): (share, N+1) - the reserve, kept through every transition and burned only by the
@@ -67,8 +72,9 @@
     //
     // PATHS, selected by the shares burned = transaction-wide share inputs minus share outputs
     // PULL (burned = 0, still holding the bond unit; anyone). Context var 0: Int continuation index.
-    //   As the standard vault: spends this box with the settled ZC_Standard_BondVault, burns all 3
-    //   bond units, takes all of its tokens(1..) and value, and may keep up to the pull fee.
+    //   As the standard vault: spends this box with the settled ZC_Standard_BondVault (verified under
+    //   CONST_VAULT_HASH), burns all 3 bond units, takes all of its tokens(1..) and value, and may
+    //   keep up to the pull fee.
     //   It sets the state from the bond vault's path: 0 if repaid; if liquidated and there is a lot
     //   with some item under the threshold, 1 when the currency held is short of the floor target,
     //   4 when it is not and the opening is above 0; else 2. For an ERG currency the currency held
@@ -240,6 +246,7 @@
                         } else began == 0L
                         sigmaProp(
                             carried && clock &&
+                            blake2b256(source.propositionBytes) == CONST_VAULT_HASH &&
                             source.tokens(0)._1 == bondAsset &&
                             numTokenInOutputs(bondAsset) == 0L &&
                             next.value >= SELF.value - pullFee &&

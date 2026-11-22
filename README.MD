@@ -27,8 +27,11 @@ maturity grid, batching and defaults.
 How it works, in brief:
 
 - A fill mints exactly 3 units of the bond asset: 2 stay with the bond, then its vault, and 1
-  circulates. The box holding 2 units is always the bond's state box, so one lookup by token id finds
-  it, and one check that the asset's minting box was a standard order proves the asset genuine.
+  circulates (or all 3 burn together directly on the bond's extinguish path when the borrower holds
+  the circulating unit). The box holding 2 units is always the bond's state box, so one lookup by
+  token id finds it, and one check that the asset's minting box was a standard order proves the
+  asset genuine. Pullable vaults (`FractionalVault`, `DutchAuctionVault`, and future Series Pools)
+  pin `CONST_VAULT_HASH` explicitly.
 - A loan is lent and repaid in one asset, so every bond's rate and accrued value are defined.
 - Each market (ERG, SigUSD, ...) has one address per contract, and all markets share one template
   hash, so the Ergo indexed node lists them directly.
@@ -61,11 +64,11 @@ sigmafi> bonds --old
 sigmafi> exit
 ```
 
-`sigmafi` is an sbt alias for `runMain ksingh.sigmabonds.app.SigmaFiCli`; given a command, it runs that
+`sigmafi` is an sbt alias for `runMain org.lithosprotocol.sigmafi.app.SigmaFiCli`; given a command, it runs that
 one command and exits, so scripts keep working:
 
 ```bash
-sbt "runMain ksingh.sigmabonds.app.SigmaFiCli help"
+sbt "runMain org.lithosprotocol.sigmafi.app.SigmaFiCli help"
 ```
 
 **ZC Standard, the default.** Commands build from the pinned trees in
@@ -80,7 +83,9 @@ sbt "runMain ksingh.sigmabonds.app.SigmaFiCli help"
   carries a fill guard that its contract enforces, at `--ratio` or `--fill-ratio`, unless
   `--no-fill-guard`; `--window <min>:<max> --yield <cap> [--curve ...]` makes a window order, whose
   lender picks the maturity and pays the principal the borrower's curve prices there),
-  `cancel-order`, `repay [--from-collateral]`, `recollateralize`
+  `cancel-order`, `repay [--from-collateral]`, `recollateralize`, `extinguish` (close a live bond at
+  any height by burning all 3 bond units with the circulating unit you hold, unlocking collateral
+  and the fee reserve without passing full repayment through the vault)
 - Lender: `fill-order [--fee-reserve <ERG>] [--maturity <height>]` (CLI minimum and default 0.05 ERG;
   a window order's maturity defaults to the earliest grid height in it), `claim`. A fill or purchase
   that would leave a bond under its own oracle ratio is refused unless `--allow-liquidatable`
@@ -120,7 +125,9 @@ renaming it does not change its tree. `PricedOrder` is an additional issuing typ
 `SaleOrder` remain. Lend offers accept both issuing types; existing offer boxes keep their original
 scripts. On 2026-11-16 the bond and its vaults gained the paid refresh, `PricedOrder` the window mode,
 and the Dutch vault an excess auction for thin items when the floor is already held, so every pinned
-hash downstream of them changed.
+hash downstream of them changed. On 2026-11-22 `ZC_Standard_Bond` gained the Extinguish path (borrower
+co-spend + all 3 bond units burned, unconstrained outputs) and `FractionalVault` and `DutchAuctionVault`
+pinned `CONST_VAULT_HASH` on `PULL`, regenerating all affected pins and addresses.
 
 Every transaction follows the zcs1 off-chain rules in
 [docs/ZC_STANDARD_OFFCHAIN.md](./docs/ZC_STANDARD_OFFCHAIN.md). It discloses each script its boxes name
@@ -203,5 +210,5 @@ covered; a SigUSD order and ask are only created and cancelled.
   generation.
 - [TESTING.md](./TESTING.md): the offline contract specs, how to write them, and how to measure
   transaction cost.
-- `sbt "runMain ksingh.sigmabonds.client.ContractClient"` prints the first generation's addresses,
+- `sbt "runMain org.lithosprotocol.sigmafi.client.ContractClient"` prints the first generation's addresses,
   script hashes, liquidation scripts and order templates.

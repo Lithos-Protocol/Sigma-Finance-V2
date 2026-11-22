@@ -1,0 +1,702 @@
+package org.lithosprotocol.sigmafi
+package livetest
+
+/** What a step does, and when it counts as done. */
+sealed trait Kind
+object Kind {
+  /** The setup transaction: the node wallet mints the test token and splits ERG into boxes. */
+  case object Setup extends Kind
+  /** A CLI command that submits transactions (run with --send); done once every one of them confirms. */
+  case object Tx extends Kind
+  /** A listing; done once it runs and prints everything in `expect`. */
+  case object Read extends Kind
+  /** A command the CLI must refuse with an error containing `expect`. Run without --send. */
+  case object Refusal extends Kind
+}
+
+/** The kind of box whose expiry a gate reads. */
+sealed trait BoxKind
+object BoxKind {
+  case object Order extends BoxKind
+  case object Offer extends BoxKind
+  case object Ask extends BoxKind
+  case object Lot extends BoxKind
+}
+
+/** A condition on the chain a step waits for, beyond the steps it builds on. Names are variables. */
+sealed trait Gate
+object Gate {
+  case object Open extends Gate
+  /** From the expiry of the order, offer or ask whose box id is in `box`. */
+  case class Expired(kind: BoxKind, box: String) extends Gate
+  /** Only before that expiry; once it has passed the step is skipped, too late to show the refusal. */
+  case class Unexpired(kind: BoxKind, box: String) extends Gate
+  /** From the height at which the bond in `box` may take collateral again. */
+  case class Recollateralizable(box: String) extends Gate
+  /** From the height held in `height`. */
+  case class Reached(height: String) extends Gate
+  /** Only before the height held in `height`; afterwards the step is skipped. */
+  case class Before(height: String) extends Gate
+  /**
+   * When a batch scan finds work and every piece of it spends only the boxes in `boxes`, so a batch run
+   * does exactly the planned work and nothing else (in particular, nobody else's boxes).
+   */
+  case class QuietBatch(boxes: Seq[String]) extends Gate
+}
+
+/** What must hold once a step's transactions confirm. */
+sealed trait Check
+object Check {
+  case object NoCheck extends Check
+  /** No unspent box holds any of the token: every unit was burned. */
+  case class TokenGone(token: String) extends Check
+  /** The share vault in `box` records `state` in R6 and no longer holds its bond unit. */
+  case class VaultState(box: String, state: Int) extends Check
+  /** The bond in `box` holds exactly `amount` of the token in `token`. */
+  case class BondHolds(box: String, token: String, amount: Long) extends Check
+  /** The historical fill records the actual borrower payment and preserves all non-price terms. */
+  case class PricedFill(order: String, bond: String, principal: String) extends Check
+  /** The historical ask commits to a yield policy moving from `startBps` to `endBps`. */
+  case class AskPricing(ask: String, startBps: Long, endBps: Long) extends Check
+}
+
+/**
+ * Binds variable `name` to output `output` of one of the step's transactions: its last one, or with
+ * `title`, the last whose title starts with it (a batch run submits several).
+ */
+case class Bind(name: String, output: Int, title: String = "")
+
+/**
+ * One step of the live test. `command` is a CLI command line with `{name}` for variables bound by earlier
+ * steps. It runs once the steps in `after` have submitted (with mempool chaining) or confirmed (without), the
+ * steps in `settled` have confirmed, and `gate` is open. `settled` is for a CLI check that reads the chain's
+ * history rather than the mempool, chiefly the bond asset's origin: the order box must be spent on chain.
+ * A listing or refusal never changes the chain or binds anything, so a step waiting on one only waits for it
+ * to have run, whatever its outcome. `skipIf` skips the step when that variable is already bound. `noDefer`
+ * fails the step at once rather than retrying it after the transactions in flight confirm. `last` steps run
+ * once every other step is over. `expect` may name variables too. `about` says in a sentence or two what the
+ * step does and what it shows off; the runner prints it under the step's title.
+ */
+case class Step(id: String, track: String, title: String, kind: Kind, command: String,
+                after: Seq[String] = Nil, settled: Seq[String] = Nil, gate: Gate = Gate.Open,
+                binds: Seq[Bind] = Nil, expect: Seq[String] = Nil, check: Check = Check.NoCheck,
+                skipIf: Option[String] = None, noDefer: Boolean = false, last: Boolean = false,
+                about: String = "") {
+  /** The variables the command and the gate read. */
+  def reads: Seq[String] = (LivePlan.placeholders(command) ++ expect.flatMap(LivePlan.placeholders) ++ (gate match {
+    case Gate.Expired(_, b) => Seq(b)
+    case Gate.Unexpired(_, b) => Seq(b)
+    case Gate.Recollateralizable(b) => Seq(b)
+    case Gate.Reached(h) => Seq(h)
+    case Gate.Before(h) => Seq(h)
+    case Gate.QuietBatch(bs) => bs
+    case Gate.Open => Seq.empty
+  }) ++ (check match {
+    case Check.TokenGone(t) => Seq(t)
+    case Check.VaultState(b, _) => Seq(b)
+    case Check.BondHolds(b, t, _) => Seq(b, t)
+    case Check.PricedFill(o, b, p) => Seq(o, b, p)
+    case Check.AskPricing(a, _, _) => Seq(a)
+    case Check.NoCheck => Seq.empty
+  })).distinct
+}
+
+/**
+ * The live test: every ZC Standard command, in ERG only, against a real node and wallet, with this wallet as
+ * borrower, lender, seller, buyer and batcher. Amounts are small (0.1 ERG loans); everything but miner fees
+ * comes back to the wallet. Tracks run side by side:
+ *
+ *  - A: fixed-maturity issuance at a falling yield; Selective shares sold at a rising yield, repaid and claimed
+ *  - B: on-close yield issuance with token collateral, recollateralized after the 60-block wait, repaid from collateral
+ *  - C: an oracle-rule bond below its ratio, refused by an offer, liquidated early in a pack with a refund
+ *  - D/E: a curve lend offer filling a rising-yield order, buying the unit from a yield ask and guarded yield-priced
+ *    Dutch shares; two bonds liquidated at maturity together; E's Dutch auction pulled, its lot bought, the shares
+ *    claimed; D's Dutch vault already holds its floor, so its thin lot goes to an excess auction (state 4)
+ *  - V: window orders, where the lender picks the maturity: one filled from the wallet at a chosen maturity, one
+ *    matched by a lend offer at zcs1's default maturity; both repaid and claimed
+ *  - K: expiry refunds and cancels of orders, offers and asks, and a SigUSD-market order and ask
+ *  - L: a lot auction of test tokens bought by this wallet, and one refunded after its expiry
+ *  - W: a test token wrapped, its receipt minted and unwrapped, a refresh refused as too early, a wrap cancelled
+ *  - G: a batch run filling an order from an offer that delivers Selective shares, and minting them; the final
+ *    claim before the pull returns the unit, which extinguishes the live bond directly in one transaction
+ *
+ * The loans here last tens to hundreds of blocks, so their yields per 262800 blocks are in the thousands of
+ * percent: a 0.1 to 0.12 ERG loan over 60 blocks is about 87,600%. Orders and asks an offer fills quote enough
+ * above the offer's yield for the offer's 0.005 ERG batcher fee to fit.
+ *
+ * Variables bound by the setup: `token` (the test token, collateral that the oracle values at nothing),
+ * `T0` (the height the setup ran at), `M` (T0 plus the maturity blocks: when bonds D and E mature) and `V`
+ * (T0 plus `WindowMaturityBlocks`: the maturity the lender chooses for window order V).
+ */
+object LivePlan {
+
+  import Kind._
+  import Gate._
+
+  /** Variables the setup binds. */
+  val SetupVars: Seq[String] = Seq("token", "T0", "M", "V")
+
+  /**
+   * Blocks from the setup to the maturity chosen for window order V. Its window is 30 to 1000 blocks after the fill,
+   * so the fill can land up to 570 blocks after the setup and still choose it. The bond is repaid at once.
+   */
+  val WindowMaturityBlocks = 600
+
+  /** Blocks from the setup to the maturity of bonds D and E, unless the runner is told otherwise. */
+  val DefaultMaturityBlocks = 40
+
+  /** ERG the setup splits off into separate boxes, so independent steps need not share one. */
+  val SplitBoxes = 8
+  val SplitValue = "0.3"
+
+  /** The test token the setup mints: it stands in for collateral the oracle does not price. */
+  val TokenAmount = 1000000L
+  val TokenName = "SigmaFi live test"
+  val TokenDescription = "Test collateral minted by the SigmaFi live test. It has no value."
+
+  /** 1% of a zcs1 share token in raw units (1.0 shares), so share steps read as percentages. */
+  val SharePct: Long = standard.StandardMetadata.ShareCount / 100
+
+  /** The least the wallet should hold before starting: about twice the most the plan locks at once. */
+  val MinimumBalance = "4"
+
+  private val Placeholder = """\{([A-Za-z0-9]+)\}""".r
+
+  def placeholders(command: String): Seq[String] = Placeholder.findAllMatchIn(command).map(_.group(1)).toSeq
+
+  /** `command` with every `{name}` replaced, or the first name `vars` lacks. */
+  def fill(command: String, vars: Map[String, String]): Either[String, String] =
+    placeholders(command).find(n => !vars.contains(n)).toLeft(Placeholder.replaceAllIn(command, m =>
+      scala.util.matching.Regex.quoteReplacement(vars(m.group(1)))))
+
+  private val oracleOrder = "--liquidation oracle --ratio 150 --oracle-age 720"
+  private val offerTerms = "--yield 5 --collateral-floor 150 --oracle-age 720"
+
+  private def tx(id: String, track: String, title: String, command: String, after: Seq[String] = Nil,
+                 settled: Seq[String] = Nil, gate: Gate = Open, binds: Seq[Bind] = Nil,
+                 check: Check = Check.NoCheck, skipIf: Option[String] = None): Step =
+    Step(id, track, title, Tx, command, after, settled, gate, binds, check = check, skipIf = skipIf)
+
+  private def read(id: String, track: String, title: String, command: String, expect: Seq[String] = Nil,
+                   after: Seq[String] = Nil, gate: Gate = Open, noDefer: Boolean = false): Step =
+    Step(id, track, title, Read, command, after, gate = gate, expect = expect, noDefer = noDefer)
+
+  private def refusal(id: String, track: String, title: String, command: String, expect: String,
+                      after: Seq[String] = Nil, gate: Gate = Open): Step =
+    Step(id, track, title, Refusal, command, after, gate = gate, expect = Seq(expect))
+
+  private def end(id: String, title: String, command: String, expect: String): Step =
+    Step(id, "end", title, Read, command, expect = Seq(expect), last = true)
+
+  private def out(name: String, i: Int) = Bind(name, i)
+
+  /** Every step, each with its explanation from `About`. */
+  lazy val steps: Seq[Step] = defined.map(s => s.copy(about = About.getOrElse(s.id, "")))
+
+  private val defined: Seq[Step] = Seq(
+    // ─── basics: listings that need nothing ──────────────────────────────────
+    read("R1", "basics", "Pinned contracts, network and wallet", "info",
+      Seq("ZC Standard, from pinned trees", "MAINNET", "Wallet address")),
+    read("R2", "basics", "First-generation contracts compile", "info --old", Seq("First-generation contracts")),
+    read("R3", "basics", "First-generation orders", "orders --old"),
+    read("R4", "basics", "First-generation bonds of this wallet", "bonds --old --mine"),
+    read("R5", "basics", "First-generation claims", "claims --old"),
+
+    Step("S1", "setup", s"Mint $TokenAmount test tokens and split $SplitBoxes boxes of $SplitValue ERG", Setup, ""),
+
+    // ─── D/E first: the longest chain before a fixed maturity ────────────────
+    tx("O1", "D/E Dutch", "Curve lend offer: 0.6 ERG at 5% rising to 6%, oracle-rule bonds at 150%, Dutch shares too",
+      s"create-offer --capital 0.6 $offerTerms --curve 5:10,6:262800 --min-auction-floor 100 --max-auction-expiry 100",
+      after = Seq("S1"), binds = Seq(out("offer1", 0))),
+    tx("E1", "D/E Dutch", "PricedOrder E: 0.1 principal floor, repay 0.12 at M; yield 100000% rising to 120000%, guarded",
+      s"create-order --principal 0.1 --repayment 0.12 --collateral-erg 0.25 --collateral-token {token}:1000 " +
+        s"$oracleOrder --maturity {M} --exact-maturity --expires-in 30 --yield 100000 --end-yield 120000",
+      after = Seq("S1"), binds = Seq(out("orderE", 0))),
+    tx("D1", "D/E Dutch", "Order D: borrow 0.1, repay 0.11, 0.15 ERG and 500 test tokens, maturity rule, matures at M",
+      "create-order --principal 0.1 --repayment 0.11 --collateral-erg 0.15 --collateral-token {token}:500 --maturity {M} " +
+        "--exact-maturity --expires-in 30",
+      after = Seq("S1"), binds = Seq(out("orderD", 0))),
+
+    // ─── C, first part: the offer must refuse an undercollateralized order ───
+    tx("C1", "C oracle", "Order C: borrow 0.1, repay 0.12, only 0.1 ERG collateral, oracle rule at 150%",
+      s"create-order --principal 0.1 --repayment 0.12 --collateral-erg 0.1 $oracleOrder --term 400 --exact-maturity " +
+        "--expires-in 200 --no-fill-guard --allow-liquidatable",
+      after = Seq("S1"), binds = Seq(out("orderC", 0))),
+    refusal("C1x", "C oracle", "The offer refuses order C: its collateral is under the offer's floor",
+      "match-offer {offer1} --order {orderC}", "under the offer's floor", after = Seq("O1", "C1")),
+
+    tx("E2", "D/E Dutch", "Offer fills order E (a new bond): the unit comes to this wallet",
+      "match-offer {offer1} --order {orderE}", after = Seq("O1", "E1"),
+      binds = Seq(out("bondE", 1), out("principalE", 2), out("offer1", 3)),
+      check = Check.PricedFill("orderE", "bondE", "principalE")),
+    tx("D2", "D/E Dutch", "Fill order D from the wallet", "fill-order {orderD}", after = Seq("D1"),
+      binds = Seq(out("bondD", 1))),
+    refusal("D2x", "D/E Dutch", "Bond D cannot be liquidated before maturity", "liquidate {bondD}",
+      "it can be liquidated from then on", after = Seq("D2"), gate = Before("M")),
+    read("E3", "D/E Dutch", "The offer lists with its remaining capital", "offers --mine", Seq("{offer1}"),
+      after = Seq("E2")),
+    tx("E4", "D/E Dutch", "Sell bond E's unit on a yield ask at 100000% falling to 80000%",
+      "sell {orderE} --amount 1 --yield 100000 --end-yield 80000", settled = Seq("E2"), binds = Seq(out("pricedAskE", 0)),
+      check = Check.AskPricing("pricedAskE", startBps = 10000000L, endBps = 8000000L)),
+    read("E5", "D/E Dutch", "The yield ask lists with its price", "asks --mine", Seq("{pricedAskE}", "block yield", "moving to"),
+      after = Seq("E4")),
+    tx("E6", "D/E Dutch", "The offer buys the unit from the yield ask; the unit comes back to this wallet",
+      "match-offer {offer1} --ask {pricedAskE}", after = Seq("E4", "E5"), settled = Seq("E2"),
+      binds = Seq(out("offer1", 2))),
+    tx("E7", "D/E Dutch", "Fractionalize bond E's unit into Dutch shares: 300% down to 250% over 20 blocks, held 30",
+      "fractionalize {orderE} --dutch --auction-opening 300 --auction-floor 250 --auction-length 20 --auction-expiry 30",
+      after = Seq("E6"), settled = Seq("E2"), binds = Seq(out("reqE", 0))),
+    tx("E8", "D/E Dutch", "Mint the Dutch shares (this wallet as batcher)", "mint-shares {reqE}", after = Seq("E7"),
+      binds = Seq(out("vaultE", 1))),
+    tx("E9", "D/E Dutch", "Sell 40% of the Dutch shares at yield 400000%, guarded at 150%",
+      s"sell {reqE} --amount ${40 * SharePct} --yield 400000 --min-cover 150 --oracle-age 720",
+      after = Seq("E8"), binds = Seq(out("askE", 0)), check = Check.AskPricing("askE", startBps = 40000000L, endBps = 40000000L)),
+    tx("E10", "D/E Dutch", "The offer buys the Dutch shares from the ask", "match-offer {offer1} --ask {askE}",
+      after = Seq("E9", "E6"), settled = Seq("E7"), binds = Seq(out("offer1", 2))),
+    tx("E11", "D/E Dutch", "Cancel what is left of the offer", "cancel-offer {offer1}", after = Seq("E10")),
+    tx("DE1", "D/E Dutch", "Liquidate bonds D and E together at maturity", "liquidate {bondD} {bondE}",
+      after = Seq("D2", "E10"), gate = Reached("M")),
+    tx("D3", "D/E Dutch", "Fractionalize bond D's unit into Dutch shares: 20% down to 10%, under the ERG it holds",
+      "fractionalize {orderD} --dutch --auction-opening 20 --auction-floor 10 --auction-length 30 --auction-expiry 30",
+      settled = Seq("D2"), binds = Seq(out("reqD", 0))),
+    tx("D4", "D/E Dutch", "Mint bond D's Dutch shares (this wallet as batcher)", "mint-shares {reqD}", after = Seq("D3"),
+      binds = Seq(out("vaultD", 1))),
+    tx("D5", "D/E Dutch", "Pull liquidated bond D: the floor is already held, so an excess auction opens (state 4)",
+      "pull {vaultD}", after = Seq("DE1", "D4"), binds = Seq(out("vaultD", 0)), check = Check.VaultState("vaultD", 4)),
+    read("D6", "D/E Dutch", "The excess auction lists with its falling price", "shares --mine", Seq("EXCESS AUCTION OPEN"),
+      after = Seq("D5")),
+    refusal("D6x", "D/E Dutch", "Claims wait for the excess auction's end", s"claim-shares {reqD} --amount ${10 * SharePct}",
+      "excess auction runs until", after = Seq("D5")),
+    tx("D7", "D/E Dutch", "Buy the excess auction's lot (the 500 test tokens) at its current price", "buy-lot {vaultD}",
+      after = Seq("D5", "D6", "D6x"), binds = Seq(out("vaultD", 0)), check = Check.VaultState("vaultD", 2)),
+    tx("D8", "D/E Dutch", "Final claim on bond D's Dutch shares", "claim-shares {reqD}", after = Seq("D7"),
+      check = Check.TokenGone("reqD")),
+    tx("E12", "D/E Dutch", "Pull bond E's liquidation into the Dutch vault: the auction opens",
+      "pull {vaultE}", after = Seq("DE1", "E8"), binds = Seq(out("vaultE", 0)), check = Check.VaultState("vaultE", 1)),
+    read("E13", "D/E Dutch", "The open auction lists with its price", "shares --mine", Seq("AUCTION OPEN"),
+      after = Seq("E12")),
+    tx("E14", "D/E Dutch", "Buy the auction's lot (the test tokens) at its current price", "buy-lot {vaultE}",
+      after = Seq("E12", "E13"), binds = Seq(out("vaultE", 0)), check = Check.VaultState("vaultE", 2)),
+    tx("E15", "D/E Dutch", "Claim 30% of the Dutch shares", s"claim-shares {reqE} --amount ${30 * SharePct}",
+      after = Seq("E14", "E10"), binds = Seq(out("vaultE", 1))),
+    tx("E16", "D/E Dutch", "Final claim on the Dutch shares", "claim-shares {reqE}", after = Seq("E15"),
+      check = Check.TokenGone("reqE")),
+
+    // ─── A: a repaid bond's shares ────────────────────────────────────────────
+    tx("A1", "A shares", "PricedOrder A: yield 50% falling to 20%, 0.1 principal floor, repay 0.11 in 400 blocks",
+      "create-order --principal 0.1 --repayment 0.11 --collateral-erg 0.15 --term 400 --exact-maturity --expires-in 200 " +
+        "--yield 50 --end-yield 20",
+      after = Seq("S1"), binds = Seq(out("orderA", 0))),
+    read("A1m", "A shares", "Order A lists from the mempool, before it confirms", "orders --mine --mempool",
+      Seq("{orderA}"), after = Seq("A1"), noDefer = true),
+    tx("A2", "A shares", "Fill order A from the wallet", "fill-order {orderA}", after = Seq("A1"),
+      binds = Seq(out("bondA", 1), out("principalA", 2)), check = Check.PricedFill("orderA", "bondA", "principalA")),
+    refusal("A2x", "A shares", "Bond A cannot be claimed before it settles", "claim {orderA}",
+      "has not been repaid or liquidated yet", after = Seq("A2")),
+    tx("A3", "A shares", "Fractionalize bond A's unit into 100 Selective shares (zcs1)", "fractionalize {orderA} --auction-opening 150 --auction-floor 80",
+      settled = Seq("A2"), binds = Seq(out("reqA", 0))),
+    read("A4", "A shares", "The share request lists", "shares --mine", Seq("{reqA}"), after = Seq("A3")),
+    tx("A5", "A shares", "Mint bond A's shares (this wallet as batcher)", "mint-shares {reqA}", after = Seq("A3", "A4"),
+      binds = Seq(out("vaultA", 1))),
+    tx("A6", "A shares", "Sell 40% of the shares at yield 5% rising to 10%",
+      s"sell {reqA} --amount ${40 * SharePct} --yield 5 --end-yield 10", after = Seq("A5"), binds = Seq(out("askA", 0)),
+      check = Check.AskPricing("askA", startBps = 500L, endBps = 1000L)),
+    read("A7", "A shares", "The ask lists, priced against face value", "asks --mine",
+      Seq("{askA}", "of face", "block yield", "moving to 10%"), after = Seq("A6")),
+    tx("A8", "A shares", "Buy 10% of the shares back with the wallet", s"buy {askA} --amount ${10 * SharePct}",
+      after = Seq("A6", "A7"), binds = Seq(out("askA", 1))),
+    tx("A9", "A shares", "Cancel the rest of the ask", "cancel-ask {askA}", after = Seq("A8")),
+    tx("A10", "A shares", "Repay bond A", "repay {bondA}", after = Seq("A9", "A2x")),
+    tx("A11", "A shares", "Pull the repaid bond into the share vault", "pull {vaultA}", after = Seq("A10", "A5"),
+      binds = Seq(out("vaultA", 0)), check = Check.VaultState("vaultA", 0)),
+    tx("A12", "A shares", "Claim 25% of the shares", s"claim-shares {reqA} --amount ${25 * SharePct}", after = Seq("A11"),
+      binds = Seq(out("vaultA", 1))),
+    tx("A13", "A shares", "Final claim on the shares", "claim-shares {reqA}", after = Seq("A12", "A9"),
+      check = Check.TokenGone("reqA")),
+
+    // ─── B: recollateralize after the 60-block wait, repay from collateral ───
+    tx("B1", "B recollateralize", "PricedOrder B: on-close at yield 50%, repay 0.11 after 90 blocks",
+      "create-order --principal 0.1 --repayment 0.11 --collateral-erg 0.3 --collateral-token {token}:1000 " +
+        "--duration 90 --expires-in 200 --yield 50",
+      after = Seq("S1"), binds = Seq(out("orderB", 0))),
+    tx("B2", "B recollateralize", "Fill order B from the wallet: its 90 blocks start", "fill-order {orderB}",
+      after = Seq("B1"), binds = Seq(out("bondB", 1), out("principalB", 2)), check = Check.PricedFill("orderB", "bondB", "principalB")),
+    refusal("B2x", "B recollateralize", "Bond B cannot take collateral within 60 blocks of its fill",
+      "recollateralize {bondB} --add-erg 0.01", "can take collateral again from height", after = Seq("B2")),
+    tx("B3", "B recollateralize", "Recollateralize bond B with 0.02 ERG and 500 test tokens (60 blocks after its fill)",
+      "recollateralize {bondB} --add-erg 0.02 --add-token {token}:500", after = Seq("B2"),
+      gate = Recollateralizable("bondB"), binds = Seq(out("bondB", 0)), check = Check.BondHolds("bondB", "token", 1500L)),
+    tx("B4", "B recollateralize", "Repay bond B out of its own ERG collateral", "repay {bondB} --from-collateral",
+      after = Seq("B3")),
+    tx("B5", "B recollateralize", "Claim repaid bond B", "claim {orderB}", after = Seq("B4"),
+      check = Check.TokenGone("orderB")),
+
+    // ─── C, the rest: early liquidation by the oracle rule ────────────────────
+    tx("C2", "C oracle", "Fill order C from the wallet: the bond starts below its ratio",
+      "fill-order {orderC} --allow-liquidatable",
+      after = Seq("C1x"), binds = Seq(out("bondC", 1))),
+    read("C3", "C oracle", "Bond C lists as liquidatable", "bonds --liquidatable", Seq("{bondC}"), after = Seq("C2")),
+    tx("C4", "C oracle", "Fractionalize bond C's unit", "fractionalize {orderC} --auction-opening 150 --auction-floor 80", settled = Seq("C2"),
+      binds = Seq(out("reqC", 0))),
+    tx("C5", "C oracle", "Cancel the share request: the unit comes back", "cancel-share-request {reqC}",
+      after = Seq("C4")),
+
+    // ─── K: expiries and cancels ──────────────────────────────────────────────
+    tx("K1", "K expiries", "Rising-yield PricedOrder K1, expiring in 10 blocks", "create-order --principal 0.1 --repayment 0.11 " +
+      "--collateral-erg 0.01 --term 400 --exact-maturity --expires-in 10 --yield 5 --end-yield 10", after = Seq("S1"),
+      binds = Seq(out("orderK1", 0))),
+    refusal("K1x", "K expiries", "Order K1 cannot be refunded before it expires", "refund-order {orderK1}",
+      "it can be refunded from then on", after = Seq("K1"), gate = Unexpired(BoxKind.Order, "orderK1")),
+    read("K1b", "K expiries", "The batch scan lists the expired order", "batch", Seq("{orderK1}"), after = Seq("K1"),
+      gate = Expired(BoxKind.Order, "orderK1")),
+    tx("K1r", "K expiries", "Refund expired order K1 to its borrower", "refund-order {orderK1}", after = Seq("K1b"),
+      gate = Expired(BoxKind.Order, "orderK1")),
+    tx("K2", "K expiries", "Order K2, expiring in 10 blocks (refunded in a pack with bond C)",
+      "create-order --principal 0.1 --repayment 0.11 --collateral-erg 0.01 --term 400 --exact-maturity --expires-in 10",
+      after = Seq("S1"), binds = Seq(out("orderK2", 0))),
+    tx("K3", "K expiries", "Order on the SigUSD market: borrow 1 SigUSD against 0.05 ERG (never filled)",
+      s"create-order --market SigUSD --principal 1 --repayment 1.1 --collateral-erg 0.05 $oracleOrder " +
+        "--term 400 --exact-maturity --expires-in 200 --yield 5",
+      after = Seq("S1"), binds = Seq(out("orderS", 0))),
+    read("K4", "K expiries", "The SigUSD order lists, with its fill guard", "orders --mine",
+      Seq("{orderS}", "SigUSD", "fill guard"), after = Seq("K3")),
+    refusal("K4x", "K expiries", "The SigUSD order's fill guard refuses a fill: 0.05 ERG is far under 150% of $1.10",
+      "fill-order {orderS}", "fill guard refuses", after = Seq("K3")),
+    tx("K5", "K expiries", "Cancel the SigUSD order", "cancel-order {orderS}", after = Seq("K3", "K4", "K4x")),
+    tx("K6", "K expiries", "Lend offer of 0.05 ERG expiring in 10 blocks",
+      "create-offer --capital 0.05 --yield 5 --collateral-floor 150 --expires-in 10", after = Seq("S1"),
+      binds = Seq(out("offer4", 0))),
+    tx("K7", "K expiries", "Refund the expired offer to its owner", "refund-offer {offer4}", after = Seq("K6"),
+      gate = Expired(BoxKind.Offer, "offer4")),
+    tx("K8", "K expiries", "Ask selling 100 test tokens for 0.01 ERG, expiring in 10 blocks",
+      "sell {token} --amount 100 --price 0.01 --expires-in 10", after = Seq("S1"), binds = Seq(out("askT", 0))),
+    tx("K9", "K expiries", "Refund the expired ask to its seller", "refund-ask {askT}", after = Seq("K8"),
+      gate = Expired(BoxKind.Ask, "askT")),
+    tx("K10", "K expiries", "Ask selling 100 test tokens for 1 SigUSD", "sell {token} --amount 100 --market SigUSD --price 1",
+      after = Seq("S1"), binds = Seq(out("askS", 0))),
+    tx("K11", "K expiries", "Cancel the SigUSD ask", "cancel-ask {askS}", after = Seq("K10")),
+
+    // ─── L: lot auctions ──────────────────────────────────────────────────────
+    tx("L1", "L lots", "Lot auction: 100 test tokens for 0.01 ERG falling to 0.002 over 10 blocks",
+      "sell-lot --token {token}:100 --opening 0.01 --floor 0.002 --falls-for 10 --holds-for 20", after = Seq("S1"),
+      binds = Seq(out("lot1", 0))),
+    read("L2", "L lots", "The lot lists with its current price", "lots --mine", Seq("{lot1}", "take-lot"), after = Seq("L1")),
+    tx("L3", "L lots", "Buy the lot with this wallet at its current price", "take-lot {lot1}", after = Seq("L1", "L2"),
+      check = Check.NoCheck),
+    tx("L4", "L lots", "Lot auction of 100 test tokens that expires unsold", "sell-lot --token {token}:100 " +
+      "--opening 1 --floor 0.5 --falls-for 3 --holds-for 5", after = Seq("S1"), binds = Seq(out("lot2", 0))),
+    tx("L5", "L lots", "Refund the expired lot to its seller", "refund-lot {lot2}", after = Seq("L4"),
+      gate = Expired(BoxKind.Lot, "lot2")),
+    tx("L6", "L lots", "Lot auction of 100 test tokens, cancelled by its seller", "sell-lot --token {token}:100 " +
+      "--opening 1 --floor 0.5", after = Seq("S1"), binds = Seq(out("lot3", 0))),
+    tx("L7", "L lots", "Cancel the lot", "cancel-lot {lot3}", after = Seq("L6")),
+
+    // ─── V: window orders, the lender picks the maturity ─────────────────────
+    tx("V1", "V window", "Window order V: repay 0.12 within 30 to 1000 blocks, priced from 5000% to 8000% on a curve",
+      "create-order --principal 0.1 --repayment 0.12 --collateral-erg 0.15 --window 30:1000 --expires-in 200 " +
+        "--curve 5000:30,8000:1000", after = Seq("S1"), binds = Seq(out("orderV", 0))),
+    refusal("V1x", "V window", "A window order's yield cannot move with time",
+      "create-order --principal 0.1 --repayment 0.12 --collateral-erg 0.15 --window 30:1000 --yield 5 --end-yield 10",
+      "does not move with time"),
+    read("V2", "V window", "The window order lists with its window, curve and zcs1's default maturity", "orders --mine",
+      Seq("{orderV}", "maturity window", "the lender's choice", "curve: at most"), after = Seq("V1")),
+    refusal("V2x", "V window", "A maturity outside the window is refused", "fill-order {orderV} --maturity {T0}",
+      "outside the order's window", after = Seq("V1")),
+    tx("V3", "V window", "Fill window order V from the wallet, choosing maturity V", "fill-order {orderV} --maturity {V}",
+      after = Seq("V2", "V2x"), binds = Seq(out("bondV", 1), out("principalV", 2)),
+      check = Check.PricedFill("orderV", "bondV", "principalV")),
+    tx("V4", "V window", "Repay bond V at once, long before its maturity", "repay {bondV}", after = Seq("V3")),
+    tx("V5", "V window", "Claim repaid bond V", "claim {orderV}", after = Seq("V4"), check = Check.TokenGone("orderV")),
+    tx("V6", "V window", "Window order W: repay 0.12 within 30 to 200 blocks, oracle rule, curve 50000% to 80000%",
+      s"create-order --principal 0.1 --repayment 0.12 --collateral-erg 0.25 $oracleOrder --window 30:200 --expires-in 200 " +
+        "--curve 50000:30,80000:200", after = Seq("V5"), binds = Seq(out("orderW", 0))),
+    tx("O4", "V window", "Lend offer of 0.3 ERG at 5% for oracle-rule bonds at 150%",
+      s"create-offer --capital 0.3 $offerTerms --expires-in 300", after = Seq("V5"), binds = Seq(out("offer5", 0))),
+    tx("V7", "V window", "The offer fills window order W at zcs1's default maturity",
+      "match-offer {offer5} --order {orderW}", after = Seq("V6", "O4"),
+      binds = Seq(out("bondW", 1), out("principalW", 2), out("offer5", 3)),
+      check = Check.PricedFill("orderW", "bondW", "principalW")),
+    tx("V8", "V window", "Cancel what is left of the offer", "cancel-offer {offer5}", after = Seq("V7")),
+    tx("V9", "V window", "Repay bond W", "repay {bondW}", after = Seq("V7")),
+    tx("V10", "V window", "Claim repaid bond W with the unit the offer delivered", "claim {orderW}", after = Seq("V9"),
+      check = Check.TokenGone("orderW")),
+
+    // ─── W: custody wraps and the paid refresh ────────────────────────────────
+    tx("W1", "W wraps", "Wrap 1 test token: a request a batcher mints into a receipt and a vault",
+      "wrap {token} --amount 1 --refresh-reserve 0.01", after = Seq("S1"), binds = Seq(out("wrapReq1", 0))),
+    tx("W2", "W wraps", "Mint the wrap's receipt, with the request as the transaction's only input", "mint-wrap {wrapReq1}",
+      after = Seq("W1"), binds = Seq(out("wrapVault1", 1))),
+    read("W3", "W wraps", "The wrap lists with its receipt and vault", "wraps --mine", Seq("{wrapReq1}", "unwrap"),
+      after = Seq("W2")),
+    refusal("W3x", "W wraps", "A refresh is refused: the vault is not two years old", "refresh {wrapVault1}",
+      "can be refreshed from height", after = Seq("W2")),
+    tx("W4", "W wraps", "Unwrap: burn the receipt with the vault's two and take the token back", "unwrap {wrapReq1}",
+      after = Seq("W3", "W3x"), check = Check.TokenGone("wrapReq1")),
+    tx("W5", "W wraps", "Wrap 1 more test token, cancelled before it is minted",
+      "wrap {token} --amount 1 --refresh-reserve 0", after = Seq("S1"), binds = Seq(out("wrapReq2", 0))),
+    tx("W6", "W wraps", "Cancel the wrap request", "cancel-wrap {wrapReq2}", after = Seq("W5")),
+
+    tx("C6", "C oracle", "One transaction: liquidate bond C by the oracle and refund expired order K2",
+      "pack {bondC} {orderK2}", after = Seq("C2", "C3", "K2"), gate = Expired(BoxKind.Order, "orderK2")),
+    read("C7", "C oracle", "Bond C lists as claimable", "claims", Seq("{orderC}"), after = Seq("C6", "C5")),
+    tx("C8", "C oracle", "Claim liquidated bond C: its collateral comes to the unit's holder", "claim {orderC}",
+      after = Seq("C7"), check = Check.TokenGone("orderC")),
+
+    // ─── G: a batch run ───────────────────────────────────────────────────────
+    tx("G1", "G batch", "PricedOrder G: on-close at yield 50000%, repay 0.12 after 60 blocks",
+      s"create-order --principal 0.1 --repayment 0.12 --collateral-erg 0.25 $oracleOrder --duration 60 --expires-in 300 --yield 50000",
+      after = Seq("S1"), binds = Seq(out("orderG", 0))),
+    tx("O3", "G batch", "Lend offer of 0.3 ERG that delivers each bond unit into shares (batcher fee 0.006)",
+      s"create-offer --capital 0.3 $offerTerms --batcher-fee 0.006 --deliver-shares --auction-opening 150 --auction-floor 80", after = Seq("S1"),
+      binds = Seq(out("offer3", 0))),
+    read("G2", "G batch", "The batch scan finds the match of order G with the share-delivering offer, and nothing else",
+      "batch", Seq("{orderG}", "{offer3}"), after = Seq("G1", "O3"), gate = QuietBatch(Seq("offer3", "orderG"))),
+    tx("G3", "G batch", "Batch run: fill order G from the offer, then mint the delivered shares", "batch --run",
+      after = Seq("G2"), gate = QuietBatch(Seq("offer3", "orderG")),
+      binds = Seq(Bind("requestG", 0, "Match offer"), Bind("bondG", 1, "Match offer"), Bind("principalG", 2, "Match offer"), Bind("vaultG", 1, "Mint shares")),
+      check = Check.PricedFill("orderG", "bondG", "principalG")),
+    tx("G4", "G batch", "Mint the delivered shares, if the batch run did not", "mint-shares {requestG}",
+      after = Seq("G3"), skipIf = Some("vaultG"), binds = Seq(out("vaultG", 1))),
+    tx("G5", "G batch", "Final claim before the pull: the shares burn and the bond unit comes back",
+      "claim-shares {requestG}", after = Seq("G4"), check = Check.TokenGone("requestG")),
+    tx("G6", "G batch", "Extinguish bond G directly with the unit that came back in G5",
+      "extinguish {bondG}", after = Seq("G3", "G5"), check = Check.TokenGone("orderG")),
+
+    // ─── end: nothing of this wallet's is left open ───────────────────────────
+    end("Z1", "No open orders left", "orders --mine", "No open orders."),
+    end("Z2", "No bonds left", "bonds --mine", "No bonds."),
+    end("Z3", "No lend offers left", "offers --mine", "No lend offers."),
+    end("Z4", "No asks left", "asks --mine", "No asks."),
+    end("Z5", "No share requests or vaults left", "shares --mine", "No share requests or vaults."),
+    end("Z7", "No lots left", "lots --mine", "No lots."),
+    end("Z8", "No wraps left", "wraps --mine", "No wrap requests or vaults."),
+    end("Z6", "Nothing left to claim", "claims", "Nothing to claim.")
+  )
+
+  /** What each step does and what it shows off, a sentence or two, printed under the step's title. */
+  val About: Map[String, String] = Map(
+    // basics
+    "R1" -> ("Prints the pinned ZC Standard contracts, the network and the wallet this run acts as. Shows the " +
+      "CLI building every contract from the pinned trees and talking to a mainnet node."),
+    "R2" -> ("Compiles the first-generation production contracts behind --old. Shows the old contracts still " +
+      "build next to the standard set."),
+    "R3" -> "Lists first-generation orders on the node. Shows the --old commands still read the production boxes.",
+    "R4" -> "Lists this wallet's first-generation bonds. Read only, like every R step.",
+    "R5" -> "Lists first-generation bonds ready to claim. Read only, like every R step.",
+    "S1" -> ("The node wallet mints a worthless test token and splits ERG into separate boxes for this wallet, in " +
+      "one transaction. The token stands in for collateral the oracle can't price, and the boxes let independent " +
+      "steps run side by side."),
+
+    // D/E: a curve offer, a yield ask, Dutch shares, liquidation at maturity, an auction
+    "O1" -> ("Posts a curve lend offer: 0.6 ERG for oracle-rule bonds at 150% or more, at 5% a year for bonds 10 " +
+      "blocks out rising to 6% a year out. It also buys Dutch-pair shares (floor at least 100%, expiry at most 100 " +
+      "blocks), so this track uses it three ways."),
+    "E1" -> ("A yield-priced order: 0.1 ERG floor, 0.12 repayment, yield rising from 100000% to 120000% by its expiry, " +
+      "so its principal falls while it waits. The rate is huge because the loan lasts about 40 blocks; it leaves room " +
+      "for the offer's fee. A fill guard protects its collateral."),
+    "D1" -> ("A plain order for 0.1 ERG, repaying 0.11 at height M, with 0.15 ERG and 500 test tokens under the " +
+      "maturity liquidation rule. This wallet fills it by hand, and it is liquidated at maturity together with bond E."),
+    "C1" -> ("An order backed by only 0.1 ERG against a 0.12 ERG repayment, about 83%, well under its 150% oracle " +
+      "ratio. It exists to be refused by an offer, then filled by hand and liquidated early: it leaves out the fill " +
+      "guard, and --allow-liquidatable lets the CLI post it."),
+    "C1x" -> ("Tries to match the O1 offer with order C, which the CLI must refuse. Shows an offer's collateral floor " +
+      "is checked before anything is built, so no batcher can fund a bond the lender wouldn't accept."),
+    "E2" -> ("The offer fills yield-priced order E. The confirmation check compares its actual borrower payment with the " +
+      "bond's recorded principal and checks that repayment and other borrower terms stayed fixed."),
+    "D2" -> ("This wallet fills order D itself, paying the principal and taking the bond's unit. Shows the basic " +
+      "peer-to-peer fill: three bond units minted, one to the lender and two kept as the bond's reserve."),
+    "D2x" -> ("Tries to liquidate bond D before its maturity, which the CLI must refuse. Shows a maturity-rule bond " +
+      "is safe from liquidation until its maturity height."),
+    "E3" -> "Lists the O1 offer after it funded bond E. Shows the offer's continuation with its remaining capital.",
+    "E4" -> ("Lists bond E's unit on a yield ask whose buyer yield falls from 100000% to 80000% by its expiry. Shows an " +
+      "ask whose price follows the bond's maturity block by block, and rises as its yield falls."),
+    "E5" -> "Lists the yield ask with its current price and yield. Shows readers computing the price as the chain does.",
+    "E6" -> ("The O1 offer buys bond E's unit from the yield ask; the unit returns to this wallet, which owns both. " +
+      "Shows an offer buying an existing bond: the origin check that proves the bond genuine, and the ask's pricing " +
+      "expression running on chain."),
+    "E7" -> ("Puts bond E's unit into a Dutch mint request: after a liquidation its collateral is auctioned from 300% " +
+      "down to 250% of the repayment over 20 blocks, held until 30. Dutch, not Selective: 1,000 test tokens would split " +
+      "pro rata. The vault will hold less ERG than 250%, so the auction opens."),
+    "E8" -> ("Mints the Dutch shares, with this wallet as the batcher keeping the mint fee. The owner gets 100 shares, " +
+      "and the share vault locks the bond unit."),
+    "E9" -> ("Lists 40% of the Dutch shares at a 400000% buyer yield with a 150% sale guard. The yield leaves room for " +
+      "the offer's batcher fee on this short, small trade."),
+    "E10" -> ("The O1 offer buys the Dutch shares from the ask. Shows an offer buying Dutch-pair shares, checking their " +
+      "auction terms against the floor and expiry it accepts."),
+    "E11" -> ("Cancels what is left of the O1 offer, returning its capital. Shows the owner can withdraw an offer " +
+      "at any time."),
+    "DE1" -> ("Waits for height M, then liquidates bonds D and E in one transaction. Shows two bonds with different " +
+      "rules (maturity, and oracle at maturity) settled together for one miner fee."),
+    "D3" -> ("Puts bond D's unit into a Dutch mint request whose floor, 10% of the repayment, is far under the 0.15 ERG " +
+      "the bond holds. After the liquidation the floor is already held, so the thin test tokens go to an excess auction."),
+    "D4" -> "Mints bond D's Dutch shares, with this wallet as the batcher keeping the mint fee.",
+    "D5" -> ("Pulls liquidated bond D into its Dutch vault. The vault holds the floor, and the test tokens are thin, so " +
+      "it opens an excess auction (state 4), falling from 20% of the repayment to nothing over 30 blocks."),
+    "D6" -> "Lists the vault with its excess auction open and the current price.",
+    "D6x" -> ("Tries a partial claim during the excess auction, which the CLI must refuse: claims wait until the " +
+      "auction is sold or its price reaches zero, so no holder takes a thin item in kind early."),
+    "D7" -> ("Buys the excess auction's lot at its falling price, paying ERG into the vault. Shows thin collateral " +
+      "sold for ERG even when the floor is already held, rather than paid out in kind."),
+    "D8" -> "Claims with every share, taking the vault's ERG and closing it.",
+    "E12" -> ("Pulls bond E's liquidated collateral into its Dutch share vault; anyone can, for the pull fee. The vault " +
+      "holds less ERG than the auction floor, so the auction of the test tokens opens."),
+    "E13" -> "Lists the share vault with its auction open and the current price. Shows the falling price as readers see it.",
+    "E14" -> ("Buys the auction's lot, the test tokens, by topping the vault's ERG up to the current target. Shows " +
+      "anyone can buy a lot, and since the price only falls, a purchase priced now stays valid."),
+    "E15" -> ("Claims with 30% of the Dutch shares, taking that share of the vault's ERG. Shows a partial claim paying " +
+      "pro rata and leaving the vault open for the rest."),
+    "E16" -> ("Claims with every remaining share, burning them and the vault's reserve. Shows the final claim closing " +
+      "the vault completely."),
+
+    // A: shares of a repaid bond
+    "A1" -> ("A yield-priced order with a 0.1 ERG principal floor, repaying 0.11 in 400 blocks, whose yield falls from " +
+      "50% to 20% by its expiry, so its principal rises while it waits. --exact-maturity keeps it off the " +
+      "21,600-block maturity grid, so the test doesn't wait a month."),
+    "A1m" -> ("Lists order A from the mempool right after it is submitted, before it confirms. Shows the mempool " +
+      "lookups that let later steps chain without waiting for blocks."),
+    "A2" -> ("This wallet fills yield-priced order A and verifies the actual principal against its payment and fixed terms. Its unit is split into shares " +
+      "next."),
+    "A2x" -> ("Tries to claim bond A before it is repaid or liquidated, which the CLI must refuse. Shows a unit claims " +
+      "nothing until its bond settles."),
+    "A3" -> ("Puts bond A's unit into a Selective mint request for 100 shares with 6 decimals, the CLI's default. Shows " +
+      "the zcs1 share format: 1.0 shares is 1% of the bond, and the name and description are built from the bond."),
+    "A4" -> "Lists the share request. Shows it waiting for any batcher to mint it.",
+    "A5" -> ("Mints bond A's shares, with this wallet as the batcher keeping the mint fee. The owner gets 100 shares, " +
+      "and the vault locks the unit until the bond settles."),
+    "A6" -> ("Lists 40% of the shares on a yield-priced ask whose buyer yield rises from 5% to 10% by its expiry. The " +
+      "ask's minimum fill defaults to the smallest lot that still claims a raw unit of the repayment."),
+    "A7" -> ("Lists the ask with its current block yield, where it is heading, and its percentage of face. Shows share " +
+      "prices quoted so they compare across bonds of any size."),
+    "A8" -> ("Buys 10% of the shares back from the ask, a partial fill. Shows the ask paying its seller and carrying " +
+      "on with the rest."),
+    "A9" -> "Cancels the rest of the ask, returning the unsold shares. Shows the seller can withdraw an ask at any time.",
+    "A10" -> ("The borrower repays bond A: the collateral comes back, and the repayment waits in the bond vault for " +
+      "the unit, which the share vault holds. The normal, happy ending of a bond."),
+    "A11" -> ("Pulls the repayment into the share vault; anyone can, for the pull fee. All three bond units burn, and " +
+      "the vault now holds ERG for the shareholders."),
+    "A12" -> "Claims with 25% of the shares, taking that share of the repayment. Shows a pro-rata claim after a repayment.",
+    "A13" -> ("Claims with every remaining share, closing the vault. It waits for A9, so every unsold share is back in " +
+      "this wallet."),
+
+    // B: recollateralize, repay from collateral
+    "B1" -> ("An on-close order priced at a 50% yield, with 0.3 ERG and 1,000 test tokens: its 90-block term starts when it " +
+      "is filled. Shows an order whose maturity is set by the fill rather than in advance."),
+    "B2" -> ("This wallet fills order B, starting its 90-block term. It also starts the 60-block wait before the bond " +
+      "can take more collateral."),
+    "B2x" -> ("Tries to add collateral to bond B within 60 blocks of its fill, which the CLI must refuse. Shows the " +
+      "wait between moves that stops a borrower dodging a liquidation by moving the bond again and again."),
+    "B3" -> ("Adds 0.02 ERG and 500 more test tokens to bond B once the 60 blocks have passed. The check confirms " +
+      "the bond then holds 1,500 tokens."),
+    "B4" -> ("Repays bond B out of the ERG already locked in it as collateral, so the borrower brings nothing from " +
+      "outside. The rest of the collateral, tokens included, comes back."),
+    "B5" -> "Claims repaid bond B with its unit, taking the 0.11 ERG repayment. All three bond units burn.",
+
+    // C: early liquidation by the oracle rule
+    "C2" -> ("This wallet fills order C anyway, starting a bond that is already below its 150% ratio; " +
+      "--allow-liquidatable overrides the CLI's refusal. It is what C6 liquidates early."),
+    "C3" -> ("Lists bond C as liquidatable. Shows readers applying the oracle rule to find bonds anyone may " +
+      "liquidate now."),
+    "C4" -> "Puts bond C's unit into a share mint request. It is never minted: C5 takes it back.",
+    "C5" -> ("Cancels the share request, returning the unit. Shows the owner can take a unit back out of a request " +
+      "nobody has minted yet."),
+    "C6" -> ("One transaction liquidates bond C by the oracle rule and refunds expired order K2. Shows unrelated work " +
+      "packed together for one miner fee, as a batcher would."),
+    "C7" -> "Lists bond C as claimable after its liquidation.",
+    "C8" -> ("Claims liquidated bond C with its unit: the collateral comes to the unit's holder and all three bond " +
+      "units burn."),
+
+    // K: expiries and cancels
+    "K1" -> "A rising-yield priced order that expires in 10 blocks, refunded without pricing witnesses.",
+    "K1x" -> ("Tries to refund order K1 before it expires, which the CLI must refuse. Shows that until its expiry, " +
+      "only the borrower can take an order back."),
+    "K1b" -> ("Runs the batch scan once K1 has expired and finds its refund. Shows a batcher discovering work that " +
+      "pays it."),
+    "K1r" -> ("Refunds expired order K1 to its borrower. Anyone may do this from the expiry height and keep the expiry " +
+      "fee; here this wallet is both."),
+    "K2" -> "Another order expiring in 10 blocks. Its refund rides along with bond C's liquidation in C6.",
+    "K3" -> ("A yield-priced order on the SigUSD market at 5%: a 1 SigUSD principal floor against 0.05 ERG. Nobody fills it; it shows the SigUSD " +
+      "market's contracts taking an order. As an oracle order it carries the default fill guard at its 150% ratio, " +
+      "so the CLI posts it with a warning instead of refusing it."),
+    "K4" -> "Lists the SigUSD order, with amounts in SigUSD and its fill guard.",
+    "K4x" -> ("Tries to fill the SigUSD order, which the CLI must refuse: the bond would start far under the fill " +
+      "guard's 150%, so the order's own contract would reject the fill."),
+    "K5" -> "Cancels the SigUSD order, returning its collateral. Shows the borrower can cancel at any time.",
+    "K6" -> "A small lend offer that expires in 10 blocks, set up to be refunded.",
+    "K7" -> ("Refunds the expired offer to its owner. Anyone may, keeping the batcher fee; it is how a contract-owned " +
+      "offer gets its funds back without signing."),
+    "K8" -> "An ask selling 100 test tokens for 0.01 ERG that expires in 10 blocks, set up to be refunded.",
+    "K9" -> "Refunds the expired ask to its seller. Anyone may, keeping the ask's refund fee.",
+    "K10" -> "An ask selling 100 test tokens for 1 SigUSD. Shows the sale order on the SigUSD market.",
+    "K11" -> "Cancels the SigUSD ask, returning the tokens.",
+
+    // L: lot auctions
+    "L1" -> ("Puts 100 test tokens up as one lot for ERG: 0.01 ERG now, falling in a straight line to 0.002 over 10 " +
+      "blocks, then held there for 20 more. Shows how a holder paid collateral in kind sells it for the repayment asset."),
+    "L2" -> "Lists the lot with its current price. Shows readers computing the falling price as the chain does.",
+    "L3" -> ("This wallet buys its own lot at the current price: the payment goes to the seller and the tokens come " +
+      "back. Since the price only falls, a purchase priced now stays valid later."),
+    "L4" -> "A lot priced far above its worth, falling for 3 blocks and held for 5, set up to expire unsold.",
+    "L5" -> "Refunds the expired lot to its seller. Anyone may, keeping the lot's refund fee.",
+    "L6" -> "A lot priced far above its worth, set up to be cancelled.",
+    "L7" -> "Cancels the lot, returning the tokens. Shows the seller can withdraw a lot at any time.",
+
+    // W: custody wraps
+    "W1" -> ("Puts one test token in a wrap request, funding 0.01 ERG for the vault's refreshes. Shows how a capability " +
+      "token, such as a LithosDex position's owner NFT, is wrapped before it goes into an order."),
+    "W2" -> ("Mints the receipt: one unit to this wallet, two and the token into the vault. The request is the " +
+      "transaction's only input, so the wrapped token is never spent beside anything else."),
+    "W3" -> "Lists the wrap: the receipt, the vault and what it holds, and when it can first be refreshed.",
+    "W3x" -> ("Asks to refresh the new vault, which the CLI refuses: a paid refresh opens only after 525600 blocks, about " +
+      "two years. Shows the refresh command without waiting two years."),
+    "W4" -> "Burns the receipt with the vault's two units and takes the token back, so all three units are gone.",
+    "W5" -> "A second wrap request, without a refresh reserve, set up to be cancelled.",
+    "W6" -> "Cancels the wrap request before a batcher mints it, returning the token.",
+
+    // V: window orders
+    "V1" -> ("A window order: the lender picks the maturity, 30 to 1000 blocks after the fill, and pays the principal " +
+      "the borrower's curve prices there, 5000% at 30 blocks rising to 8000% at 1000, never under 0.1. Repayment stays " +
+      "fixed at 0.12, so a longer loan pays the borrower less now."),
+    "V1x" -> ("Tries a window order whose yield moves with time, which the CLI must refuse: a window order is priced " +
+      "by a curve over maturities, and YieldOrder_Pricing refuses the window mode."),
+    "V2" -> "Lists the window order with its window, its curve and the maturity zcs1 would pick now.",
+    "V2x" -> ("Tries to fill order V at height T0, which the CLI must refuse: the chosen maturity must lie in the " +
+      "window, counted from the fill."),
+    "V3" -> ("This wallet fills order V choosing maturity V, about 600 blocks out, and the check confirms the principal " +
+      "paid is the one recorded, with every borrower term unchanged."),
+    "V4" -> "Repays bond V straight away: a window bond, like any other, can be repaid before its maturity.",
+    "V5" -> "Claims repaid bond V with its unit. All three bond units burn.",
+    "V6" -> ("A second window order, 30 to 200 blocks, under the oracle rule at 150% so a lend offer can buy it, " +
+      "priced high enough to leave room for the offer's fee."),
+    "O4" -> "A small lend offer at 5% that fills window order W.",
+    "V7" -> ("The offer fills window order W without a maturity: the CLI takes zcs1's choice, a grid height if one is " +
+      "in both windows, else the widest gap between the yield the offer earns and the one it requires, else the shorter."),
+    "V8" -> "Cancels what is left of the offer.",
+    "V9" -> "The borrower repays bond W.",
+    "V10" -> "Claims repaid bond W with the unit the offer delivered to this wallet.",
+
+    // G: a batch run
+    "G1" -> ("An on-close order priced at a 50000% yield, repaying 0.12 after 60 blocks: on a 60-block loan that " +
+      "discount leaves room for the offer's fee. It is the order the batch run fills."),
+    "O3" -> ("A lend offer of 0.3 ERG that has every bond unit it buys minted into Selective shares for its owner, " +
+      "paying batchers 0.006 ERG. Shows an offer that ends in shares rather than a unit."),
+    "G2" -> ("Runs the batch scan and waits until its only work is matching order G with offer O3. That way the batch " +
+      "run touches nobody else's boxes."),
+    "G3" -> ("A batch run fills order G from the offer, delivering the unit into a share mint request, then mints the " +
+      "shares in a second, chained transaction. Shows a batcher doing the whole job with no input from the lender."),
+    "G4" -> "Mints the delivered shares, in case the batch run stopped before it did. Skipped when it already did.",
+    "G5" -> ("Claims with every share before the bond settles: the shares and the vault's reserve burn, and the bond " +
+      "unit comes back. Shows whoever holds every share can turn them back into the unit until the pull."),
+    "G6" -> ("Extinguishes live bond G directly with the unit that came back in G5: all three bond units burn and " +
+      "the collateral and fee reserve return to the borrower without passing repayment through the vault."),
+
+    // end
+    "Z1" -> "Checks this wallet has no open orders left.",
+    "Z2" -> "Checks this wallet has no bonds left.",
+    "Z3" -> "Checks this wallet has no lend offers left.",
+    "Z4" -> "Checks this wallet has no asks left.",
+    "Z5" -> "Checks this wallet has no share requests or vaults left.",
+    "Z6" -> "Checks nothing is left for this wallet to claim.",
+    "Z7" -> "Checks this wallet has no lots left.",
+    "Z8" -> "Checks this wallet has no wrap requests or vaults left."
+  )
+}

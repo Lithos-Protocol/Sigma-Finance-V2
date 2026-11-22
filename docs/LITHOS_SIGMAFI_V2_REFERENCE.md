@@ -110,7 +110,7 @@ Names/descriptions and any client metadata never authenticate an asset.
 
 ### Generated EIP-4 metadata
 
-`src/main/scala/app/BondAssetMetadata.scala` generates issuance metadata when an order is filled. The name is
+`src/main/scala/org/lithosprotocol/sigmafi/app/BondAssetMetadata.scala` generates issuance metadata when an order is filled. The name is
 `SigmaFi-ZC-Bond-<first6>`, with the first six hexadecimal characters of the asset id, matching LithosDex's
 LD-NFT suffix length. The CLI generates both name and description; it takes no manual metadata flags.
 The compact JSON description keeps the older Lithos SigmaFi field names and adds identifiers/build context:
@@ -550,9 +550,9 @@ blake2b256 over UTF-8 source text after normalizing CRLF to LF; these fingerprin
 | `contracts/old/ZC_OrderOnClose.ergo` | `61209c052c8107b6c3300bdea9e3d3a39dc031019db9360f1d61525818aaca4c` |
 | `contracts/old/BondAssetVault.ergo` | `3297b063e1287b33732e2f6f4bbe0a70a836460aea0af716ce6385010e7e505a` |
 | `contracts/old/MaturityLiquidation.ergo` | `ba5f0f3647f5f73c3d81a61ffb599119731c89efab5dc1c65d125144520af19e` |
-| `src/main/scala/client/ScriptGenerator.scala` | `9e4865d047444921bb85e57562d193602e197a60dacfd5d1eae3e1250a949dfe` |
-| `src/main/scala/work/lithos/mutations/Contract.scala` | `fe1e473783454eab1b759feb7ea3ab9c757d8e26ec0aef615dd45a5573021213` |
-| `build.sbt` | `076681fc6386d44c3b933f07d0f6cbbb9ba65f64469d57bae9ad95f378f58646` |
+| `src/main/scala/org/lithosprotocol/sigmafi/client/ScriptGenerator.scala` | `9dec8e2738406a0388102fb24b5d7f21347585293eeb928b5e62a6439d5a7444` |
+| `src/main/scala/org/lithosprotocol/sigmafi/mutations/Contract.scala` | `7ac5bba4dbb39a6d2eebdaf0b77c12cb02870894522ff8bae437b8ea7d2ec70b` |
+| `build.sbt` | `e3b427009a12269da759572d80671b3d537e236bff6db050dd438d7e393c0df7` |
 | `project/build.properties` | `e6023cb99f0ff57fdcb183b400632402e711320ee722372eb7a6a844ba9f4897` |
 
 <!-- END GENERATED CONTRACT REFERENCE -->

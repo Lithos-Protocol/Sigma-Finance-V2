@@ -12,8 +12,10 @@
     // CONST_REPAYMENT_TOKEN: Coll[Byte] - repayment token id; EMPTY for ERG repayment
     //
     // TOKENS
-    // tokens(0): (bond asset, 2) - the reserve. It is NEVER burned here: it moves to the vault on
-    //   settlement, so the box holding 2 units stays the asset's state box (see ZC_Standard_Order).
+    // tokens(0): (bond asset, 2) - the reserve. Every settlement moves it to ZC_Standard_BondVault,
+    //   and recollateralize/refresh keep it here, so the box holding 2 units stays the asset's state
+    //   box (see ZC_Standard_Order). It is burned here ONLY on the Extinguish path, together with the
+    //   circulating unit (all 3 units burned) and a borrower-script co-spend.
     // tokens(1..): collateral tokens. The order's tokens, and for a token bond possibly the
     //   repayment token, appended last by a recollateralization.
     //
@@ -37,10 +39,11 @@
     // recollateralization stamps a new one (see RECOLLATERALIZE).
     //
     // PATHS AND CONTEXT VARS
-    // Refresh:     9 Int successor output index. Selects this path whatever else is set.
-    // Liquidation: 0 Coll[Byte] liquidation expression; 1 Int settlement output index.
-    // Repayment:   1 Int settlement output index; 2 Int collateral-return output index. Vars 0, 3 absent.
-    // Recollateralize:      3 Int successor output index. Var 0 absent.
+    // Refresh:         9 Int successor output index. Selects this path whatever else is set.
+    // Liquidation:     0 Coll[Byte] liquidation expression; 1 Int settlement output index.
+    // Recollateralize: 3 Int successor output index. Vars 0, 9 absent.
+    // Repayment:       1 Int settlement output index; 2 Int collateral-return output index. Vars 0, 3, 9 absent.
+    // Extinguish:      vars 0, 1, 3, 9 all absent. Borrower co-spend + all 3 bond units burned.
     //
     // SETTLEMENT BOX (both paths), at ZC_Standard_BondVault
     // tokens(0) = this bond's reserve (asset, 2); R4 = SELF.id; R5: Byte = 0 repaid / 1 liquidated.
@@ -93,11 +96,39 @@
     //   the borrower past maturity into liquidation. From maturity on, liquidation is open to anyone
     //   anyway, and a refresh is allowed again.
     //
+    // EXTINGUISH (borrower + circulating unit holder, at any height)
+    // Context vars 0, 1, 3, 9 all absent. Requires a borrower-script co-spend, tokens(0) == (R4, 2),
+    // more than 2 units of that asset in INPUTS (the circulating unit is presented), and 0 units of
+    // it in OUTPUTS (all 3 units burned). Outputs are otherwise unconstrained, releasing the collateral
+    // and the lender fee reserve directly without passing full repayment through ZC_Standard_BondVault.
+    // This lets a borrower who acquires their own bond unit (at a discount on a SaleOrder or LotAuction,
+    // via OTC workout, or after un-fractionalizing shares) close the debt and unlock collateral in one
+    // transaction without sourcing face-value repayment cash, and even fund a SaleOrder/OTC buyback by
+    // swapping part of the unlocked collateral or atomically unwrap a WrapVault receipt.
+    //
+    // SECURITY NOTES FOR EXTENSIONS AND CONSUMING CONTRACTS
+    // - Lender-side vaults / Series Pools: because a live bond can burn all 3 units with borrowerAuth,
+    //   burning all 3 units no longer proves ZC_Standard_BondVault was spent. Every contract holding
+    //   (asset, 1) with a permissionless pull/sweep path MUST explicitly pin CONST_VAULT_HASH
+    //   (blake2b256(source.propositionBytes) == CONST_VAULT_HASH), as ZC_Standard_FractionalVault and
+    //   ZC_Standard_DutchAuctionVault do.
+    // - Contract borrowers (Nautilus v2 proxies, DAOs, routers): because Extinguish leaves outputs
+    //   unconstrained, borrowerHash holds full-custody release authority over the live bond for its
+    //   entire lifetime (matching ZC_Standard_Order's cancel path). A contract used as borrowerHash
+    //   must never allow an untrusted third party to spend a box at borrowerHash without pinning
+    //   INPUTS (or must keep batcher-spendable intent boxes under a separate script).
+    // - PricedAsk single-tx caveat: YieldAsk_Pricing and ERG_SigUSD_GuardedYield_Pricing require the
+    //   live bond in CONTEXT.dataInputs while Extinguish spends it in INPUTS. Do not assume single-tx
+    //   PricedAsk + Extinguish without live-node/wallet verification of INPUTS/dataInputs overlap.
+    // - Settlement receipts: Extinguish skips ZC_Standard_BondVault, so no R5 = 0/1 vault box is
+    //   created for naked third-party derivatives waiting on a vault data input.
+    //
     // ASSUMPTIONS
     // A hand-made box with this script proves nothing: authenticate the asset's issuer (Order or PricedOrder).
     // The liquidation expression controls the vault's contents; both parties must inspect it.
     // Anyone may repay in full. Liquidation may run before maturity if the expression allows it.
-    // An anyone-can-spend borrower script lets anyone recollateralize or repay from collateral.
+    // An anyone-can-spend borrower script lets anyone recollateralize, repay from collateral, or extinguish
+    // (if they hold the circulating unit).
     // A refresh relies on someone sending it within the two years before rent is due; the bounty is
     // the reason to. Live-node serialization and maximum cost are unverified.
 
@@ -153,7 +184,7 @@
                     next.R9[Coll[Long]].get == lender
                 )
             }
-        } else if (liquidationScript.isDefined || !recollateralizeIndex.isDefined) {
+        } else if (liquidationScript.isDefined || (!recollateralizeIndex.isDefined && getVar[Int](1).isDefined)) {
             // Settlement: liquidation or repayment
             val settlementIndex = getVar[Int](1).get
             if (settlementIndex < 0 || settlementIndex >= OUTPUTS.size) {
@@ -217,7 +248,7 @@
                     }
                 }
             }
-        } else {
+        } else if (recollateralizeIndex.isDefined) {
             // Recollateralize
             val index = recollateralizeIndex.get
             if (index < 0 || index >= OUTPUTS.size) {
@@ -261,6 +292,34 @@
                         sameTerms && noneLower && grown
                     )
                 }
+            }
+        } else {
+            // Extinguish: borrower + holder of the circulating unit burn all 3 units (vars 0, 1, 3, 9 absent).
+            // Token counts live strictly in this branch so existing paths pay zero extra runtime cost.
+            if (SELF.tokens.size == 0) {
+                sigmaProp(false)
+            } else {
+                val asset = SELF.tokens(0)._1
+                val reserve = SELF.tokens(0)._2
+                val inCount = INPUTS.fold(0L, { (a: Long, b: Box) =>
+                    val count = b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                        if (t._1 == asset) z + t._2 else z
+                    })
+                    a + count
+                })
+                val outCount = OUTPUTS.fold(0L, { (a: Long, b: Box) =>
+                    val count = b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                        if (t._1 == asset) z + t._2 else z
+                    })
+                    a + count
+                })
+                sigmaProp(
+                    borrowerAuth &&
+                    asset == SELF.R4[Coll[Byte]].get &&
+                    reserve == 2L &&
+                    inCount > reserve &&
+                    outCount == 0L
+                )
             }
         }
     }

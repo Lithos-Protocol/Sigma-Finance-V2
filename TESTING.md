@@ -31,18 +31,16 @@ shared with c-bonds; anything in this file or the repository takes precedence ov
 
 | Path | What |
 |---|---|
-| `src/main/scala/work/lithos/mutations/` | the box/transaction API, copied from Lithos unchanged |
-| `src/main/scala/mutations/NodeWallet.scala` | the miner-reward-delay constant the above needs |
-| `src/test/scala/specs/harness/` | `ContractSpecBase`, `HarnessProbeSpec` |
-| `src/test/scala/specs/<product>/` | one `<Product>SpecBase` plus one suite per contract |
-| `src/test/scala/specs/bonds/` | `BondSpecBase`; suites for the first-generation bonds, orders, `MaturityLiquidation`, `BondAssetVault`, template verification and collateral conversion |
-| `src/test/scala/specs/bonds/ZcStandard*` | `ZcStandardSpecBase`, which views `StandardContracts.compile` per market (`scripts`, `exchange`, `marketOf`) and builds an order-to-bond `Flow`; suites for the bond, order and vault, the fractional pair, the asks, the lend offer, the Dutch auction pair and the fill and sale guards (`ZcStandardFillGuardSpec`); `ZcStandardProbeSpec` and `ZcStandardReference` for the pins |
-| `src/test/scala/specs/app/` | `SigmaFiAppSpec` (first generation), and `StandardAppSpec` (bond lifecycle) and `StandardExchangeAppSpec` (shares, asks, lend offers, the batch scan) and `StandardOffchainSpec` (the zcs1 off-chain rules: script disclosure, token metadata, share count, face prices and lots, the maturity grid, cover at the fill and the guards as the CLI builds them, packed refunds and liquidations, ranked and chained batch runs, mempool lookups) for the ZC Standard: the CLI's apps end to end, over `FakeNode`, an in-memory chain served as the node's index and wallet JSON, whose transactions keep each input's spending proof and context extension as the node renders them. `StandardSpecSupport` holds the standard specs' world and seeding helpers. `SigmaFiCliSpec` covers argument and shell-line parsing. `LivePlanSpec` checks the live test's plan (`sbt livetest`, see the README), which only runs against a node: every command parses, every variable is found by a step it builds on, no step that may run first can rebind what a transaction reads, and every standard command is exercised |
+| `src/main/scala/org/lithosprotocol/sigmafi/mutations/` | the box and transaction API ported from Lithos, including the miner-reward-delay constant in `NodeWallet.scala` |
+| `src/test/scala/org/lithosprotocol/sigmafi/specs/harness/` | `ContractSpecBase`, `HarnessProbeSpec` |
+| `src/test/scala/org/lithosprotocol/sigmafi/specs/<product>/` | one `<Product>SpecBase` plus one suite per contract |
+| `src/test/scala/org/lithosprotocol/sigmafi/specs/bonds/` | `BondSpecBase`; suites for the first-generation bonds, orders, `MaturityLiquidation`, `BondAssetVault`, template verification and collateral conversion |
+| `src/test/scala/org/lithosprotocol/sigmafi/specs/bonds/ZcStandard*` | `ZcStandardSpecBase`, which views `StandardContracts.compile` per market (`scripts`, `exchange`, `marketOf`) and builds an order-to-bond `Flow`; suites for the bond, order and vault, the fractional pair, the asks, the lend offer, the Dutch auction pair and the fill and sale guards (`ZcStandardFillGuardSpec`); `ZcStandardProbeSpec` and `ZcStandardReference` for the pins |
+| `src/test/scala/org/lithosprotocol/sigmafi/specs/app/` | `SigmaFiAppSpec` (first generation), and `StandardAppSpec` (bond lifecycle) and `StandardExchangeAppSpec` (shares, asks, lend offers, the batch scan) and `StandardOffchainSpec` (the zcs1 off-chain rules: script disclosure, token metadata, share count, face prices and lots, the maturity grid, cover at the fill and the guards as the CLI builds them, packed refunds and liquidations, ranked and chained batch runs, mempool lookups) for the ZC Standard: the CLI's apps end to end, over `FakeNode`, an in-memory chain served as the node's index and wallet JSON, whose transactions keep each input's spending proof and context extension as the node renders them. `StandardSpecSupport` holds the standard specs' world and seeding helpers. `SigmaFiCliSpec` covers argument and shell-line parsing. `LivePlanSpec` checks the live test's plan (`sbt livetest`, see the README), which only runs against a node: every command parses, every variable is found by a step it builds on, no step that may run first can rebind what a transaction reads, and every standard command is exercised |
 
-The mutations package keeps its Lithos name rather than the `org.lithosprotocol.sigmafi` prefix so
-it can be re-synced with Lithos and c-bonds by copying. `BoxLoader`, `UTXOSelector` and
-`NotEnoughInputsException` were left behind because they call the Lithos node API and nothing here
-needs them.
+When copying updates from Lithos or c-bonds, use the local `org.lithosprotocol.sigmafi.mutations`
+namespace. `BoxLoader`, `UTXOSelector` and `NotEnoughInputsException` were left behind because they
+call the Lithos node API and nothing here needs them.
 
 `HarnessProbeSpec` touches no SigmaFi contract. It checks the harness itself: the mocked context,
 offline signing, 6.0 compilation at ErgoTree v3, and that `rejectsAtSigning` really separates a
@@ -279,3 +277,26 @@ A mainnet run with `chain off` (setup at height 1918919) failed ten steps; three
 
 The runner changes are checked only by compiling and the state round trip; the next `chain off` run is their
 test. All 524 tests pass. Nothing was broadcast.
+
+## Early extinguish and pull-vault pinning (2026-11-22)
+
+Added offline specs for `ZC_Standard_Bond`'s Extinguish path and `CONST_VAULT_HASH` pinning on both share vaults:
+
+- `ZcStandardBondSpec`: Extinguish in ERG and SigUSD (fixed and on-close) before, at, and after maturity;
+  unconstrained outputs; unit held at borrower address satisfying `borrowerAuth` directly and unit held at a
+  non-borrower script with a separate borrower co-spend; negatives for lender-only, stranger co-spend,
+  borrower without the 3rd unit, partial burns leaving 1 or 2 units alive, wrong R4, reserve != 2, zero-token
+  box, and context-var routing isolation (`var 1/3/9`); atomic 1-tx `SaleOrder` collateral-funded buyback +
+  Extinguish; atomic 1-tx Extinguish + `WrapVault` unwrap.
+- `ZcStandardRefreshSpec`: a refreshed bond extinguishes cleanly.
+- `ZcStandardFractionalSpec` and `ZcStandardDutchAuctionSpec`: adversarial `PULL` negatives pairing a live
+  bond + `borrowerAuth` (Extinguish hijack) and a fake non-`BondVault` source carrying a valid `Byte` R5,
+  proving `CONST_VAULT_HASH` rejects both.
+- `ZcStandardProbeSpec`: asserts `CONST_VAULT_HASH` is pinned in both `FractionalVault` and `DutchAuctionVault`,
+  and verifies all regenerated pins and `docs/ZC_STANDARD_REFERENCE.md`.
+- `StandardAppSpec` and `LivePlanSpec`: end-to-end `extinguish` on ERG and SigUSD bonds (before and at maturity,
+  with zero repayment cash and no `BondVault` created), non-borrower and missing-unit refusals, and Track G
+  updated to exercise `extinguish`.
+
+All 533 tests across 30 suites pass, with updated cost measurements recorded in `SigmaBonds.MD`. Nothing was
+broadcast.

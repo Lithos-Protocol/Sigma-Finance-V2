@@ -4,8 +4,7 @@ ThisBuild / scalaVersion := "2.12.18"
 
 lazy val root = (project in file("."))
   .settings(
-    name := "SigmaFinanceV2",
-    idePackagePrefix := Some("org.lithosprotocol.sigmafi")
+    name := "SigmaFinanceV2"
   )
 
 libraryDependencies ++= Seq(
@@ -44,7 +43,7 @@ Compile / run / connectInput := true
 Compile / run / outputStrategy := Some(StdoutOutput)
 
 // `sbt sigmafi` starts the shell; anything after it is passed on, e.g. `sbt "sigmafi --node <url>"`.
-addCommandAlias("sigmafi", "runMain ksingh.sigmabonds.app.SigmaFiCli")
+addCommandAlias("sigmafi", "runMain org.lithosprotocol.sigmafi.app.SigmaFiCli")
 
 // `sbt livetest` walks the CLI through every ZC Standard command against a live node (see the README).
-addCommandAlias("livetest", "runMain ksingh.sigmabonds.livetest.LiveTest")
+addCommandAlias("livetest", "runMain org.lithosprotocol.sigmafi.livetest.LiveTest")
