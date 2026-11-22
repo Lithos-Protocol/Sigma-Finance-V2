@@ -1,0 +1,33 @@
+{
+    // FI_Standard_Liquidation.ergo - pays an FI bond out to its settlement vault on liquidation
+    // Author: CannonQ (2026)
+    //
+    // An expression, not a box script. FI_Standard_Bond's R8 holds the blake2b256 hash of these
+    // bytes, and the bond runs them from its context var 0, with the bond as SELF, when it is
+    // liquidated. The bond itself decides whether it is liquidatable (maturity, a missed coupon,
+    // or an open breach past its deadline) and pins the vault script, tokens(0), the R4 tag, the
+    // path marker, a recent creation height (HEIGHT - 15 or later) and no R6 on the settlement
+    // output; this expression adds no eligibility test.
+    // FI_Standard_Order fills only an order whose R7 equals its CONST_LIQUIDATION_HASH, so every
+    // bond it creates carries this expression. That constant, and the one of the same name in
+    // FI_Standard_ERG_SigUSD_CollateralPolicy, must be blake2b256 of these bytes.
+    //
+    // Reads from the bond (SELF): R9, which must hold exactly 7 Longs; R9(0) is the lender fee
+    // reserve and must be within 0..SELF.value. Context var 1 (Int) names the settlement output.
+    //
+    // Checked here: the settlement output carries exactly SELF.tokens (the reserve, then all
+    // collateral tokens, same order) and at least SELF.value minus the fee reserve in nanoERG.
+    // So the fee reserve R9(0) goes wherever the sender of the liquidation puts it: it is the
+    // liquidator's pay. (On Repayment the bond instead sends it into the settlement.)
+    // The ZC liquidation expressions read R9 as 3 Longs, so they do not fit an FI bond.
+
+    val lender = SELF.R9[Coll[Long]].get
+    val index = getVar[Int](1).get
+    if (lender.size != 7 || index < 0 || index >= OUTPUTS.size) {
+        sigmaProp(false)
+    } else {
+        val settlement = OUTPUTS(index)
+        sigmaProp(lender(0) >= 0L && lender(0) <= SELF.value &&
+            settlement.value >= SELF.value - lender(0) && settlement.tokens == SELF.tokens)
+    }
+}

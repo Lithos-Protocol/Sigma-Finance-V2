@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FI Bond Walkthrough</title>
+<style>
+:root{
+  --bg:#f6f5f1; --panel:#ffffff; --ink:#1d1f23; --muted:#5d636d; --line:#d9d6cd; --soft:#efede6;
+  --alice:#b4532a; --bob:#1f6f8b; --charlie:#6b5b95; --david:#2e7d4f; --erin:#a3477a; --contract:#4a4f57; --oracle:#8a6d1b;
+  --mint:#2e7d4f; --burn:#b33a3a; --accent:#1f6f8b;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#15171a; --panel:#1e2125; --ink:#e8e6e1; --muted:#9aa1ab; --line:#33383f; --soft:#262a2f;
+    --alice:#e58a5f; --bob:#5bb4d1; --charlie:#a99ad6; --david:#6cc08d; --erin:#d987b3; --contract:#aab0b9; --oracle:#d6b656;
+    --mint:#6cc08d; --burn:#e57373; --accent:#5bb4d1;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#15171a; --panel:#1e2125; --ink:#e8e6e1; --muted:#9aa1ab; --line:#33383f; --soft:#262a2f;
+  --alice:#e58a5f; --bob:#5bb4d1; --charlie:#a99ad6; --david:#6cc08d; --erin:#d987b3; --contract:#aab0b9; --oracle:#d6b656;
+  --mint:#6cc08d; --burn:#e57373; --accent:#5bb4d1;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:24px 16px 80px}
+h1{font-size:28px;margin:0 0 4px;letter-spacing:-.01em}
+h2{font-size:20px;margin:44px 0 6px;padding-top:12px;border-top:2px solid var(--line)}
+h3{font-size:16px;margin:0}
+p{margin:6px 0}
+.lede{color:var(--muted);max-width:760px}
+nav{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line);margin:16px -16px 0;padding:8px 16px;display:flex;gap:6px;flex-wrap:wrap}
+nav a{color:var(--ink);text-decoration:none;font-size:13px;padding:4px 10px;border:1px solid var(--line);border-radius:999px;background:var(--panel)}
+nav a:hover{border-color:var(--accent)}
+.cast{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-top:14px}
+.person{background:var(--panel);border:1px solid var(--line);border-left:5px solid var(--c);border-radius:8px;padding:10px 12px}
+.person b{color:var(--c)}
+.person span{display:block;color:var(--muted);font-size:13px}
+table{border-collapse:collapse;width:100%;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden;font-size:14px}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{background:var(--soft);font-weight:600}
+tr:last-child td{border-bottom:0}
+.scroll{overflow-x:auto}
+.tx{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin:18px 0;padding:16px}
+.txhead{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.num{font:600 13px ui-monospace,Menlo,Consolas,monospace;background:var(--soft);border:1px solid var(--line);border-radius:6px;padding:1px 7px}
+.meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:8px 18px;margin:10px 0 14px;font-size:14px}
+.meta div b{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600}
+.flow{display:grid;grid-template-columns:1fr 150px 1fr;gap:10px;align-items:center}
+.col{display:flex;flex-direction:column;gap:8px}
+.colhead{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600}
+.box{border:1px solid var(--line);border-left:5px solid var(--c);border-radius:7px;padding:7px 10px;background:var(--bg)}
+.box .who{font-size:12px;color:var(--c);font-weight:600}
+.box .name{font-weight:600}
+.box .holds{font-size:13px;color:var(--muted)}
+.box.data{border-style:dashed}
+.mid{display:flex;flex-direction:column;align-items:center;gap:6px;text-align:center}
+.hex{background:var(--soft);border:2px solid var(--ink);border-radius:10px;padding:10px 8px;font-weight:600;font-size:13px;width:100%}
+.arrow{color:var(--muted);font-size:18px;line-height:1}
+.tag{font:600 12px ui-monospace,Menlo,Consolas,monospace;border-radius:5px;padding:1px 6px;border:1px solid currentColor;display:inline-block;margin-top:2px}
+.tag.mint{color:var(--mint)} .tag.burn{color:var(--burn)}
+.datarow{margin:0 0 10px}
+.rule,.after{font-size:14px;margin-top:12px;padding:8px 10px;border-radius:7px;background:var(--soft)}
+.rule b,.after b{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);display:block}
+.note{font-size:13.5px;color:var(--muted);margin-top:8px}
+.timeline{display:grid;grid-template-columns:120px 1fr;gap:4px 14px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px;font-size:14px}
+.timeline code{font:13px ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
+.limits li{margin:6px 0}
+code{font:13px ui-monospace,Menlo,Consolas,monospace}
+@media (max-width:760px){
+  .flow{grid-template-columns:1fr}
+  .mid{flex-direction:row;justify-content:center}
+  .hex{width:auto}
+  .arrow{transform:rotate(90deg)}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>FI Bond Walkthrough</h1>
+<p class="lede">Every transaction in the Fixed Interest (coupon) bond standard, told with five people. Each card shows what a transaction spends, what it only reads, and what it creates. The example is one bond: Alice borrows 100 SigUSD from Bob against 400 ERG, pays three coupons of 5 SigUSD each, and repays 100 SigUSD.</p>
+
+<nav>
+<a href="#cast">Cast</a><a href="#terms">Terms</a><a href="#open">Open the bond</a><a href="#coupons">Coupons</a><a href="#covenant">Covenant</a><a href="#end">Ending</a><a href="#shares">Shares</a><a href="#upkeep">Upkeep</a><a href="#contracts">Contracts</a><a href="#limits">Known limits</a>
+</nav>
+
+<h2 id="cast">Cast</h2>
+<div class="cast">
+  <div class="person" style="--c:var(--alice)"><b>Alice</b> · borrower<span>Locks 400 ERG, receives 100 SigUSD, pays coupons in SigUSD, cures breaches, repays in SigUSD.</span></div>
+  <div class="person" style="--c:var(--bob)"><b>Bob</b> · lender and coupon receiver<span>Lends the 100 SigUSD and holds the one circulating bond unit. Whoever holds that unit collects coupons and the final settlement.</span></div>
+  <div class="person" style="--c:var(--charlie)"><b>Charlie</b> · cranker (anyone)<span>Sends the transactions that need no signature: offer fills, breach records, liquidations, refreshes, share-vault upkeep. Paid for each: at least 0.1 ERG for filling an offer, 0.5 ERG for recording a breach, 0.5% of a coupon for feeding it into a share vault, at least 0.1 ERG for the final pull, the lender's fee reserve, at least 0.1 ERG, for a liquidation, and the order's expiry fee (at least 0.1 ERG) or the offer's refund fee for refunding an expired order or offer.</span></div>
+  <div class="person" style="--c:var(--david)"><b>David</b> · share holder<span>Buys 300 of the 1000 shares Bob makes from his unit.</span></div>
+  <div class="person" style="--c:var(--erin)"><b>Erin</b> · share holder / seller<span>Buys 200 shares. In one card she sells a unit of a different bond.</span></div>
+  <div class="person" style="--c:var(--oracle)"><b>Oracle box</b> · read only<span>The ERG/USD price box. Transactions read it as a data input; they never spend it.</span></div>
+</div>
+
+<h2 id="terms">The example bond</h2>
+<div class="scroll"><table>
+<tr><th>Term</th><th>Value</th><th>Meaning</th></tr>
+<tr><td>Principal / repayment</td><td>100 SigUSD / 100 SigUSD</td><td>Bob's return is the coupons.</td></tr>
+<tr><td>Collateral</td><td>400 ERG</td><td>Locked in the bond box.</td></tr>
+<tr><td>Coupons</td><td>3 × 5 SigUSD</td><td>Due every 10,000 blocks.</td></tr>
+<tr><td>Grace</td><td>1,000 blocks</td><td>A coupon unpaid this long after its due height is missed, and the bond can be liquidated.</td></tr>
+<tr><td>Covenant ratio</td><td>150%</td><td>Collateral value must be at least 150% of the repayment, tested at each coupon date.</td></tr>
+<tr><td>Cure window</td><td>720 blocks</td><td>Time Alice has to top up after a breach is recorded. An order must give at least 30 blocks.</td></tr>
+<tr><td>Max oracle age</td><td>30 blocks</td><td>How fresh the price box must be.</td></tr>
+<tr><td>Bond units</td><td>3 of asset X</td><td>2 stay locked in the bond (later in the settlement box). 1 circulates: Bob's.</td></tr>
+</table></div>
+
+<p style="margin-top:14px"><b>Block heights</b></p>
+<div class="timeline">
+<code>999,900</code><div>Alice posts the order.</div>
+<code>1,000,000</code><div>Filled. The bond starts.</div>
+<code>1,010,000</code><div>Coupon 0 due. Missed at 1,011,000.</div>
+<code>1,020,000</code><div>Coupon 1 due. Missed at 1,021,000.</div>
+<code>1,030,000</code><div>Coupon 2 due. Missed at 1,031,000.</div>
+<code>1,039,280</code><div>Last 720 blocks: no breach can be recorded, no refresh.</div>
+<code>1,040,000</code><div>Maturity. Unrepaid, the bond can be liquidated.</div>
+</div>
+<p class="note"><b>Quiet zone.</b> In the last 500 blocks before a coupon's miss height (half the grace, at least 2 and at most 720 blocks), nobody can record a breach or refresh the bond. Those are the two things a stranger can do that would re-spend the bond box and cancel Alice's pending coupon payment. In the same blocks a coupon must go into a fresh coupon box, so Bob collecting an old one cannot cancel her payment either. Zones here: 1,010,500–1,011,000, 1,020,500–1,021,000, 1,030,500–1,031,000. Paying the coupon moves the zone to the next one. The same protection covers a cure: while a breach is open, nobody can refresh the bond in the last half of the cure window (capped at 720 blocks) before the deadline, so Alice's pending cure or repayment cannot be cancelled.</p>
+<p class="note"><b>Limits.</b> A bond lives at most 788,400 blocks (about 3 years) from its start. A covenant needs a cure window of at least 30 blocks, and every bond carries the standard liquidation rule. Wherever Alice or Bob authorise something by spending one of their own boxes beside the contract box, that box must be younger than 1,051,200 blocks. Boxes the contracts create for someone are stamped within 1,000 blocks of the current height and carry no registers beyond the ones named here.</p>
+
+<div id="cards"></div>
+
+<h2 id="contracts">Contracts</h2>
+<div class="scroll"><table>
+<tr><th>Contract</th><th>Box it guards</th><th>The one thing it enforces</th></tr>
+<tr><td>FI_Standard_Order</td><td>Alice's order: collateral and terms</td><td>A fill mints exactly 3 units and creates a bond with her terms copied exactly, on a schedule where every coupon can be enforced.</td></tr>
+<tr><td>FI_Standard_Bond</td><td>The bond: 2 units, collateral, coupon and breach state</td><td>Only seven moves exist (pay, record, cure, recollateralize, refresh, repay, liquidate), and each changes only its own fields.</td></tr>
+<tr><td>FI_Standard_CouponVault</td><td>The coupon box of one bond</td><td>Only the holder of the circulating unit collects it; anything else must carry it forward whole (a refresh may keep up to 0.01 ERG).</td></tr>
+<tr><td>FI_Standard_FractionalVault</td><td>One bond unit held for N shares</td><td>Coupons and the settlement come in whole, less the 0.5% keeper cut and, at the pull, the pull fee; claims pay exactly pro rata to the shares burned.</td></tr>
+<tr><td>FI_Standard_LendOffer</td><td>Bob's standing offer and its capital</td><td>It buys one whole unit of a genuine, healthy FI bond within Bob's bounds, and only the listed amounts leave.</td></tr>
+<tr><td>FI_Standard_ERG_SigUSD_Covenant</td><td>(expression run by the bond)</td><td>At a fresh price: is collateral below the ratio (record), or back at it (cure)?</td></tr>
+<tr><td>FI_Standard_ERG_SigUSD_FillGuard</td><td>(expression run by the order; required for a covenant order, Alice picks which)</td><td>The new bond must start at or above its own covenant ratio.</td></tr>
+<tr><td>FI_Standard_ERG_SigUSD_CollateralPolicy</td><td>(expression run by the offer, Bob's choice)</td><td>The bond carries the standard liquidation rule and a covenant at or above Bob's floor, and right now its collateral covers that floor plus the fee reserve and one 0.5 ERG breach bounty, and the bond's own ratio.</td></tr>
+<tr><td>FI_Standard_Liquidation</td><td>(expression run by the bond)</td><td>On liquidation all collateral goes into the settlement box.</td></tr>
+<tr><td>ZC_Standard_BondVault <i>(unchanged)</i></td><td>The settlement box</td><td>Whoever burns all 3 units takes it.</td></tr>
+<tr><td>FI_Standard_FractionalMint</td><td>The share-mint request</td><td>Exactly 2N+1 shares are made: N to the owner, N+1 locked in the vault with the unit. Same layout as ZC_Standard_FractionalMint with stricter rules: a pull fee of at least 0.1 ERG, a vault funded at exactly 0.001 ERG plus the pull fee, freshly stamped outputs and a recent owner box. It is the only supported creator of FI share vaults.</td></tr>
+</table></div>
+
+<h2 id="limits">Known limits</h2>
+<ul class="limits">
+<li><b>A coupon box left out of the final claim or the pull is stuck for good.</b> The 720-block wait before a pull and the keeper pay make leaving one out unprofitable, but cannot make it impossible. Once all 3 units of X are burned nobody can collect it. It never goes back to Alice. No contract can tell that a box was left out, so whoever claims or pulls must include it.</li>
+<li><b>Share holders are paid coupons only at their claim</b>, after the settlement is pulled into the share vault. Selling shares earlier sells that part of the coupons too.</li>
+<li><b>Early repayment skips future coupons.</b> Alice can repay any time while the bond is in good standing; coupons not yet missed are then not owed. This is intended.</li>
+<li><b>Oracle outage during a cure window.</b> A cure needs a fresh price box. If the oracle stalls for the whole window the bond can be liquidated at the deadline. Use long cure windows.</li>
+<li><b>The covenant is tested only at coupon dates</b>, not continuously.</li>
+<li><b>If Alice never cures, Bob bears the breach bounty.</b> The bond is liquidated 0.5 ERG lighter for each breach recorded.</li>
+</ul>
+<p class="note">Numbers are from the example; SigUSD amounts are whole dollars for reading, and ERG is taken at 1 USD.</p>
+</div>
+
+<script>
+const P={alice:"Alice",bob:"Bob",charlie:"Charlie",david:"David",erin:"Erin",contract:"Contract",oracle:"Oracle"};
+const b=(who,name,holds,guard)=>({who,name,holds,guard});
+const SECTIONS=[
+{id:"open",title:"Open the bond",txs:[
+ {n:"1",t:"Alice posts her order",who:"Alice",signs:"Alice (her own wallet)",when:"Any time. Fillable until block 1,001,000; she can cancel at any height.",
+  ins:[b("alice","Alice's wallet","400 ERG + at least 0.1 ERG for the expiry fee + a little ERG for miner fees")],
+  outs:[b("contract","Order box","400 ERG of collateral + an expiry fee of at least 0.1 ERG (returned to Alice with the principal on a fill). Terms: borrow 100 SigUSD, pay 3 coupons of 5 SigUSD each, repay 100 SigUSD. Covenant ratio 150%, cure window 720 blocks. Names Alice as borrower.","FI_Standard_Order")],
+  rule:"Nothing is checked yet. The order only decides what a later fill must look like.",
+  after:"If nobody fills by 1,001,000, anyone may return it to Alice and keep the order's expiry fee (at least 0.1 ERG)."},
+ {n:"2a",t:"Bob fills the order directly",who:"Bob",signs:"Bob",when:"Before the order expires. The first coupon must fall due at or after the fill and be missed no sooner than 30 blocks after it; maturity is at most 788,400 blocks (about 3 years) after the start.",
+  data:[b("oracle","Oracle box","ERG price, at most 30 blocks old. Read by the fill guard, which a covenant order must name.")],
+  ins:[b("contract","Order box","400 ERG + terms","FI_Standard_Order"),b("bob","Bob's wallet","100 SigUSD + ERG for fees")],
+  outs:[b("bob","Bond unit","1 unit of X. This is the lender's claim."),
+        b("contract","Bond box","2 units of X + 400 ERG of collateral + Bob's fee reserve (at least 0.1 ERG). Terms copied from the order. Coupons paid = 0 of 3, no breach.","FI_Standard_Bond"),
+        b("alice","Principal","100 SigUSD")],
+  mint:"mint 3 units of X",
+  rule:"Exactly 3 units are minted and 2 are locked in the bond. Every term is copied byte for byte. The fill guard makes the bond start at or above 150% cover (here 400%).",
+  after:"Alice: +100 SigUSD, 400 ERG locked. Bob: −100 SigUSD and the fee reserve, holds the unit."},
+ {n:"2b",t:"Or: Charlie fills it from Bob's standing offer",who:"Charlie (anyone)",signs:"Nobody. Bob signed once, when he posted the offer.",when:"While both the order and the offer are open and the bond fits Bob's bounds.",
+  data:[b("oracle","Oracle box","ERG price. Read by Bob's collateral policy (and Alice's guard).")],
+  ins:[b("contract","Order box","400 ERG + terms","FI_Standard_Order"),b("contract","Bob's offer","200 SigUSD + 1 ERG. Bob's bounds: minimum coupon 1 SigUSD, maximum grace 2,000 blocks, maximum cure window 1,440 blocks, collateral floor 130%.","FI_Standard_LendOffer")],
+  outs:[b("bob","Bond unit","1 unit of X, delivered to Bob"),
+        b("contract","Bond box","2 units of X + 400 ERG of collateral, as in 2a","FI_Standard_Bond"),
+        b("alice","Principal","100 SigUSD"),
+        b("contract","Bob's offer, continued","100 SigUSD left for the next fill","FI_Standard_LendOffer")],
+  mint:"mint 3 units of X",
+  rule:"The offer checks the bond is a genuine FI bond inside Bob's schedule bounds, and the price clears the yield Bob's offer asks (0 here; coupons are not counted). His policy checks that, at the current price, the collateral covers his 130% floor plus the bond's fee reserve and one 0.5 ERG breach bounty, and the bond's own 150% ratio. Only the price, the fill fee, the bond's fee reserve and box minimums may leave the offer.",
+  after:"Same as 2a. Charlie keeps the fill fee Bob's offer sets, at least 0.1 ERG, paid from the offer box's ERG. Bob pays it because he relied on Charlie to do the matching; in 2a he acted himself and paid no one."}
+]},
+{id:"coupons",title:"Coupons",txs:[
+ {n:"3a",t:"Alice pays coupon 0",who:"Alice",signs:"Alice",when:"From one period before the due height until the miss height: blocks 1,000,000 to 1,010,999.",
+  ins:[b("contract","Bond box","2 units of X + 400 ERG. Coupons paid = 0 of 3","FI_Standard_Bond"),b("alice","Alice's wallet","5 SigUSD + ERG for fees")],
+  outs:[b("contract","Bond box","2 units of X + 400 ERG. Coupons paid = 1 of 3","FI_Standard_Bond"),b("contract","Coupon box","5 SigUSD, tagged with bond asset X","FI_Standard_CouponVault")],
+  rule:"The bond is re-created unchanged except the counter. The coupon box must hold the full coupon in SigUSD and nothing else.",
+  after:"Alice: −5 SigUSD, and it is no longer hers in any way. 5 SigUSD waits for whoever holds the bond unit."},
+ {n:"3b",t:"Alice pays coupon 1 and tops up the coupon box",who:"Alice",signs:"Alice",when:"Blocks 1,010,000 to 1,020,499 for a top-up; a fresh coupon box until 1,020,999.",
+  ins:[b("contract","Bond box","2 units of X + 400 ERG. Coupons paid = 1 of 3","FI_Standard_Bond"),b("contract","Coupon box","5 SigUSD (coupon 0)","FI_Standard_CouponVault"),b("alice","Alice's wallet","5 SigUSD + ERG for fees")],
+  outs:[b("contract","Bond box","2 units of X + 400 ERG. Coupons paid = 2 of 3","FI_Standard_Bond"),b("contract","Coupon box","10 SigUSD (coupons 0 and 1)","FI_Standard_CouponVault")],
+  rule:"The new coupon box must hold everything the old one held plus the new coupon. The coupon can only be new money.",
+  after:"Topping up is optional. In the last 500 blocks before the miss height the bond accepts only a fresh coupon box."},
+ {n:"4",t:"Bob collects the coupons",who:"Bob",signs:"Bob",when:"Any time.",
+  ins:[b("contract","Coupon box","10 SigUSD","FI_Standard_CouponVault"),b("bob","Bob's unit","1 unit of X")],
+  outs:[b("bob","Bob's wallet","1 unit of X (kept) + 10 SigUSD")],
+  rule:"Exactly one input holds exactly 1 unit of X, and it is a plain key address younger than 1,051,200 blocks (about 4 years). The bond box is not touched, so collecting cannot disturb Alice.",
+  after:"Bob: +10 SigUSD. Whoever holds the unit is the coupon receiver; if Bob sells the unit, the buyer collects from then on."}
+]},
+{id:"covenant",title:"Covenant: breach, cure, liquidation",txs:[
+ {n:"5",t:"Charlie records a breach",who:"Charlie (anyone)",signs:"Nobody",when:"At a coupon date and through its grace (1,020,000 to 1,021,000 here), outside the quiet zone, once per coupon date.",
+  data:[b("oracle","Oracle box","ERG has fallen to $0.25. 400 ERG now covers 100%, below the 150% ratio.")],
+  ins:[b("contract","Bond box","2 units of X + 400 ERG. No breach open","FI_Standard_Bond"),b("charlie","Charlie's wallet","ERG for the miner fee")],
+  outs:[b("contract","Bond box","2 units of X + 399.5 ERG. Breach recorded at coupon date 1; cure deadline = block 1,020,820","FI_Standard_Bond"),b("charlie","Charlie's bounty","0.5 ERG, taken from the ERG in the bond")],
+  rule:"The covenant expression must find the collateral below the ratio at a fresh price. A low price alone never liquidates; it only starts the cure clock.",
+  after:"Charlie earns 0.5 ERG for recording, paid from Alice's ERG in the bond whether she later cures or not. It can be earned once per coupon date, and only when the breach is real. No SigUSD or other token can leave."},
+ {n:"6",t:"Alice cures the breach",who:"Alice",signs:"Alice",when:"While the breach is open and before the deadline (block 1,020,820). No waiting period.",
+  data:[b("oracle","Oracle box","fresh price, still $0.25")],
+  ins:[b("contract","Bond box","2 units of X + 399.5 ERG. Breach open","FI_Standard_Bond"),b("alice","Alice's wallet","200.5 ERG + ERG for fees")],
+  outs:[b("contract","Bond box","2 units of X + 600 ERG. Breach cleared","FI_Standard_Bond")],
+  rule:"The re-created bond must be back at or above 150% at the fresh price (600 ERG = exactly 150%). Collateral can only be added.",
+  after:"Alice: −200.5 ERG, now locked in the bond: 200 ERG for the shortfall plus the 0.5 ERG bounty Charlie took. One transaction tops up and clears."},
+ {n:"7",t:"Charlie liquidates",who:"Charlie (anyone)",signs:"Nobody",when:"(a) a coupon is unpaid past its grace, e.g. coupon 2 from block 1,031,000; or (b) a breach reached its deadline uncured, from 1,020,820; or at maturity.",
+  ins:[b("contract","Bond box","2 units of X + all the ERG collateral","FI_Standard_Bond")],
+  outs:[b("contract","Settlement box","2 units of X + all the collateral (400 ERG, or 600 ERG after a cure), marked liquidated","ZC_Standard_BondVault")],
+  rule:"The bond itself works out whether it is liquidatable, from its own coupon counter and breach deadline. All collateral goes to the settlement box.",
+  after:"Charlie keeps the fee reserve Bob set when lending (at least 0.1 ERG; Bob gets it back if Alice repays instead). Bob claims the collateral as in card 9; if a breach was recorded and never cured, it is 0.5 ERG lighter. Alice keeps the 100 SigUSD she borrowed."}
+]},
+{id:"end",title:"Ending the bond",txs:[
+ {n:"8",t:"Alice repays",who:"Alice",signs:"Alice",when:"Any time before maturity (block 1,040,000), but only while the bond is in good standing. Once a coupon is missed or a breach passes its cure deadline, repayment is shut: the default is final and only liquidation remains.",
+  ins:[b("contract","Bond box","2 units of X + 400 ERG","FI_Standard_Bond"),b("alice","Alice's wallet","100 SigUSD + ERG for fees")],
+  outs:[b("contract","Settlement box","2 units of X + 100 SigUSD, marked repaid","ZC_Standard_BondVault"),b("alice","Collateral returned","400 ERG (600 ERG if she cured)")],
+  rule:"The settlement must hold the full repayment and the collateral must go to the borrower named in the bond. The bond refuses repayment from the block it becomes open to liquidation, so Alice cannot race Charlie out of a default.",
+  after:"Alice: −100 SigUSD, collateral back. Coupons not yet paid are no longer owed."},
+ {n:"9",t:"Bob claims the settlement",who:"Bob",signs:"Bob",when:"Any time after the bond settles.",
+  ins:[b("contract","Settlement box","2 units of X + 100 SigUSD","ZC_Standard_BondVault"),b("contract","Coupon box","5 SigUSD (coupon 2, not yet collected)","FI_Standard_CouponVault"),b("bob","Bob's unit","1 unit of X")],
+  outs:[b("bob","Bob's wallet","105 SigUSD (100 repayment + 5 coupon)")],
+  burn:"burn 3 units of X",
+  rule:"Burning all 3 units is the only key to the settlement box.",
+  after:"Bob ends with his 100 SigUSD back plus 15 SigUSD in coupons. If he leaves the coupon box out of this transaction, nobody can ever collect it: it does not go back to Alice, it is simply stuck."}
+]},
+{id:"shares",title:"Shares: splitting Bob's unit",txs:[
+ {n:"12",t:"Bob turns his unit into 1000 shares",who:"Bob posts a request; Charlie runs the mint",signs:"Bob for the request. Nobody for the mint.",when:"Any time while Bob holds the unit.",
+  ins:[b("contract","Mint request","Bob's 1 unit of X + ERG for fees, including a pull fee of at least 0.1 ERG; says: make 1000 shares, pay them to Bob","FI_Standard_FractionalMint")],
+  outs:[b("bob","Shares","1000 shares"),b("contract","Share vault","1 unit of X + 1001 reserve shares + 0.101 ERG (the 0.1 ERG pull fee + the 0.001 ERG box minimum)","FI_Standard_FractionalVault")],
+  mint:"mint 2001 shares",
+  rule:"Exactly 2N+1 shares exist: N for the owner, N+1 locked in the vault until the final claim burns them, so the vault can always be recognised.",
+  after:"Bob then sells 300 shares to David and 200 to Erin (ordinary transfers). Bob 500, David 300, Erin 200. The unit now lives in the vault, so coupons reach holders only through the next two cards."},
+ {n:"13",t:"Charlie feeds the coupon box into the share vault",who:"Charlie (anyone)",signs:"Nobody",when:"While the vault still holds the unit.",
+  ins:[b("contract","Share vault","1 unit of X + 1001 reserve shares","FI_Standard_FractionalVault"),b("contract","Coupon box","5 SigUSD (coupon 2)","FI_Standard_CouponVault"),b("charlie","Charlie's wallet","ERG for the miner fee")],
+  outs:[b("contract","Share vault","1 unit of X + 1001 reserve shares + 4.98 SigUSD","FI_Standard_FractionalVault"),b("charlie","Charlie's cut","0.02 SigUSD (0.5% of the 5 SigUSD coupon)")],
+  rule:"The vault's new box must hold everything the vault held, plus the coupon box's contents less a 0.5% keeper cut. The cut is worked out only on the coupon coming in, never on what the vault already held.",
+  after:"The coupon is safe inside the vault. Charlie keeps 0.5% of it, paid by the share holders. On this 5 SigUSD coupon that is 0.02 SigUSD, about 20 times his 0.001 ERG miner fee (about 0.001 USD with 1 ERG at 1 USD)."},
+ {n:"14",t:"Charlie pulls the settlement into the share vault",who:"Charlie (anyone)",signs:"Nobody",when:"From 720 blocks (about a day) after the bond settles, so anyone has time to feed open coupon boxes in first.",
+  ins:[b("contract","Share vault","1 unit of X + 1001 reserve shares","FI_Standard_FractionalVault"),b("contract","Settlement box","2 units of X + 100 SigUSD","ZC_Standard_BondVault"),b("contract","Coupon box","5 SigUSD (coupon 2), if it is still open","FI_Standard_CouponVault")],
+  outs:[b("contract","Share vault","1001 reserve shares + 104.98 SigUSD, marked repaid","FI_Standard_FractionalVault"),b("charlie","Charlie's pay","0.1 ERG pull fee + 0.02 SigUSD (0.5% of the coupon box)")],
+  burn:"burn 3 units of X",
+  rule:"The vault's new box, recognised by its reserve shares, must carry the settlement and every coupon box in the transaction, whole.",
+  after:"Charlie earns the pull fee (0.1 ERG minimum, funded by Bob when he made the shares) whether or not a coupon box is included, plus 0.5% of any coupon box he includes. So including it always pays more than leaving it out. A coupon box left out can still never be collected by anyone."},
+ {n:"15",t:"Share holders claim",who:"David, Erin, then Bob",signs:"Each holder, for their own shares",when:"After the pull.",
+  ins:[b("contract","Share vault","104.98 SigUSD, 1000 shares outstanding","FI_Standard_FractionalVault"),b("david","David's shares","300 shares")],
+  outs:[b("david","David's payout","31.49 SigUSD (300 of 1000 shares, of 104.98 SigUSD, rounded down)"),b("contract","Share vault","73.49 SigUSD, 700 shares outstanding","FI_Standard_FractionalVault")],
+  burn:"burn 300 shares",
+  rule:"Each claim pays exactly balance × shares burned ÷ shares outstanding.",
+  after:"Erin then burns 200 shares for 20.99 SigUSD. Bob, holding all the remaining 500, makes the final claim for the 52.50 SigUSD left, which also burns the reserve and closes the vault."}
+]},
+{id:"upkeep",title:"Upkeep and the secondary market",txs:[
+ {n:"10",t:"Alice adds collateral by choice",who:"Alice",signs:"Alice",when:"At least 60 blocks after her last top-up, while the bond is healthy.",
+  ins:[b("contract","Bond box","2 units of X + 400 ERG","FI_Standard_Bond"),b("alice","Alice's wallet","extra ERG")],
+  outs:[b("contract","Bond box","2 units of X + more than 400 ERG","FI_Standard_Bond")],
+  rule:"Collateral can only grow. This does not clear a recorded breach; only a cure does.",
+  after:"Separately, anyone may refresh a bond box older than about two years so storage rent cannot take it: for nothing before maturity, for up to 0.01 ERG from maturity on."},
+ {n:"11",t:"Charlie refreshes an old coupon box",who:"Charlie (anyone)",signs:"Nobody",when:"Only when the coupon box is more than about two years old (525,600 blocks).",
+  ins:[b("contract","Coupon box","5 SigUSD + a little ERG","FI_Standard_CouponVault"),b("charlie","Charlie's wallet","ERG for the miner fee")],
+  outs:[b("contract","Coupon box","5 SigUSD, same box re-created with a fresh age","FI_Standard_CouponVault")],
+  rule:"The new box has the same contract, the same SigUSD and the same bond tag. Charlie may keep at most 0.01 ERG of its ERG, never any SigUSD, and never below the box minimum.",
+  after:"Storage rent cannot take the coupons. Alice has no path to a coupon box at any height: once she pays a coupon it is never hers again."},
+ {n:"16",t:"Bob's offer buys a unit someone is selling",who:"Charlie (anyone)",signs:"Nobody",when:"While the offer and the sale are open, and the bond being bought is alive and not open to liquidation, and its original order is younger than 1,051,200 blocks.",
+  data:[b("contract","That bond's box","holds 2 units of bond Y; proves Y is a live FI bond and shows its state"),b("oracle","Oracle box","price, for Bob's policy")],
+  ins:[b("contract","Erin's sale order","1 unit of a different bond, Y, asking 95 SigUSD","ZC_Standard_SaleOrder"),b("contract","Bob's offer","100 SigUSD","FI_Standard_LendOffer")],
+  outs:[b("erin","Erin's payment","95 SigUSD"),b("bob","Bond unit","1 unit of Y"),b("contract","Bob's offer, continued","5 SigUSD","FI_Standard_LendOffer")],
+  rule:"The offer proves Y came from a genuine FI order, reads its live bond box, and refuses a bond with a missed coupon or a lapsed breach.",
+  after:"Bob now collects Y's coupons too. Charlie keeps the fill fee from Bob's offer, at least 0.1 ERG."}
+]}
+];
+const el=(t,c,h)=>{const e=document.createElement(t);if(c)e.className=c;if(h!==undefined)e.innerHTML=h;return e};
+const boxEl=(x,data)=>{const d=el("div","box"+(data?" data":""));d.style.setProperty("--c",`var(--${x.who})`);
+  const owner=x.who==="contract"?(x.guard||"Contract box"):P[x.who];
+  d.innerHTML=`<div class="who">${owner}</div><div class="name">${x.name}</div><div class="holds">${x.holds}</div>`;return d};
+const root=document.getElementById("cards");
+for(const s of SECTIONS){
+  const h=el("h2",null,s.title);h.id=s.id;root.appendChild(h);
+  for(const t of s.txs){
+    const c=el("div","tx");
+    c.appendChild(el("div","txhead",`<span class="num">${t.n}</span><h3>${t.t}</h3>`));
+    c.appendChild(el("div","meta",`<div><b>Who sends it</b>${t.who}</div><div><b>Who signs</b>${t.signs}</div><div><b>When</b>${t.when}</div>`));
+    if(t.data){const dr=el("div","datarow col");dr.appendChild(el("div","colhead","Read only (data inputs, not spent)"));t.data.forEach(x=>dr.appendChild(boxEl(x,true)));c.appendChild(dr)}
+    const f=el("div","flow");
+    const i=el("div","col");i.appendChild(el("div","colhead","Spent (inputs)"));t.ins.forEach(x=>i.appendChild(boxEl(x)));
+    const m=el("div","mid");m.appendChild(el("div","arrow","→"));m.appendChild(el("div","hex",`Tx ${t.n}`));
+    if(t.mint)m.appendChild(el("span","tag mint",t.mint));if(t.burn)m.appendChild(el("span","tag burn",t.burn));m.appendChild(el("div","arrow","→"));
+    const o=el("div","col");o.appendChild(el("div","colhead","Created (outputs)"));t.outs.forEach(x=>o.appendChild(boxEl(x)));
+    f.append(i,m,o);c.appendChild(f);
+    c.appendChild(el("div","rule",`<b>What stops cheating</b>${t.rule}`));
+    c.appendChild(el("div","after",`<b>Afterwards</b>${t.after}`));
+    root.appendChild(c);
+  }
+}
+</script>
+</body>
+</html>

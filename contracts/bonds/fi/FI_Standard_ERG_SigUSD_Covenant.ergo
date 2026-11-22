@@ -1,0 +1,73 @@
+{
+    // FI_Standard_ERG_SigUSD_Covenant.ergo - is an FI bond's collateral below its covenant ratio?
+    // Author: CannonQ (2026)
+    //
+    // An expression, not a box script. FI_Standard_Bond keeps the blake2b256 hash of these bytes
+    // as CONST_COVENANT_HASH and runs them from its context var 8, with the bond as SELF, on its
+    // Record breach and Cure paths. It compares the bond's collateral with its debt at one
+    // oracle price:
+    //   Record breach (bond var 6 set): passes iff the bond's own collateral is below the ratio.
+    //   Cure (var 6 absent): passes iff the successor, OUTPUTS(var 7), is not below the ratio.
+    //
+    // No constants. The repayment asset is read from the bond's R7 principal: empty for ERG, or
+    // exactly one SigUSD entry. Any other asset never passes. One expression, and one hash, for
+    // both markets.
+    //
+    // Reads from the bond (SELF):
+    //   R6(0)  repayment amount, the debt measured; must be above 0.
+    //   R6(12) minimum collateral ratio in bps (15000 = 150%); must be above 0.
+    //   R6(14) maximum oracle age in blocks; must be 1..100000.
+    //   R7     principal tokens: tells ERG repayment (empty) from SigUSD.
+    //   R9(0)  lender fee reserve; it is not collateral and is subtracted from the box value.
+    //
+    // Data input: exactly one box holding the oracle pool NFT (amount 1, id in the code). Its
+    // R4 Long is nanoERG per USD (above 0) and R5 Int is the epoch (0 or more). The box must
+    // have been created at or before HEIGHT and at most R6(14) blocks before it. Any failure
+    // here, or any bound above out of range, makes the expression fail on both paths, even for
+    // a bond whose test does not depend on the price (ERG repaid, no SigUSD held).
+    // Trust: the collateral is valued at that one box, with no second source or price band. If
+    // the pool were left unrefreshed for 1051200 blocks, storage rent could re-create its box
+    // with a fresh creation height and its old price, which reads here as fresh; and a pool box
+    // whose value does not cover the storage fee could be taken whole, NFT included.
+    //
+    // Rule: SigUSD counts as $1 at 100 raw units per USD; other collateral tokens count as zero.
+    // With price P, collateral C = 100 * (box nanoERG - R9(0)) + P * box SigUSD, and debt
+    // L = 100 * repayment (ERG) or P * repayment (SigUSD). "Below" means C * 10000 < L * ratio,
+    // computed in BigInt. The debt is the repayment amount, not the principal.
+
+    val borrower = SELF.R6[Coll[Long]].get
+    val fee = SELF.R9[Coll[Long]].get(0)
+    val repayment = borrower(0)
+    val ratio = borrower(12)
+    val maxAge = borrower(14)
+    val sigUSD = fromBase16("03faf2cb329f2e90d6d23b58d91bbb6c046aa143261cc21f52fbe2824bfcbf04")
+    val oracleNFT = fromBase16("6a2b821b5727e85beb5e78b4efb9f0250d59cd48481d2ded2c23e91ba1d07c66")
+    val principal = SELF.R7[Coll[(Coll[Byte], Long)]].get
+    val repaysERG = principal.size == 0
+    val pools = CONTEXT.dataInputs.filter { (b: Box) =>
+        b.tokens.exists { (t: (Coll[Byte], Long)) => t._1 == oracleNFT && t._2 == 1L }
+    }
+    if (ratio <= 0L || maxAge < 1L || maxAge > 100000L || repayment <= 0L || pools.size != 1 ||
+        !(repaysERG || (principal.size == 1 && principal(0)._1 == sigUSD))) {
+        sigmaProp(false)
+    } else {
+        val pool = pools(0)
+        val price = pool.R4[Long].get
+        val created = pool.creationInfo._1.toLong
+        val height = HEIGHT.toLong
+        val debt = (if (repaysERG) 100L.toBigInt else price.toBigInt) *
+            repayment.toBigInt * ratio.toBigInt
+        val below = { (b: Box) =>
+            val usd = b.tokens.fold(0L, { (a: Long, t: (Coll[Byte], Long)) =>
+                if (t._1 == sigUSD) a + t._2 else a
+            })
+            val cover = (b.value - fee).toBigInt * 100L.toBigInt + price.toBigInt * usd.toBigInt
+            cover * 10000L.toBigInt < debt
+        }
+        sigmaProp(
+            created >= 0L && created <= height && height - created <= maxAge &&
+            price > 0L && pool.R5[Int].get >= 0 &&
+            (if (getVar[Int](6).isDefined) below(SELF) else !(below(OUTPUTS(getVar[Int](7).get))))
+        )
+    }
+}

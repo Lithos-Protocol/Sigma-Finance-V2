@@ -1,0 +1,109 @@
+{
+    // FI_Standard_ERG_SigUSD_CollateralPolicy.ergo - the lender's collateral rule for FI bonds
+    // Author: CannonQ (2026)
+    //
+    // An expression, not a box script. FI_Standard_LendOffer keeps its hash in R6 and runs it
+    // from context var 1 on a fill, with the offer as SELF. It is the lender's whole collateral
+    // test for the bond being bought: which liquidation rule it carries, what covenant it has, and
+    // whether its collateral is worth enough now. Same job as the ZC policy of the same name,
+    // but for the FI bond's registers (R6 of 15 or more Longs, R9 of exactly 7).
+    //
+    // Constants:
+    //   CONST_REPAYMENT_TOKEN: Coll[Byte], the offer's repayment asset: empty for ERG, or
+    //     SigUSD. Any other asset never passes.
+    //   CONST_LIQUIDATION_HASH: Coll[Byte], blake2b256 of FI_Standard_Liquidation.
+    // Deploy-time couplings: CONST_LIQUIDATION_HASH must be the hash FI_Standard_Order requires;
+    // the literal 500000000 below must equal FI_Standard_Bond's CONST_RECORD_BOUNTY. Nothing on
+    // chain compares either.
+    //
+    // Reads from the offer (SELF): R5(5) the lender's collateral floor in bps of the repayment
+    // (13000 = 130%), above 0; R5(8) maximum oracle age in blocks, 1..100000; its tokens.
+    //
+    // The bond: when context var 2 is present, the data input named by var 3 (an existing bond
+    // being bought); otherwise OUTPUTS(1) (a new bond). Read from it: R6(0) repayment, R6(12)
+    // covenant ratio, R6(14) covenant oracle age, R8 liquidation hash, R9(0) lender fee reserve
+    // (within 0..bond.value), and tokens(1..) as collateral tokens. The bond is not
+    // authenticated here: FI_Standard_LendOffer and the order it fills do that.
+    //
+    // Data input: exactly one box holding the oracle pool NFT (amount 1, id in the code). Its
+    // R4 Long is nanoERG per USD, R5 Int the epoch; it must be created at or before HEIGHT and
+    // at most R5(8) blocks before it.
+    //
+    // Checked here, all required. With SigUSD at $1 (100 raw units per USD), other collateral
+    // tokens worth zero, price P, C = 100 * (bond nanoERG - R9(0)) + P * SigUSD, and
+    // L = 100 * repayment (ERG) or P * repayment (SigUSD), in BigInt:
+    //   1. Rule: the bond's R8 equals CONST_LIQUIDATION_HASH.
+    //   2. Covenant: R6(12) >= the floor, and R6(14) is at least R5(8) and at most 100000, so
+    //      an oracle fresh enough for this check is also accepted by the covenant expression.
+    //   3. Cover over the floor: C * 10000 >= L * floor + 1000000 * (F + A), that is, the floor
+    //      plus F + A nanoERG. F is R9(0) on a new bond (the reserve the lender funds, which
+    //      whoever liquidates keeps) and 0 on an existing one. A, the allowance for one Record
+    //      bounty, is min(500000000, bond nanoERG - R9(0) - 1000000), at least 0, when the cover
+    //      moves with the price (SigUSD repayment or SigUSD collateral), and 0 otherwise.
+    //   4. Own ratio: C * 10000 >= L * R6(12), so the bond is not recordable on this oracle box.
+    //   5. Offer asset: an ERG offer holds no token; a SigUSD offer holds one, SigUSD.
+    //
+    // Limits:
+    // - One recorded breach takes up to 0.5 ERG from the collateral. On a bond whose cover moves
+    //   with the price, a breach is recorded at a cover near ratio x repayment, so the lender is
+    //   left with less than the repayment when (ratio - 100%) x repayment is under 0.5 ERG. The
+    //   lender's protection is the minimum fill R5(7): keep it above 0.5 ERG / (floor - 100%)
+    //   worth of the repayment asset (about 1.67 ERG at 130%, 1 ERG at 150%).
+    //   That bounds the repayment only. To stay whole on the fee reserve R5(4) as well when someone
+    //   else liquidates, use (0.5 ERG + R5(4)) / (floor - 100%), plus the batcher fee on a token
+    //   offer. On a SigUSD offer convert at the highest ERG price expected before the expiry.
+    // - The bond's 0.01 ERG Refresh bounty is paid only from maturity on; on a bond box older
+    //   than 525600 blocks it can be taken in the maturity block. It is not in the allowance.
+    // - The collateral is valued at one oracle pool box, with no second source or price band. If
+    //   the pool were left unrefreshed for 1051200 blocks, storage rent could re-create its box
+    //   with a fresh creation height and its old price, which reads here as fresh; and a pool box
+    //   whose value does not cover the storage fee could be taken whole, NFT included. Offers
+    //   should carry an expiry R5(6) well inside that.
+
+    val terms = SELF.R5[Coll[Long]].get
+    val bond = if (getVar[Int](2).isDefined) CONTEXT.dataInputs(getVar[Int](3).get) else OUTPUTS(1)
+    val borrower = bond.R6[Coll[Long]].get
+    val lender = bond.R9[Coll[Long]].get
+    val floorBps = terms(5)
+    val maxAge = terms(8)
+    val oracleNFT = fromBase16("6a2b821b5727e85beb5e78b4efb9f0250d59cd48481d2ded2c23e91ba1d07c66")
+    val sigUSD = fromBase16("03faf2cb329f2e90d6d23b58d91bbb6c046aa143261cc21f52fbe2824bfcbf04")
+    val pools = CONTEXT.dataInputs.filter { (b: Box) =>
+        b.tokens.exists { (t: (Coll[Byte], Long)) => t._1 == oracleNFT && t._2 == 1L }
+    }
+    val repaysERG = CONST_REPAYMENT_TOKEN.size == 0
+    val supported = repaysERG || CONST_REPAYMENT_TOKEN == sigUSD
+
+    if (!supported || floorBps <= 0L || maxAge < 1L || maxAge > 100000L || pools.size != 1 ||
+        borrower.size < 15 || lender.size != 7 || lender(0) < 0L || lender(0) > bond.value) {
+        sigmaProp(false)
+    } else {
+        val ruleAgreed = bond.R8[Coll[Byte]].get == CONST_LIQUIDATION_HASH
+        val covenantCover = borrower(12) >= floorBps && borrower(14) >= maxAge && borrower(14) <= 100000L
+
+        val pool = pools(0)
+        val price = pool.R4[Long].get
+        val epoch = pool.R5[Int].get
+        val created = pool.creationInfo._1.toLong
+        val fresh = created >= 0L && created <= HEIGHT.toLong && HEIGHT.toLong - created <= maxAge
+        val collateral = bond.tokens.slice(1, bond.tokens.size)
+        val collateralUSD = collateral.fold(0L, { (a: Long, t: (Coll[Byte], Long)) =>
+            if (t._1 == sigUSD) a + t._2 else a
+        })
+        val collateralValue = (bond.value - lender(0)).toBigInt * 100L.toBigInt +
+            price.toBigInt * collateralUSD.toBigInt
+        val repayment = borrower(0)
+        val debtValue = if (repaysERG) repayment.toBigInt * 100L.toBigInt
+            else price.toBigInt * repayment.toBigInt
+        val takeable = if (!repaysERG || collateralUSD > 0L)
+            max(0L, min(500000000L, bond.value - lender(0) - 1000000L))
+            else 0L
+        val coverNow = fresh && price > 0L && epoch >= 0 && repayment > 0L &&
+            collateralValue * 10000L.toBigInt >= debtValue * floorBps.toBigInt +
+                (if (getVar[Int](2).isDefined) takeable else lender(0) + takeable).toBigInt * 1000000L.toBigInt &&
+            collateralValue * 10000L.toBigInt >= debtValue * borrower(12).toBigInt
+
+        sigmaProp(ruleAgreed && covenantCover && coverNow &&
+            (if (repaysERG) SELF.tokens.size == 0 else SELF.tokens.size == 1 && SELF.tokens(0)._1 == sigUSD))
+    }
+}

@@ -1,0 +1,317 @@
+{
+    // FI_Standard_Order.ergo - the borrower's order for a fixed-interest (coupon) bond
+    // Author: CannonQ (2026)
+    //
+    // ZC_Standard_Order with coupon and covenant terms in R4 and the longer bond R9 of
+    // FI_Standard_Bond. The box holds the borrower's collateral and terms: a lender fills it into
+    // a new bond, the borrower can cancel it, and anyone can refund it once it expires.
+    // Use only with FI_Standard_Bond and ZC_Standard_BondVault. One order script serves ERG and
+    // token repayment, fixed and on-close maturity: every term is in a register, so every open
+    // FI order of this repayment asset sits at ONE address.
+    //
+    // CONSTANTS
+    // CONST_BOND_HASH: Coll[Byte] - blake2b256 of the FI_Standard_Bond ErgoTree. The bond compiles
+    //   in its vault, repayment token, coupon vault and covenant, so this hash also fixes the
+    //   repayment asset: orders split into one address per repayment asset.
+    // CONST_REPAYMENT_TOKEN: Coll[Byte] - that bond's repayment token, EMPTY for ERG. The deployer
+    //   must compile it to match CONST_BOND_HASH; the script cannot read the bond's constant.
+    // CONST_LIQUIDATION_HASH: Coll[Byte] - blake2b256 of the FI_Standard_Liquidation expression.
+    //   A fill requires R7 to equal it. The deployer must take it from those exact bytes.
+    //
+    // ONE ASSET (as ZC)
+    // A loan is lent and repaid in one asset, the repayment asset. A fill requires:
+    //   ERG:   no principal tokens, principal R4(1) > 0, and floor R4(2) <= R4(0), so the floor
+    //          never binds and the repayment is R4(0) nanoERG.
+    //   token: principal tokens exactly ((repayment token, P > 0)), and at most 1000000 nanoERG
+    //          in both R4(1) and R4(2): box minimums beside the token, never a second asset.
+    // The bond takes its coupons in the same asset. Cancel and expiry ignore this rule.
+    //
+    // ORDER REGISTERS -> BOND REGISTERS (copied exactly; the lender cannot alter them)
+    // R4: Coll[Long] -> bond R6: borrower values, length 15..64 to fill (7..64 to refund):
+    //   0..6 as ZC: 0 repayment amount, 1 principal nanoERG, 2 repayment ERG floor, 3 maturity
+    //     height (mode 0) or duration of at least 30 blocks (mode 1), 4 order expiry height,
+    //     5 expiry fee >= 100000000 nanoERG, 6 maturity mode (0 fixed height, 1 on-close)
+    //   7 coupon, raw units of the repayment asset: > 0 when 8 > 0, else >= 0
+    //   8 coupon count, >= 0 (0 = no coupons)
+    //   9 blocks from the start height to the first due height, 0..1000000000
+    //   10 period between due heights, 1..1000000000
+    //   11 grace after each due height, 0..1000000000, at most R4(10) when 8 > 0, and at least
+    //     30 when 12 > 0
+    //   12 minimum collateral ratio in bps, >= 0 (0 = no covenant; above 0 needs 8 >= 1, a fill
+    //     guard in R8 and a first checkpoint the bond can record, see SCHEDULE)
+    //   13 cure window in blocks, 30..1000000000 when 12 > 0 (see SCHEDULE)
+    //   14 maximum oracle age in blocks, 1..100000 when 12 > 0
+    //   15.. liquidation payload, not read here
+    //   The ranges of 9, 10 and 11 are checked even with no coupons. They are the bond's clamps,
+    //   so the bond reads these terms exactly as written.
+    // R5: Coll[(Coll[Byte], Long)] -> bond R7: exact principal tokens: empty for ERG, or exactly
+    //   one entry, the repayment token and the principal amount
+    // R6: Coll[Byte] -> bond R5: blake2b256 of the borrower script
+    // R7: Coll[Byte] -> bond R8: blake2b256 of the serialized liquidation expression; a fill
+    //   requires it to equal CONST_LIQUIDATION_HASH, the standard FI_Standard_Liquidation
+    // R8 (optional, not copied): Coll[Byte] - blake2b256 of a serialized fill guard expression.
+    //   When present, a fill must also pass that expression, supplied in context var 1 and run
+    //   with this order as SELF; it reads the new bond at OUTPUTS(1) and may read data inputs.
+    //   FI_Standard_ERG_SigUSD_FillGuard is one: when R4(12) > 0 the bond must start with
+    //   collateral worth at least that ratio of the repayment at a fresh oracle price. It has no
+    //   margin: a bond filled at exactly its ratio can be recorded in breach at the next, lower
+    //   oracle price, as early as the fill block, so the borrower pays the Record bounty and must
+    //   cure; post collateral above the ratio for headroom. Absent, only an order with no
+    //   covenant (R4(12) = 0) fills, and nothing about the collateral's value is checked.
+    // Bond R4 = this order's id. Bond R9: Coll[Long], exactly 7 = (lender liquidation fee
+    // reserve of at least 100000000 nanoERG, start height, maturity height, 0 coupons paid, -1 no
+    // breach recorded, 0 no cure deadline, start height as the recollateralize clock).
+    //
+    // VALUE AND EXPIRY (as ZC)
+    // Order value = collateral nanoERG + expiry fee; SELF.tokens are the collateral tokens.
+    // Fill requires HEIGHT < R4(4) and returns the unused expiry fee with the principal.
+    // Expiry refund requires HEIGHT >= R4(4): all tokens and >= value - fee go back to the borrower
+    // at output var 0 (Int), tagged R4 = SELF.id, with no R5 and created at HEIGHT - 999 or later.
+    // A borrower-script co-spend cancels at any height: another input whose script hashes to R6,
+    // created fewer than 1051200 blocks before HEIGHT (an older box can be spent under storage
+    // rent without its script running).
+    //
+    // FILL SHAPE (as ZC; no context vars, except var 1: Coll[Byte] the guard when R8 names one)
+    // INPUTS(0) = SELF, so the bond asset id is this order's id and one order fills per
+    // transaction.
+    // Exactly 3 units are minted: 2 locked in the bond, 1 circulating.
+    // OUTPUTS(0): the circulating unit at tokens(0), at any lender-chosen script (a wallet, an
+    //   FI_Standard_LendOffer delivery...), created at HEIGHT - 999 or later. R4/R5: EIP-4
+    //   name/description; R6: UTF-8 "0".
+    // OUTPUTS(1): the bond. tokens(0) = (asset, 2), then SELF.tokens unchanged. Value at least
+    //   collateral nanoERG + lender fee reserve bond R9(0), funded by the lender above the
+    //   collateral, and at least 1000000 nanoERG beyond R9(0).
+    // OUTPUTS(2): principal + expiry-fee refund, at the borrower script, R4 = SELF.id, no R5,
+    //   created at HEIGHT - 999 or later. The tag keeps any other box paid to the borrower in the
+    //   same transaction from counting as it.
+    //
+    // START AND MATURITY (as ZC)
+    // Bond R9(1), the start height S, must lie in [HEIGHT - 8, HEIGHT]: a script cannot pin
+    // HEIGHT exactly without making the transaction valid in a single block. The bond box's
+    // creation height must equal it: the bond's Refresh reads the box's age from it.
+    // Mode 0: maturity M = R4(3), at least HEIGHT + 30. Mode 1: M = S + R4(3), with R4(3) >= 30.
+    // Either way M <= S + 788400 (about three years), the bond's maximum life. So a box stamped
+    // at the start reaches the storage-rent age (1051200 blocks) no sooner than about 262800
+    // blocks after maturity.
+    //
+    // SCHEDULE
+    // Coupon k (from 0) falls due at S + R4(9) + k * R4(10); checkpoint k, where the bond can
+    // record a covenant breach, is the same height. The coupon is missed, and an unpaid bond
+    // liquidatable, from its due height plus the grace R4(11). With coupons (R4(8) > 0) a fill
+    // requires:
+    // - the first due height S + R4(9) at or after HEIGHT;
+    // - the grace no longer than the period, R4(11) <= R4(10). Then at each checkpoint's due
+    //   height every earlier coupon is paid or already missed, so with a grace of at least 3
+    //   (every covenant order has 30 or more) the bond's coupon quiet zone (the last
+    //   max(2, min(720, grace / 2)) blocks before the next unpaid coupon's miss, where it refuses
+    //   Record breach) never covers a due height;
+    // - the first coupon missed no earlier than HEIGHT + 30, so the bond is not liquidatable for
+    //   a coupon until at least 30 blocks after the fill;
+    // - the last coupon missed before M: last due + grace <= M - 1. A miss shuts repayment and
+    //   opens liquidation, and M does both anyway, so a coupon missed only at or after M would
+    //   change nothing.
+    // With a covenant (R4(12) > 0) a fill also requires a guard in R8, a grace R4(11) of at
+    // least 30, at least one coupon, and the first checkpoint's window closing before M - 720:
+    // S + R4(9) + R4(11) + 720 < M. The bond records a breach only at HEIGHT in [checkpoint,
+    // checkpoint + grace] with HEIGHT < M - 720, so a covenant with no such checkpoint could never
+    // be tested. In on-close mode this reads R4(9) + R4(11) + 720 < R4(3).
+    // A covenant also needs a cure window R4(13) of at least 30 blocks. A breach recorded at
+    // HEIGHT h has its deadline from h + R4(13), and the bond refuses Cure and Repayment from the
+    // deadline on, so the window must leave the borrower blocks in which to act.
+    // With no coupons the covenant must be 0: the bond is a plain zero-coupon bond.
+    //
+    // STATE-BOX RULE (as ZC)
+    // Supply is exactly 3 and 2 stay together for the asset's whole life: in the bond, then in
+    // the vault. Genuineness of an asset X is a one-time check: the box with id X must have been
+    // spent as an order with this exact script (and CONST_BOND_HASH), fewer than 1051200 blocks
+    // after its creation height, because a box that old can be spent under storage rent without
+    // its script running. FI_Standard_LendOffer makes that check, by this script's hash and the
+    // box's age, before it buys an existing bond. The maximum life binds only bonds filled
+    // through this script.
+    //
+    // ASSUMPTIONS
+    // The liquidation expression is pinned by CONST_LIQUIDATION_HASH, and the covenant
+    // expression is compiled into the bond, so CONST_BOND_HASH fixes it; this order only holds
+    // the covenant's terms to the ranges above. The fill guard in R8 is the borrower's choice.
+    //
+    // BORROWER SCRIPTS
+    // The borrower script must be one that only its owner can spend in every instance: P2PK,
+    // multisig, or a contract whose keys are compiled-in constants. Anyone can create a box at a
+    // script that reads its authority from its own registers, so naming one lets anyone cancel
+    // this order and take everything it holds. The payouts here (principal, refund) carry only
+    // the R4 tag, so whether the owner can spend them is up to that script.
+    // FI_Standard_FractionalMint and FI_Standard_FractionalVault can be instantiated by anyone
+    // and must never be the borrower hash. Builders should refuse any other kind of borrower
+    // script.
+
+    def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
+        OUTPUTS.fold(0L, { (a: Long, b: Box) =>
+            val count = b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                if (t._1 == tokenId) z + t._2 else z
+            })
+            a + count
+        })
+    }
+
+    val borrowerHash = SELF.R6[Coll[Byte]].get
+    val minted = numTokenInOutputs(SELF.id)
+
+    if (minted > 0L) {
+        // Fill
+        val borrower = SELF.R4[Coll[Long]].get
+        if (borrower.size < 15 || borrower.size > 64 || OUTPUTS.size < 3) {
+            sigmaProp(false)
+        } else {
+            val lenderOut = OUTPUTS(0)
+            val bond = OUTPUTS(1)
+            val principal = OUTPUTS(2)
+            val lender = bond.R9[Coll[Long]].get
+            if (lender.size != 7) {
+                sigmaProp(false)
+            } else {
+                val expiryFee = borrower(5)
+                val mode = borrower(6)
+                val collateralERG = SELF.value - expiryFee
+                val fee = lender(0)
+                val start = lender(1)
+                val maturity = lender(2)
+                val principalTokens = SELF.R5[Coll[(Coll[Byte], Long)]].get
+                val decimals = fromBase16("30")
+
+                // Lent and repaid in one asset, the repayment asset: the principal is that asset
+                // alone, and the repayment needs nothing beside it but a box minimum. The empty
+                // collection is taken from the box so the compiler cannot fold the constant.
+                val noToken = SELF.id.slice(0, 0)
+                val singleAsset = if (CONST_REPAYMENT_TOKEN == noToken) {
+                    principalTokens.size == 0 && borrower(1) > 0L && borrower(2) <= borrower(0)
+                } else {
+                    principalTokens.size == 1 && principalTokens(0)._1 == CONST_REPAYMENT_TOKEN &&
+                    principalTokens(0)._2 > 0L &&
+                    borrower(1) <= 1000000L && borrower(2) <= 1000000L
+                }
+
+                val borrowerValid =
+                    singleAsset &&
+                    borrower(0) > 0L && borrower(1) >= 0L && borrower(2) > 0L &&
+                    (mode == 0L || mode == 1L) &&
+                    expiryFee >= 100000000L && expiryFee <= SELF.value - 1000000L &&
+                    HEIGHT.toLong < borrower(4)
+
+                val mintValid =
+                    SELF.id == INPUTS(0).id && minted == 3L &&
+                    lenderOut.creationInfo._1 > HEIGHT - 1000 &&
+                    lenderOut.tokens.size > 0 &&
+                    lenderOut.tokens(0)._1 == SELF.id && lenderOut.tokens(0)._2 == 1L &&
+                    lenderOut.R4[Coll[Byte]].isDefined &&
+                    lenderOut.R5[Coll[Byte]].isDefined &&
+                    lenderOut.R6[Coll[Byte]].get == decimals
+
+                val bondValid =
+                    blake2b256(bond.propositionBytes) == CONST_BOND_HASH &&
+                    bond.tokens.size > 0 &&
+                    bond.tokens(0)._1 == SELF.id && bond.tokens(0)._2 == 2L &&
+                    bond.tokens.slice(1, bond.tokens.size) == SELF.tokens &&
+                    fee >= 100000000L && bond.value >= collateralERG && bond.value - collateralERG >= fee &&
+                    bond.value - fee >= 1000000L &&
+                    bond.R4[Coll[Byte]].get == SELF.id &&
+                    bond.R5[Coll[Byte]].get == borrowerHash &&
+                    bond.R6[Coll[Long]].get == borrower &&
+                    bond.R7[Coll[(Coll[Byte], Long)]].get == principalTokens &&
+                    bond.R8[Coll[Byte]].get == SELF.R7[Coll[Byte]].get &&
+                    SELF.R7[Coll[Byte]].get == CONST_LIQUIDATION_HASH &&
+                    // No coupon paid, no breach, no cure deadline; the recollateralize clock is
+                    // the start.
+                    lender.slice(3, 7) == Coll(0L, -1L, 0L, start)
+
+                // The bond's creation height is its start: the bond's Refresh reads its age
+                // from it.
+                val startValid = start <= HEIGHT.toLong && start >= HEIGHT.toLong - 8L &&
+                    bond.creationInfo._1.toLong == start
+                val maturityValid = maturity <= start + 788400L && (
+                    if (mode == 0L) maturity == borrower(3) && maturity >= HEIGHT.toLong + 30L
+                    else borrower(3) >= 30L && maturity == start + borrower(3) && maturity > HEIGHT.toLong + 1L
+                )
+
+                // The coupon and covenant terms, each held to its range (R4 in the header).
+                val coupon = borrower(7)
+                val count = borrower(8)
+                val firstOffset = borrower(9)
+                val period = borrower(10)
+                val grace = borrower(11)
+                val ratio = borrower(12)
+                val termsValid =
+                    coupon >= 0L && count >= 0L && (count == 0L || coupon > 0L) &&
+                    firstOffset >= 0L && firstOffset <= 1000000000L &&
+                    period >= 1L && period <= 1000000000L &&
+                    grace >= 0L && grace <= 1000000000L &&
+                    ratio >= 0L && (ratio == 0L || (
+                        borrower(11) >= 30L &&
+                        borrower(13) >= 30L && borrower(13) <= 1000000000L &&
+                        borrower(14) >= 1L && borrower(14) <= 100000L))
+                // The SCHEDULE rules of the header: the first due height at or after the fill,
+                // the grace no longer than the period, every coupon missed at least 30 blocks
+                // after the fill and before maturity, and a covenant's first checkpoint window
+                // closing before maturity - 720, where the bond shuts Record breach. The terms
+                // are used raw; once termsValid holds they equal the bond's clamped reading.
+                // The count test is
+                // (count - 1) * period <= maturity - 1 - firstMissed, by integer division.
+                val scheduleValid = termsValid && (count == 0L || {
+                    val firstMissed = start + firstOffset + grace
+                    start + firstOffset >= HEIGHT.toLong && grace <= period &&
+                    firstMissed >= HEIGHT.toLong + 30L && firstMissed < maturity &&
+                    count - 1L <= (maturity - 1L - firstMissed) / period
+                }) && (ratio == 0L || (count >= 1L && start + firstOffset + grace + 720L < maturity))
+
+                val principalPaid =
+                    blake2b256(principal.propositionBytes) == borrowerHash &&
+                    principal.creationInfo._1 > HEIGHT - 1000 &&
+                    principal.value >= expiryFee && principal.value - expiryFee >= borrower(1) &&
+                    principal.tokens == principalTokens &&
+                    principal.R4[Coll[Byte]].get == SELF.id &&
+                    principal.R5[Coll[Byte]].isDefined == false
+
+                val core = borrowerValid && mintValid && bondValid && startValid && maturityValid &&
+                    scheduleValid && principalPaid
+
+                // The borrower's fill guard, when R8 names one. Var 1 only: var 0 is the
+                // refund's Int.
+                val guard = SELF.R8[Coll[Byte]]
+                if (guard.isDefined) {
+                    sigmaProp(core && blake2b256(getVar[Coll[Byte]](1).get) == guard.get) && executeFromVar[SigmaProp](1)
+                } else {
+                    sigmaProp(core && borrower(12) == 0L)
+                }
+            }
+        }
+    } else {
+        // Cancel: an independent borrower-authorized co-spend, valid even for malformed R4
+        // terms. R6 is read on every path, so a box without a readable R6 can never be spent.
+        val borrowerAuth = INPUTS.exists { (b: Box) =>
+            b.id != SELF.id && blake2b256(b.propositionBytes) == borrowerHash &&
+            b.creationInfo._1 > HEIGHT - 1051200
+        }
+        if (borrowerAuth) {
+            sigmaProp(true)
+        } else {
+            // Expiry refund, by anyone. Context var 0: Int refund output index.
+            val borrower = SELF.R4[Coll[Long]].get
+            val refundIndex = getVar[Int](0).get
+            if (borrower.size < 7 || borrower.size > 64 || refundIndex < 0 || refundIndex >= OUTPUTS.size) {
+                sigmaProp(false)
+            } else {
+                val fee = borrower(5)
+                val refund = OUTPUTS(refundIndex)
+                sigmaProp(
+                    HEIGHT.toLong >= borrower(4) &&
+                    fee >= 100000000L && fee <= SELF.value - 1000000L &&
+                    blake2b256(refund.propositionBytes) == borrowerHash &&
+                    refund.R4[Coll[Byte]].get == SELF.id &&
+                    refund.creationInfo._1 > HEIGHT - 1000 &&
+                    refund.R5[Coll[Byte]].isDefined == false &&
+                    refund.value >= SELF.value - fee &&
+                    refund.tokens == SELF.tokens
+                )
+            }
+        }
+    }
+}

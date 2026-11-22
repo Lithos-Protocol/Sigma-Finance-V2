@@ -1,0 +1,150 @@
+{
+    // FI_Standard_FractionalMint.ergo - fractionalization request for an FI bond unit
+    // Author: CannonQ (2026)
+    //
+    // Turns one circulating FI_Standard_Bond unit into N fungible shares backed by
+    // FI_Standard_FractionalVault. The layout is ZC_Standard_FractionalMint's; the rules differ:
+    // the pull fee must be at least 100000000 nanoERG (0.1 ERG) instead of 2000000, the vault gets
+    // exactly 1000000 nanoERG plus the pull fee, both outputs must be freshly stamped, and the
+    // owner's co-spend must be younger than the storage-rent age. This script is the only
+    // supported creator of FI_Standard_FractionalVault boxes: ZC_Standard_FractionalMint carries
+    // none of these stamp, age and value rules.
+    // The owner is never assumed to be online after creating this box: everything the mint needs is
+    // committed here, so any batcher can run it for the mint fee.
+    //
+    // CONSTANTS
+    // CONST_FRACTIONAL_VAULT_HASH: Coll[Byte] - blake2b256 of FI_Standard_FractionalVault. That
+    //   vault is compiled for one repayment asset, so there is one mint per repayment asset.
+    //
+    // TOKENS
+    // tokens(0): (bond asset, 1) - the only token allowed
+    //
+    // REGISTERS
+    // R4-R6: free. When this box is an order's OUTPUTS(0) they hold the bond asset's EIP-4 data.
+    // R7: Coll[Byte] - 32-byte owner script hash, optionally followed by 32 more bytes that no
+    //   path reads (a delivery tag in the ZC layout; FI_Standard_LendOffer never delivers here).
+    //   The owner receives the shares and may cancel. R7 is read on every path, so a box without
+    //   a readable R7 can never be spent.
+    // R8: Coll[Long] - (N, pull fee, mint fee):
+    //   0 N, the number of shares, 1 <= N <= 1000000000
+    //   1 pull batching fee, >= 100000000 nanoERG. It moves into the fractional vault and pays
+    //     whoever later pulls the settled bond into it.
+    //   2 mint batching fee, >= 2000000 nanoERG. It pays whoever runs the mint.
+    // R9: Coll[Coll[Byte]] - the share token's EIP-4 (name, description, decimals), exactly 3 items.
+    //   The owner's free choice, fixed here so the minter cannot pick them. Decimals are display
+    //   only: every amount on-chain is in raw share units, and no payout granularity is guaranteed.
+    //
+    // VALUE
+    // This box funds three things: the fractional vault (exactly 1000000 nanoERG plus the pull
+    // fee), the share output (at least 1000000 nanoERG), and the mint fee. The vault and the share
+    // output together receive at least SELF.value minus the mint fee, so every spare nanoERG goes
+    // to the share output. A new vault sits at its refresh floor, so its refresh pays no bounty
+    // until an absorb adds value.
+    //
+    // MINT (anyone; no context vars)
+    // A transaction mints one token id, INPUTS(0).id, and an order fill already uses it for the
+    // bond asset. Shares therefore need this second, chainable transaction.
+    // INPUTS(0) = SELF: the share id is this box's id. Exactly 2*N+1 shares are minted.
+    // OUTPUTS(0): N shares at tokens(0), at the owner script, at least 1000000 nanoERG, created
+    //   at HEIGHT - 1000 or later. R4, R5, R6 = the three items of R9; R7 to R9 are not checked.
+    // OUTPUTS(1): FI_Standard_FractionalVault with tokens ((share, N+1), (bond asset, 1)),
+    //   R4 = bond asset id, R5: Coll[Long] = (N, N, pull fee), no R6, value exactly 1000000 plus
+    //   the pull fee, created at HEIGHT - 1000 or later. The vault's refresh reads R6 as a Byte,
+    //   so a register of any other type there would block the refresh until the pull.
+    //
+    // CANCEL
+    // Nothing is minted, and another input whose script hashes to the owner hash releases this
+    // box, if that input was created fewer than 1051200 blocks before HEIGHT: an older box can be
+    // spent under storage rent without its script running.
+    //
+    // OWNER SCRIPTS
+    // The owner script must be one that only its owner can spend in every instance: P2PK,
+    // multisig, or a contract whose keys are compiled-in constants. Anyone can create a box at a
+    // script that reads its authority from its own registers, so naming one lets anyone cancel
+    // this box and take every payout made to it: a payout pins only its script and a few
+    // registers (here the share output, whose R7 to R9 the batcher writes). This script and
+    // FI_Standard_FractionalVault can be instantiated by anyone and must never be an owner hash.
+    // Builders should refuse any other kind of owner script.
+    //
+    // VERIFYING A SHARE
+    // Share id Y is genuine iff the box with id Y was spent under this exact script and constant,
+    // fewer than 1051200 blocks after its creation height: a box that old can be spent under
+    // storage rent without its script running.
+    // The script then guarantees supply 2*N+1 with N+1 locked in the fractional vault, so for a
+    // known (Y, N) "the box holding N+1 units of Y" is the share's state box. Its R4 names the bond
+    // asset X; verify X as described in FI_Standard_Order. Also match X's repayment asset to the
+    // vault's: the vault takes in coupons only in its own repayment asset, so a bond of another
+    // asset wrapped here strands its token coupons. This script does not check that X is a
+    // genuine bond: the depositor answers for what they wrap, and share buyers verify it.
+
+    def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
+        OUTPUTS.fold(0L, { (a: Long, b: Box) =>
+            val count = b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                if (t._1 == tokenId) z + t._2 else z
+            })
+            a + count
+        })
+    }
+
+    val ownerRecord = SELF.R7[Coll[Byte]].get
+    val ownerHash = ownerRecord.slice(0, 32)
+    val minted = numTokenInOutputs(SELF.id)
+
+    if (minted > 0L) {
+        val terms = SELF.R8[Coll[Long]].get
+        val metadata = SELF.R9[Coll[Coll[Byte]]].get
+        if (terms.size != 3 || metadata.size != 3 || OUTPUTS.size < 2 || SELF.tokens.size != 1) {
+            sigmaProp(false)
+        } else {
+            val shares = terms(0)
+            val pullFee = terms(1)
+            val mintFee = terms(2)
+            val shareOut = OUTPUTS(0)
+            val vault = OUTPUTS(1)
+            val bondUnit = SELF.tokens(0)
+
+            val termsValid =
+                (ownerRecord.size == 32 || ownerRecord.size == 64) &&
+                shares >= 1L && shares <= 1000000000L &&
+                pullFee >= 100000000L && mintFee >= 2000000L &&
+                pullFee <= SELF.value && mintFee <= SELF.value - pullFee
+
+            val mintValid =
+                SELF.id == INPUTS(0).id &&
+                minted == 2L * shares + 1L &&
+                bondUnit._2 == 1L
+
+            val sharesPaid =
+                blake2b256(shareOut.propositionBytes) == ownerHash &&
+                shareOut.value >= 1000000L &&
+                shareOut.tokens.size > 0 &&
+                shareOut.tokens(0)._1 == SELF.id && shareOut.tokens(0)._2 == shares &&
+                shareOut.R4[Coll[Byte]].get == metadata(0) &&
+                shareOut.R5[Coll[Byte]].get == metadata(1) &&
+                shareOut.R6[Coll[Byte]].get == metadata(2) &&
+                shareOut.creationInfo._1 >= HEIGHT - 1000L
+
+            val vaultValid =
+                blake2b256(vault.propositionBytes) == CONST_FRACTIONAL_VAULT_HASH &&
+                vault.value - pullFee >= 1000000L &&
+                vault.value - pullFee <= 1000000L &&
+                vault.value + shareOut.value >= SELF.value - mintFee &&
+                vault.tokens == Coll((SELF.id, shares + 1L), bondUnit) &&
+                vault.R4[Coll[Byte]].get == bondUnit._1 &&
+                vault.R5[Coll[Long]].get == Coll(shares, shares, pullFee) &&
+                // No R6: the vault's refresh reads R6 as a Byte, and a register of another type would make
+                // that read fail, leaving the box to storage rent until the pull. Registers are dense, so
+                // without R6 there is nothing after it either.
+                vault.R6[Byte].isDefined == false &&
+                vault.creationInfo._1 >= HEIGHT - 1000L
+
+            sigmaProp(termsValid && mintValid && sharesPaid && vaultValid)
+        }
+    } else {
+        val ownerAuth = INPUTS.exists { (b: Box) =>
+            b.id != SELF.id && blake2b256(b.propositionBytes) == ownerHash &&
+            b.creationInfo._1 > HEIGHT - 1051200
+        }
+        sigmaProp(ownerAuth)
+    }
+}

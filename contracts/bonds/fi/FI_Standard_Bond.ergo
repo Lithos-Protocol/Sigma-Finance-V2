@@ -1,0 +1,423 @@
+{
+    // FI_Standard_Bond.ergo - a ZC Standard bond that also pays coupons and carries a covenant
+    // Author: CannonQ (2026)
+    //
+    // ZC_Standard_Bond with a coupon schedule and a collateral-ratio covenant in its registers,
+    // and three more paths that re-create the box: Pay, Record breach and Cure. FI_Standard_Order
+    // creates it; a repayment or a liquidation ends it in a ZC_Standard_BondVault settlement.
+    // The coupon state lives in R9, so this one box is the bond's whole state.
+    //
+    // CONSTANTS
+    // CONST_VAULT_HASH: Coll[Byte] - blake2b256 of ZC_Standard_BondVault; every settlement pays it
+    // CONST_REPAYMENT_TOKEN: Coll[Byte] - repayment token id; EMPTY for ERG repayment
+    // CONST_COUPON_VAULT_HASH: Coll[Byte] - blake2b256 of FI_Standard_CouponVault, the coupon pool
+    // CONST_COVENANT_HASH: Coll[Byte] - blake2b256 of the serialized covenant expression
+    //   (FI_Standard_ERG_SigUSD_Covenant, one expression for both markets)
+    // CONST_RECORD_BOUNTY: Long - the most nanoERG a Record breach caller keeps (500000000 in the
+    //   standard markets). FI_Standard_ERG_SigUSD_CollateralPolicy hard-codes the same number in
+    //   its cover test; the two must agree.
+    //
+    // TOKENS
+    // tokens(0): (bond asset, 2) - the reserve; every successor keeps it, a settlement moves it to
+    //   the vault. The third unit circulates; its holder claims the settlement and coupon pools.
+    // tokens(1..): collateral tokens. A token bond holding none of its repayment token may have it
+    //   appended last by Cure or Recollateralize.
+    //
+    // REGISTERS (set by FI_Standard_Order; R4..R8 never change)
+    // R4: Coll[Byte] - originating order id, which is also the bond asset id
+    // R5: Coll[Byte] - blake2b256 of the borrower script
+    // R6: Coll[Long] - borrower terms, 15..64 Longs:
+    //   0..6 as ZC (read here: 0 repayment amount, 2 repayment ERG floor); 7 coupon, in units
+    //   of the repayment asset; 8 coupon count; 9 blocks from the start height to the first due
+    //   height; 10 period; 11 grace; 12 minimum collateral ratio in bps (0 = no covenant); 13 cure
+    //   window in blocks; 14 maximum oracle age in blocks; 15.. liquidation payload. This script
+    //   does not read 12 or 14; the covenant, fill guard and collateral policy expressions do.
+    // R7: Coll[(Coll[Byte], Long)] - agreed principal tokens, as ZC
+    // R8: Coll[Byte] - blake2b256 of the serialized liquidation expression, as ZC
+    // R9: Coll[Long] - exactly 7: 0 lender fee reserve; 1 start height; 2 maturity height (0..2
+    //   as ZC, never changed); 3 coupons paid; 4 last breached checkpoint (-1 = none); 5 cure
+    //   deadline (0 = no breach open); 6 recollateralize clock (the start height at creation).
+    // Value minus R9(0) is collateral nanoERG. Every path needs 0 <= R9(0) <= value - 1000000.
+    //
+    // SCHEDULE
+    // R6(9) and R6(11) are clamped to 0..1000000000 and R6(10) to 1..1000000000 before use. With
+    // the clamped terms coupon k (from 0) falls due at due(k) = R9(1) + R6(9) + k * R6(10), which
+    // is also checkpoint k, and is missed from due(k) + R6(11).
+    // liquidatable: HEIGHT >= maturity; or fewer coupons paid than missed; or a breach is open
+    //   (R9(5) > 0) and HEIGHT >= R9(5). A low ratio alone never liquidates.
+    // Pay, Record breach, Cure, Recollateralize and Repayment are refused while liquidatable, so
+    // none can undo a valid liquidation and a breach that reaches its deadline is never cleared.
+    // The next unpaid coupon can be paid from one period before its due height until it is missed.
+    // Quiet zones, both applied only while the bond is not liquidatable:
+    // - Coupon: while a coupon is unpaid, let m be the next unpaid coupon's miss height and
+    //   Q = max(2, min(720, grace / 2)). Record breach and Refresh are refused at HEIGHT in
+    //   [m - Q, m), and so is a Pay that spends existing pools (which the unit holder could spend
+    //   first). So in those blocks neither a Refresh, a Record breach nor a collect of a pool it
+    //   spends can void the borrower's pending Pay; a Pay there creates a new pool instead.
+    // - Cure deadline: while a breach is open, let d be R9(5) and C = min(720, R6(13) / 2).
+    //   Refresh is refused at HEIGHT in [d - C, d), so no Refresh can void the borrower's
+    //   pending Cure or Repayment in the last blocks before the deadline.
+    //
+    // PATHS AND CONTEXT VARS
+    // Vars 9, 4, 6, 7 and 3 each select one re-creating path and name its successor output. At
+    // most one may be set, and none with var 0. With none set the box settles: var 0 set is a
+    // liquidation, absent a repayment. A successor or pool index outside OUTPUTS reads SELF in
+    // its place, which no path accepts; settlement indices must be in range.
+    // Refresh:         9 Int successor index.
+    // Pay:             4 Int successor index; 5 Int coupon pool output index.
+    // Record breach:   6 Int successor index; 8 Coll[Byte] covenant expression.
+    // Cure:            7 Int successor index; 8 Coll[Byte] covenant expression.
+    // Recollateralize: 3 Int successor index.
+    // Liquidation:     0 Coll[Byte] liquidation expression; 1 Int settlement output index.
+    // Repayment:       1 Int settlement output index; 2 Int collateral-return output index.
+    // The covenant expression reads var 6 (set: Record breach) and var 7 (Cure's successor).
+    // Borrower co-spend (Pay, Cure, Recollateralize, and keeping back collateral at Repayment):
+    // another input whose script hashes to R5, created fewer than 1051200 blocks before HEIGHT.
+    // An older box can be spent under storage rent without its script running.
+    //
+    // EVERY SUCCESSOR has this script, the same R4..R8 and R9(0..2), and changes only its own
+    // path's R9 fields. Refresh, Pay and Record breach keep the token list exactly; Pay keeps the
+    // value no lower, Refresh no lower before maturity and less at most 10000000 from maturity,
+    // Record breach less at most CONST_RECORD_BOUNTY; Refresh and Record breach never take it
+    // under R9(0) + 1000000. Cure and Recollateralize keep the reserve and every token
+    // amount no lower and must grow something, as ZC recollateralize. Only Refresh reads a
+    // successor's creation height.
+    //
+    // SETTLEMENT (Liquidation, Repayment), as ZC, into ZC_Standard_BondVault: tokens(0) the
+    // reserve, R4 = SELF.id, R5 Byte 0 repaid / 1 liquidated, no R6, and a creation height of at
+    // least HEIGHT - 15 (the node allows none above HEIGHT). FI_Standard_FractionalVault's pull
+    // waits 720 blocks from that height, so whoever settles cannot backdate it. The check is
+    // here, on both paths, not in the liquidation expression.
+    // Repayment, including ZC's repaying from collateral, is refused while liquidatable (so it
+    // needs HEIGHT < maturity, no coupon missed and no breach past its deadline): a default is
+    // final. Coupons not yet missed are not owed. Repayment pays R9(0) into the settlement on
+    // top of the repayment. Its return box (var 2) is at the borrower script, R4 = SELF.id, no
+    // R5, created at HEIGHT - 999 or later, with no more token entries than the collateral: every
+    // collateral token other than the repayment token exactly, in order, the repayment token
+    // less at most what the borrower keeps back, and the nanoERG less R9(0) (and, for an ERG
+    // bond, less what is kept back). Keeping back up to the repayment amount from collateral
+    // needs the borrower co-spend; anyone may repay otherwise.
+    // Liquidation needs `liquidatable` and var 0 hashing to R8; that expression then runs with
+    // this box as SELF and decides the vault payout (FI_Standard_Liquidation pays the vault every
+    // token and the value less R9(0), leaving R9(0) to whoever sends the liquidation), so it can
+    // narrow eligibility but never widen it.
+    //
+    // REFRESH (anyone), as ZC: the box was created more than 525600 blocks ago; HEIGHT is not in
+    // the 720 blocks before maturity; the successor is stamped 60 to 999 blocks before HEIGHT;
+    // R9 unchanged. Before maturity it keeps every nanoERG: no bounty. From maturity on the
+    // caller may keep up to 10000000 nanoERG (0.01 ERG), never taking the value under R9(0) +
+    // 1000000; on a box more than 525600 blocks old that can happen in the maturity block. Open
+    // while liquidatable; otherwise shut in both quiet zones. No output may be stamped below any
+    // input's creation height, so every input of a refresh must be at least 60 blocks old.
+    //
+    // PAY (borrower-script co-spend)
+    // Pays coupon R9(3); successor R9(3) + 1. Refused once R9(3) = R6(8). Output var 5 is this
+    // bond's coupon pool: at the coupon vault script, R4 = the bond asset id and no R5, created
+    // at HEIGHT - 999 or later, at most one token entry and no token but the repayment token
+    // (none for an ERG bond), and the only output at that script with this R4. It holds at least
+    // the coupon plus what every input at that script with this R4 holds, in the repayment asset
+    // (nanoERG for an ERG bond). So a Pay creates a pool, or spends one or more and merges them
+    // into one; merging is refused in the coupon quiet zone. One coupon per Pay; paying while a
+    // breach is open is allowed. The pool names no borrower: once paid, only the unit holder can
+    // collect it.
+    //
+    // RECORD BREACH (anyone, for a bounty)
+    // Records checkpoint k = successor R9(4). Needs no breach open (R9(5) = 0), R6(13) >= 1,
+    // k above this box's R9(4), 0 <= k < R6(8), HEIGHT in [due(k), due(k) + grace], HEIGHT <
+    // maturity - 720, and HEIGHT outside the coupon quiet zone. The covenant must find this box's
+    // collateral below the ratio. Successor R9(5) is a deadline in [HEIGHT + R6(13), HEIGHT +
+    // R6(13) + 15]. Recorded checkpoints only rise, so each is recorded at most once.
+    // The caller keeps up to CONST_RECORD_BOUNTY of the bond's nanoERG, never taking the value
+    // under R9(0) + 1000000, the least any path accepts (a box at that floor is recorded for
+    // nothing); tokens stay exactly. The borrower pays it from the collateral nanoERG, at most
+    // once per coupon date, so at most CONST_RECORD_BOUNTY times R6(8) over the bond's life. The
+    // covenant measures this box, before the bounty leaves, so the bounty never makes the breach
+    // (and Refresh takes nothing before maturity, while Record breach is still possible);
+    // Cure measures its successor, so a cure must also make up the bounty taken. A breach left
+    // uncured liquidates with the bounty gone from the collateral the lender receives.
+    //
+    // CURE (borrower-script co-spend)
+    // A breach is open and its deadline not reached. The successor adds collateral by the rule
+    // above, and the covenant must find the successor's collateral not below the ratio.
+    // Successor R9(5) = 0, R9(4) kept. No wait applies.
+    //
+    // RECOLLATERALIZE (borrower-script co-spend), as ZC, but the 60-block wait counts from the
+    // clock R9(6): HEIGHT >= R9(6) + 60, and the successor sets R9(6) within [HEIGHT - 15,
+    // HEIGHT]. It never closes a breach, even if it restores the ratio; only Cure does.
+    //
+    // COVENANT: var 8 must hash to CONST_COVENANT_HASH and runs with this box as SELF. It reads
+    // the USD oracle pool as a data input, no more than R6(14) blocks old, and fails when R6(12)
+    // is 0, so a bond without a covenant never records a breach. An ERG-repaid bond holding no
+    // SigUSD has a cover that does not move with the price and cannot fall before maturity, so
+    // once it starts at or above its ratio it is never recordable.
+    //
+    // ASSUMPTIONS
+    // A hand-made box with this script proves nothing: authenticate the asset's issuing
+    // FI_Standard_Order (its box spent fewer than 1051200 blocks after its creation height, so
+    // its script ran). The order sets R4..R9 (R9(3..6) = 0, -1, 0, start) and bounds the terms;
+    // this script re-checks none of it beyond the clamp above.
+    // With no fresh oracle box during the cure window, the breach cannot be cured, even when the
+    // cover does not depend on the price.
+    // Any spend of this box voids a pending Pay built on it, and so does the unit holder's
+    // collect of a pool that Pay spends (outside the coupon quiet zone).
+    // The liquidation and covenant expressions decide the vault payout and the breach test.
+    // FI_Standard_Order fills only with R8 = the standard FI_Standard_Liquidation hash, and the
+    // covenant is fixed by CONST_COVENANT_HASH.
+    // Storage rent after maturity: FI_Standard_Order caps the life at 788400 blocks, so a box
+    // stamped near the start (this bond, a unit box held since the fill, a share vault never
+    // absorbed, the earliest pools, a return box built early by a third party) reaches the rent
+    // age (1051200 blocks) about 262800 blocks after a full-life maturity. A box taken whole
+    // frees what it holds: a 2-unit box frees the pools; a 1-unit box (a unit box, or a share
+    // vault before the pull) frees the settlement and the pools. A covered rent event that takes
+    // this box's value under R9(0) + 1000000 locks it.
+    //
+    // BORROWER SCRIPTS
+    // The borrower script must be one that only its owner can spend in every instance: P2PK,
+    // multisig, or a contract whose keys are compiled-in constants. Anyone can create a box at a
+    // script that reads its authority from its own registers, so naming one lets anyone act as
+    // the borrower: pay, cure, recollateralize, and keep back collateral at repayment. The return
+    // box carries only the R4 tag, so whether the owner can spend it is up to that script.
+    // FI_Standard_FractionalMint and FI_Standard_FractionalVault can be instantiated by anyone
+    // and must never be the borrower hash. Builders should refuse any other kind of borrower
+    // script.
+
+    val borrower = SELF.R6[Coll[Long]].get
+    val lender = SELF.R9[Coll[Long]].get
+
+    if (borrower.size < 15 || borrower.size > 64 || lender.size != 7) {
+        sigmaProp(false)
+    } else {
+        val fee = lender(0)
+        val maturity = lender(2)
+        val paid = lender(3)
+        val lastBreach = lender(4)
+        val deadline = lender(5)
+        val clock = lender(6)
+        val coupon = borrower(7)
+        val count = borrower(8)
+        // Schedule terms clamped before any arithmetic: a term out of range reads as its nearest
+        // bound, so the period is never 0 and no term exceeds 1000000000.
+        val firstDue = lender(1) + min(max(borrower(9), 0L), 1000000000L)
+        val step = min(max(borrower(10), 1L), 1000000000L)
+        val grace = min(max(borrower(11), 0L), 1000000000L)
+        val height = HEIGHT.toLong
+        // Coupons missed so far: coupon k is missed from its due height plus the grace.
+        val missed = if (height < firstDue + grace) 0L
+            else min(count, (height - firstDue - grace) / step + 1L)
+        val liquidatable =
+            height >= maturity || paid < missed || (deadline > 0L && height >= deadline)
+
+        val borrowerHash = SELF.R5[Coll[Byte]].get
+        val asset = SELF.tokens(0)._1
+        val collateral = SELF.tokens.slice(1, SELF.tokens.size)
+        val repaymentToken = CONST_REPAYMENT_TOKEN
+        // An empty collection taken from the box, not written as a literal. Testing the constant
+        // alone is folded at compile time, which gives the ERG and token bonds different
+        // templates and breaks listing every bond by template hash.
+        val noToken = SELF.id.slice(0, 0)
+        val repaysERG = repaymentToken == noToken
+        val borrowerAuth = INPUTS.exists { (b: Box) =>
+            b.id != SELF.id && blake2b256(b.propositionBytes) == borrowerHash &&
+            b.creationInfo._1 > HEIGHT - 1051200
+        }
+        val liquidationScript = getVar[Coll[Byte]](0)
+        val recollateralizeIndex = getVar[Int](3)
+        val payIndex = getVar[Int](4)
+        val recordIndex = getVar[Int](6)
+        val cureIndex = getVar[Int](7)
+        val refreshIndex = getVar[Int](9)
+        val refresh = refreshIndex.isDefined
+        val pay = payIndex.isDefined
+        val record = recordIndex.isDefined
+        val cure = cureIndex.isDefined
+        val recollateralize = recollateralizeIndex.isDefined
+        val moves = (if (refresh) 1 else 0) + (if (pay) 1 else 0) + (if (record) 1 else 0) +
+            (if (cure) 1 else 0) + (if (recollateralize) 1 else 0)
+
+        if (fee < 0L || fee > SELF.value - 1000000L) {
+            sigmaProp(false)
+        } else if (moves == 0) {
+            // Settlement: liquidation or repayment, as ZC.
+            val settlementIndex = getVar[Int](1).get
+            if (settlementIndex < 0 || settlementIndex >= OUTPUTS.size) {
+                sigmaProp(false)
+            } else {
+                val settlement = OUTPUTS(settlementIndex)
+                val toVault =
+                    blake2b256(settlement.propositionBytes) == CONST_VAULT_HASH &&
+                    settlement.tokens.size > 0 &&
+                    settlement.tokens(0) == SELF.tokens(0) &&
+                    settlement.R4[Coll[Byte]].get == SELF.id &&
+                    settlement.creationInfo._1 >= HEIGHT - 15 &&
+                    settlement.R6[Coll[Byte]].isDefined == false
+
+                if (liquidationScript.isDefined) {
+                    val liquidated =
+                        liquidatable &&
+                        blake2b256(liquidationScript.get) == SELF.R8[Coll[Byte]].get &&
+                        toVault &&
+                        settlement.R5[Byte].get == 1.toByte
+                    sigmaProp(liquidated) && executeFromVar[SigmaProp](0)
+                } else {
+                    val returnIndex = getVar[Int](2).get
+                    if (returnIndex < 0 || returnIndex >= OUTPUTS.size ||
+                        returnIndex == settlementIndex) {
+                        sigmaProp(false)
+                    } else {
+                        val returnBox = OUTPUTS(returnIndex)
+                        val repayment = borrower(0)
+                        // Subtract the fee refund rather than add to the terms, to avoid overflow.
+                        val ergPaid =
+                            settlement.value >= fee && settlement.value - fee >= borrower(2)
+                        val assetPaid = if (repaysERG) {
+                            settlement.tokens.size == 1 && settlement.value - fee >= repayment
+                        } else {
+                            settlement.tokens.size == 2 &&
+                            settlement.tokens(1)._1 == repaymentToken &&
+                            settlement.tokens(1)._2 >= repayment
+                        }
+                        // What the borrower may keep back from the return box, in the
+                        // repayment asset.
+                        val fromCollateral = if (borrowerAuth) repayment else 0L
+                        val heldRepayment = collateral.fold(0L, {
+                            (a: Long, t: (Coll[Byte], Long)) =>
+                            if (t._1 == repaymentToken) a + t._2 else a
+                        })
+                        val returnedRepayment = returnBox.tokens.fold(0L, {
+                            (a: Long, t: (Coll[Byte], Long)) =>
+                            if (t._1 == repaymentToken) a + t._2 else a
+                        })
+                        val otherCollateral = collateral.filter { (t: (Coll[Byte], Long)) =>
+                            t._1 != repaymentToken
+                        }
+                        val otherReturned = returnBox.tokens.filter { (t: (Coll[Byte], Long)) =>
+                            t._1 != repaymentToken
+                        }
+                        val ergReturned =
+                            if (repaysERG) SELF.value - fee - fromCollateral else SELF.value - fee
+                        sigmaProp(
+                            !liquidatable &&
+                            toVault &&
+                            settlement.R5[Byte].get == 0.toByte &&
+                            ergPaid && assetPaid &&
+                            blake2b256(returnBox.propositionBytes) == borrowerHash &&
+                            returnBox.R4[Coll[Byte]].get == SELF.id &&
+                            returnBox.creationInfo._1 > HEIGHT - 1000 &&
+                            returnBox.R5[Coll[Byte]].isDefined == false &&
+                            returnBox.tokens.size <= collateral.size &&
+                            otherReturned == otherCollateral &&
+                            returnedRepayment >= heldRepayment - fromCollateral &&
+                            returnBox.value >= ergReturned
+                        )
+                    }
+                }
+            }
+        } else if (moves > 1 || liquidationScript.isDefined) {
+            sigmaProp(false)
+        } else {
+            // Exactly one re-creating path. An index outside OUTPUTS reads SELF, which fails
+            // every path below: Refresh needs a later stamp than SELF has, and every other path
+            // a changed R9 field.
+            val next = OUTPUTS.getOrElse(refreshIndex.getOrElse(recollateralizeIndex.getOrElse(
+                payIndex.getOrElse(recordIndex.getOrElse(cureIndex.getOrElse(-1))))), SELF)
+            val nextLender = next.R9[Coll[Long]].get
+            val size = SELF.tokens.size
+            val kept =
+                next.propositionBytes == SELF.propositionBytes &&
+                next.R4[Coll[Byte]].get == SELF.R4[Coll[Byte]].get &&
+                next.R5[Coll[Byte]].get == borrowerHash &&
+                next.R6[Coll[Long]].get == borrower &&
+                next.R7[Coll[(Coll[Byte], Long)]].get == SELF.R7[Coll[(Coll[Byte], Long)]].get &&
+                next.R8[Coll[Byte]].get == SELF.R8[Coll[Byte]].get &&
+                // Each path changes only its own R9 fields.
+                nextLender == Coll(fee, lender(1), maturity,
+                    if (pay) paid + 1L else paid,
+                    if (record) nextLender(4) else lastBreach,
+                    if (record) nextLender(5) else if (cure) 0L else deadline,
+                    if (recollateralize) nextLender(6) else clock)
+            val holds = if (cure || recollateralize) {
+                // ZC recollateralize: the same tokens, none lower, and more of something. A token
+                // bond holding none of its repayment token may take it on, appended last.
+                val appended =
+                    next.tokens.size == size + 1 &&
+                    !(collateral.exists { (t: (Coll[Byte], Long)) => t._1 == repaymentToken }) &&
+                    next.tokens(size)._1 == repaymentToken
+                (next.tokens.size == size || appended) &&
+                next.value >= SELF.value &&
+                next.tokens(0) == SELF.tokens(0) &&
+                SELF.tokens.indices.forall { (j: Int) =>
+                    next.tokens(j)._1 == SELF.tokens(j)._1 && next.tokens(j)._2 >= SELF.tokens(j)._2
+                } &&
+                (appended || next.value > SELF.value ||
+                    SELF.tokens.indices.exists { (j: Int) =>
+                        next.tokens(j)._2 > SELF.tokens(j)._2
+                    })
+            } else if (refresh || record) {
+                next.tokens == SELF.tokens && next.value >= fee + 1000000L &&
+                next.value >= SELF.value - (if (refresh) (if (height >= maturity) 10000000L else 0L) else CONST_RECORD_BOUNTY)
+            } else {
+                next.tokens == SELF.tokens && next.value >= SELF.value
+            }
+            val miss = firstDue + paid * step + grace
+            val quietLen = max(2L, min(720L, grace / 2L))
+            val allowed = if (refresh) {
+                val stamped = next.creationInfo._1
+                SELF.creationInfo._1 < HEIGHT - 525600 &&
+                (height < maturity - 720L || height >= maturity) &&
+                stamped > HEIGHT - 1000 && stamped <= HEIGHT - 60
+            } else if (pay) {
+                val couponBox = OUTPUTS.getOrElse(getVar[Int](5).getOrElse(-1), SELF)
+                // A box at the coupon vault script naming this asset: this bond's coupon pool.
+                val pool = { (b: Box) =>
+                    blake2b256(b.propositionBytes) == CONST_COUPON_VAULT_HASH &&
+                    b.R4[Coll[Byte]].getOrElse(noToken) == asset
+                }
+                // What a box holds in the repayment asset.
+                val inRepayment = { (b: Box) =>
+                    if (repaysERG) b.value else b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                        if (t._1 == repaymentToken) z + t._2 else z
+                    })
+                }
+                // The coupon plus what the pools spent here hold.
+                val poolIns = INPUTS.filter(pool)
+                val owed = poolIns.fold(coupon, { (a: Long, b: Box) => a + inRepayment(b) })
+                // Coupon R9(3) is payable from one period before its due height.
+                borrowerAuth && paid < count && height >= firstDue + (paid - 1L) * step &&
+                (poolIns.size == 0 || height < miss - quietLen) &&
+                pool(couponBox) && couponBox.creationInfo._1 > HEIGHT - 1000 &&
+                couponBox.R5[Coll[Byte]].isDefined == false &&
+                couponBox.tokens.size <= 1 &&
+                couponBox.tokens.forall { (t: (Coll[Byte], Long)) => t._1 == repaymentToken } &&
+                inRepayment(couponBox) >= owed &&
+                OUTPUTS.filter(pool).size == 1
+            } else if (record) {
+                // k: the checkpoint recorded; until: how far the new deadline lies beyond
+                // HEIGHT plus the cure window, at most 15 blocks.
+                val k = nextLender(4)
+                val checkpoint = firstDue + k * step
+                val until = nextLender(5) - height - borrower(13)
+                deadline == 0L && borrower(13) >= 1L && k > lastBreach && k >= 0L && k < count &&
+                height >= checkpoint && height <= checkpoint + grace && height < maturity - 720L &&
+                until >= 0L && until <= 15L && nextLender(5) > 0L
+            } else if (cure) {
+                borrowerAuth && deadline > 0L
+            } else {
+                // Recollateralize: 60 blocks since the clock, which the successor re-sets.
+                borrowerAuth && height >= clock + 60L &&
+                nextLender(6) >= height - 15L && nextLender(6) <= height
+            }
+            // The quiet zones: before the next unpaid coupon's miss height (Refresh and Record
+            // breach), and before an open breach's cure deadline (Refresh).
+            val quiet = ((refresh || record) && paid < count && height < miss &&
+                height >= miss - quietLen) ||
+                (refresh && deadline > 0L && height < deadline &&
+                height >= deadline - min(720L, borrower(13) / 2L))
+            val covenanted = record || cure
+            // While liquidatable only Refresh may re-create the box; otherwise Refresh and
+            // Record breach are shut in their quiet zones.
+            sigmaProp(kept && holds && allowed && (if (liquidatable) refresh else !quiet) &&
+                (!covenanted || blake2b256(getVar[Coll[Byte]](8).get) == CONST_COVENANT_HASH)) &&
+                (if (covenanted) executeFromVar[SigmaProp](8) else sigmaProp(true))
+        }
+    }
+}
