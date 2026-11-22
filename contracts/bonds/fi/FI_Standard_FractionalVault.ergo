@@ -1,0 +1,287 @@
+{
+    // FI_Standard_FractionalVault.ergo - one FI bond unit held for N shares, with its coupons
+    // Author: CannonQ (2026)
+    //
+    // ZC_Standard_FractionalVault for a bond that pays coupons. Such a bond pays each coupon into
+    // a coupon pool (FI_Standard_CouponVault) that the holder of its circulating unit collects.
+    // Genuine vaults are created only by FI_Standard_FractionalMint compiled with
+    // CONST_FRACTIONAL_VAULT_HASH = blake2b256 of this script, the only supported creator
+    // (ZC_Standard_FractionalMint does not carry its stamp, age and value rules). Holds one
+    // circulating bond unit on behalf of N shares, takes in the pools paid to that unit while it
+    // holds it, pulls the bond's settlement (with any pools still open) out of
+    // ZC_Standard_BondVault, and pays share holders pro rata.
+    //
+    // CONSTANTS
+    // CONST_COUPON_VAULT_HASH: Coll[Byte] - blake2b256 of FI_Standard_CouponVault, the coupon pool
+    // CONST_REPAYMENT_TOKEN: Coll[Byte] - the bond's repayment token id; empty for an ERG bond.
+    //   Coupons are counted in this token only, so one vault, and so one mint, per repayment
+    //   asset. A unit of a bond repaid in another token can be deposited, but its token coupons
+    //   cannot be taken in.
+    //
+    // TOKENS
+    // tokens(0): (share, N+1) - the reserve, kept through every transition and burned only by the
+    //   final claim. Supply is 2*N+1, so for a known (share, N) the box holding N+1 units is the
+    //   share's state box: found by token id, authenticated by amount, usable as a data input.
+    // tokens(1..): before the pull (bond asset, 1), then (repayment token, coupons) once any are
+    //   taken in, and no other token. After it, (repayment token, coupons plus proceeds) if any,
+    //   then the settlement proceeds' other tokens in their order.
+    //
+    // REGISTERS
+    // R4: Coll[Byte] - bond asset id
+    // R5: Coll[Long] - (N, outstanding shares, pull fee). Outstanding starts at N and falls with
+    //   each claim. The pull fee was funded into this box's value at mint: at least 0.1 ERG through
+    //   FI_Standard_FractionalMint. This script itself enforces no minimum.
+    // R6: Byte - bond settlement path, 0 repaid / 1 liquidated. Present only after the pull.
+    // State is read from the tokens: the vault is "holding" while tokens(1..) holds the bond asset.
+    // ERG coupons are part of the value.
+    //
+    // PATHS. Context var 9 selects REFRESH; otherwise the shares burned select the path, where
+    // burned = transaction-wide share inputs minus share outputs.
+    // ABSORB OR PULL (burned = 0, holding; anyone). Context var 0: Int successor index.
+    //   The pools are all inputs at the coupon pool script; each must have R4 = the bond asset.
+    //   The caller's cut is 1/200 (0.5%), rounded down, of what the pools bring: of their summed
+    //   nanoERG, and of their summed repayment token. It is reckoned on the pools alone, never on
+    //   this box or the bond vault, so a pool made by hand returns at most 0.5% of itself and
+    //   takes nothing of what this box held. A pool of under 200 units yields no cut.
+    //   The successor keeps this script, R4, R5 and the reserve, is created at HEIGHT - 999 or
+    //   later and has no R7. Its value is at least this box's
+    //   plus every pool's (and, at a pull, the bond vault's, less the pull fee), less the nanoERG
+    //   cut. Its coupon entry (repayment token, c) is there when c > 0, where c is the repayment
+    //   token summed over this box, the pools and the bond vault, less the token cut. Successor
+    //   tokens are exact given the cut, and each pool's own rule asks for every token it holds in
+    //   the successor, less the same cut, so a pool holding any other token cannot be taken in.
+    // ABSORB (no other input holds the bond asset; at least one pool). Successor tokens: the
+    //   reserve, (bond asset, 1), then the coupon entry; no R6. The caller keeps the cut and pays
+    //   the miner fee from its own inputs.
+    // PULL (one other input holds the bond asset; pools optional). That input is the settled
+    //   ZC_Standard_BondVault: only it can hold the other 2 units, at tokens(0). It must have been
+    //   created at least 720 blocks before HEIGHT: FI_Standard_Bond stamps it within 15 blocks of
+    //   its settlement, so every pool has about 720 blocks to be absorbed first. The bond vault's
+    //   refresh re-stamps it, which can only restart and so lengthen the wait. All 3 bond units
+    //   are burned. Successor tokens: the reserve, the coupon entry, then the bond vault's
+    //   tokens(1..) other than the repayment token, in order; R6 = the bond vault's path. The
+    //   puller keeps up to the pull fee R5(2) out of the combined value, plus the cut when pools
+    //   are in, so taking pools in never pays less than leaving them out. The pools' rule lets a
+    //   3-unit burn at a contract home keep the smaller of the home's R5(2) and the home's own
+    //   value, and the cut, out of its payout.
+    // PARTIAL CLAIM (0 < burned < outstanding, after the pull only).
+    //   Context var 0: Int continuation index; 1: Int payout index, distinct.
+    //   Pays floor(balance * burned / outstanding) of nanoERG and of EACH token; the rest stays
+    //   under this script with outstanding reduced, in a continuation created at HEIGHT - 999 or
+    //   later with R6 kept and no R7. Products use BigInt before division.
+    // FINAL CLAIM (burned = outstanding + N + 1). Context var 1: Int payout index.
+    //   Every outstanding share AND the reserve are burned; the payout takes everything. Before
+    //   the pull this returns the bond unit and every coupon taken in: holding all shares
+    //   un-fractionalizes the bond.
+    // Payout outputs carry R4 = SELF.id, so one output cannot serve two vaults.
+    // REFRESH (context var 9 present; anyone, once the box is more than 525600 blocks, about two
+    //   years, old). Var 9: Int successor index. Storage rent lets anyone take a four-year-old box
+    //   whose value does not cover the rent, tokens included, which would free the share reserve
+    //   and the bond unit. So anyone may re-create the box to reset its age, keeping up to
+    //   10000000 nanoERG (0.01 ERG) as a bounty. It never takes the value below 1000000, plus
+    //   the pull fee while the bond unit is still held; a box at or under that is renewed for
+    //   nothing, and a vault from FI_Standard_FractionalMint starts exactly there. The successor
+    //   has this script, the same tokens and registers and no more, and a creation height within
+    //   1000 blocks of HEIGHT (up to HEIGHT itself). No shares may be burned in the transaction.
+    //   The age and the bounty are ZC_Standard_Bond's; its successor stamp window is not.
+    //
+    // ASSUMPTIONS AND LIMITS
+    // - Coupons reach share holders only through the claims, after the pull pro rata to shares
+    //   burned, or all at once by a final claim before it. A holder who sells shares before the
+    //   pull sells their part of the coupons too.
+    // - Once the pull burns the unit no pool of the bond can be collected. A pool neither taken in
+    //   nor spent in the pull has no collector: the borrower, the puller and the share holders
+    //   cannot take it, and it stays unspendable except by a refresh that re-creates it. Nothing
+    //   here can tell that a pool was left out. Whoever sends the absorb or pull keeps the cut on
+    //   the pools it includes, which is the incentive to include them all (a pool under 200
+    //   units pays no cut). Builders must find and include every unspent pool of the bond whose
+    //   tokens are the repayment token or none; a pool holding any other token makes the
+    //   transaction fail. A vault 1051200 or more blocks old must be refreshed before an absorb
+    //   or pull that carries pools: the pools accept no home that old.
+    // - Share holders pay the cut, out of the coupons. ABSORB and the claims are never delayed; a
+    //   final claim before the pull takes the unit and every coupon taken in.
+    // - The vault cannot tell a genuine pool from a box made by hand at the pool script naming the
+    //   bond. Such a box adds only nanoERG and the repayment token, or cannot be taken; but any
+    //   absorb spends this box and voids a claim or pull built on it, to be rebuilt.
+    // - Before the pull the box holds at most three tokens. After it the reserve stands in for the
+    //   bond vault's 2 units and its repayment token is merged into the coupon entry, which adds
+    //   one entry only when the bond vault held none. The successor must fit the node's box size
+    //   limit for the pull to go through.
+    // - N is free and unrelated to the proceeds' raw units, so a small claim can round to zero for
+    //   an asset. Rounding dust stays for later claimants; the final claim takes it all.
+    // - Claimants fund fees and minimum-box top-ups. Payouts and continuations may receive extra
+    //   ERG; tokens are exact. Claims on one vault serialize; different vaults may share a
+    //   transaction that takes in no pools (each pool input must name this bond, and the pools'
+    //   rule counts every input at this script toward this box's successor).
+    // - The payout destination is chosen by whoever supplies the shares. Joint claimants must
+    //   agree.
+    // - The proceeds are assumed not to contain this vault's own share token: the bond's
+    //   collateral is fixed before the share id exists. A liquidation expression that injects it
+    //   is unsupported.
+    // - Shares lost or burned outside these paths strand their entitlement. No sweep authority.
+    // - A hand-made box with this script cannot hold a genuine reserve; see
+    //   FI_Standard_FractionalMint for share verification. Anyone can create and spend a box at
+    //   this script (a self-minted reserve passes the final claim), so it must never be named as
+    //   an owner or borrower script. A refresh relies on someone sending it within the two years
+    //   before rent is due.
+    // - Storage rent after maturity: FI_Standard_Order caps a bond's life at 788400 blocks, so a
+    //   vault minted near the bond's start and never absorbed reaches the rent age (1051200
+    //   blocks) about 262800 blocks after a full-life maturity. Taken whole before the pull, it
+    //   frees its unit, and with it the settlement and the pools. A rent fee that leaves less
+    //   than the pull fee in the box blocks the pull.
+
+    def numTokenInInputs(tokenId: Coll[Byte]): Long = {
+        INPUTS.fold(0L, { (a: Long, b: Box) =>
+            val count = b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                if (t._1 == tokenId) z + t._2 else z
+            })
+            a + count
+        })
+    }
+
+    def numTokenInOutputs(tokenId: Coll[Byte]): Long = {
+        OUTPUTS.fold(0L, { (a: Long, b: Box) =>
+            val count = b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) =>
+                if (t._1 == tokenId) z + t._2 else z
+            })
+            a + count
+        })
+    }
+
+    val shareId = SELF.tokens(0)._1
+    val reserve = SELF.tokens(0)._2
+    val bondAsset = SELF.R4[Coll[Byte]].get
+    val supply = SELF.R5[Coll[Long]].get
+    val assets = SELF.tokens.slice(1, SELF.tokens.size)
+    val holding = assets.exists { (t: (Coll[Byte], Long)) => t._1 == bondAsset }
+    val burned = numTokenInInputs(shareId) - numTokenInOutputs(shareId)
+
+    if (supply.size != 3 || supply(0) < 1L || supply(0) > 1000000000L || reserve != supply(0) + 1L ||
+        supply(1) < 1L || supply(1) > supply(0) || burned < 0L) {
+        sigmaProp(false)
+    } else {
+        val outstanding = supply(1)
+        val refreshIndex = getVar[Int](9)
+
+        if (refreshIndex.isDefined) {
+            // Refresh: re-create the box unchanged to reset its age, paying the refresher.
+            val index = refreshIndex.get
+            if (index < 0 || index >= OUTPUTS.size) {
+                sigmaProp(false)
+            } else {
+                val next = OUTPUTS(index)
+                val stamped = next.creationInfo._1
+                // A holding vault keeps its pull fee, so the pull can still pay its batcher.
+                val floor = if (holding) 1000000L + supply(2) else 1000000L
+                val kept = if (SELF.value < floor) SELF.value else floor
+                val least = if (SELF.value - 10000000L > kept) SELF.value - 10000000L else kept
+                // R6 exists only after the pull; the successor keeps it as it is.
+                val pathKept = if (SELF.R6[Byte].isDefined) {
+                    next.R6[Byte].get == SELF.R6[Byte].get && next.R7[Coll[Byte]].isDefined == false
+                } else next.R6[Byte].isDefined == false
+                sigmaProp(
+                    burned == 0L &&
+                    SELF.creationInfo._1 < HEIGHT - 525600 &&
+                    stamped > HEIGHT - 1000 && stamped <= HEIGHT &&
+                    next.propositionBytes == SELF.propositionBytes &&
+                    next.value >= least &&
+                    next.tokens == SELF.tokens &&
+                    next.R4[Coll[Byte]].get == bondAsset &&
+                    next.R5[Coll[Long]].get == supply &&
+                    pathKept
+                )
+            }
+        } else if (burned == 0L) {
+            // Absorb coupon pools into this box, or pull the settled bond vault (and any pools)
+            val nextIndex = getVar[Int](0).get
+            val sources = INPUTS.filter { (b: Box) =>
+                b.id != SELF.id && b.tokens.exists { (t: (Coll[Byte], Long)) => t._1 == bondAsset }
+            }
+            val pullFee = supply(2)
+            if (!holding || sources.size > 1 || pullFee < 0L || pullFee > SELF.value ||
+                nextIndex < 0 || nextIndex >= OUTPUTS.size) {
+                sigmaProp(false)
+            } else {
+                val next = OUTPUTS(nextIndex)
+                val coupon = CONST_REPAYMENT_TOKEN
+                val pools = INPUTS.filter { (b: Box) => blake2b256(b.propositionBytes) == CONST_COUPON_VAULT_HASH }
+                // What joins this box: the settled bond vault, at a pull, and the pools.
+                val parts = sources.append(pools)
+                val inCoupon = { (b: Box) =>
+                    b.tokens.fold(0L, { (z: Long, u: (Coll[Byte], Long)) => if (u._1 == coupon) z + u._2 else z })
+                }
+                // The caller's cut: 1/200 of the pools' own nanoERG and repayment token, rounded down.
+                val pooledErg = pools.fold(0L, { (a: Long, b: Box) => a + b.value })
+                val pooledCoupons = pools.fold(0L, { (a: Long, b: Box) => a + inCoupon(b) })
+                val coupons = parts.fold(inCoupon(SELF) - pooledCoupons / 200L, { (a: Long, b: Box) => a + inCoupon(b) })
+                val erg = parts.fold(SELF.value - pullFee * sources.size.toLong - pooledErg / 200L,
+                    { (a: Long, b: Box) => a + b.value })
+                // The settled bond vault's tokens after its 2 units; none at an absorb. In the
+                // successor below, slice(0, 2 - sources.size) keeps the reserve and, at an absorb
+                // only, the bond unit; SELF's own coupons re-enter through the summed entry.
+                val proceeds = sources.fold(SELF.tokens.slice(0, 0), { (a: Coll[(Coll[Byte], Long)], b: Box) =>
+                    b.tokens.slice(1, b.tokens.size)
+                })
+                sigmaProp(
+                    parts.size > 0 &&
+                    next.propositionBytes == SELF.propositionBytes &&
+                    next.creationInfo._1 > HEIGHT - 1000 &&
+                    next.R7[Coll[Byte]].isDefined == false &&
+                    next.R4[Coll[Byte]].get == bondAsset &&
+                    next.R5[Coll[Long]].get == supply &&
+                    pools.forall { (b: Box) => b.R4[Coll[Byte]].get == bondAsset } &&
+                    next.value >= erg &&
+                    next.tokens == SELF.tokens.slice(0, 2 - sources.size)
+                        .append(Coll((coupon, coupons)).filter { (t: (Coll[Byte], Long)) => t._2 > 0L })
+                        .append(proceeds.filter { (t: (Coll[Byte], Long)) => t._1 != coupon }) &&
+                    next.R6[Byte].isDefined == (sources.size == 1) &&
+                    sources.forall { (b: Box) =>
+                        b.tokens(0)._1 == bondAsset && numTokenInOutputs(bondAsset) == 0L &&
+                        next.R6[Byte].get == b.R5[Byte].get && HEIGHT >= b.creationInfo._1 + 720
+                    }
+                )
+            }
+        } else {
+            val payoutIndex = getVar[Int](1).get
+            if (payoutIndex < 0 || payoutIndex >= OUTPUTS.size) {
+                sigmaProp(false)
+            } else {
+                val payout = OUTPUTS(payoutIndex)
+                val payoutTagged = payout.R4[Coll[Byte]].get == SELF.id
+
+                if (burned == outstanding + reserve) {
+                    // Final claim: all outstanding shares and the reserve are gone
+                    sigmaProp(payoutTagged && payout.value >= SELF.value && payout.tokens == assets)
+                } else {
+                    val nextIndex = getVar[Int](0).get
+                    if (holding || burned >= outstanding ||
+                        nextIndex < 0 || nextIndex >= OUTPUTS.size || nextIndex == payoutIndex) {
+                        sigmaProp(false)
+                    } else {
+                        val next = OUTPUTS(nextIndex)
+                        val paidERG = (SELF.value.toBigInt * burned.toBigInt / outstanding.toBigInt).toLong
+                        val paidTokens = assets.map { (t: (Coll[Byte], Long)) =>
+                            (t._1, (t._2.toBigInt * burned.toBigInt / outstanding.toBigInt).toLong)
+                        }.filter { (t: (Coll[Byte], Long)) => t._2 > 0L }
+                        val retainedTokens = assets.map { (t: (Coll[Byte], Long)) =>
+                            (t._1, t._2 - (t._2.toBigInt * burned.toBigInt / outstanding.toBigInt).toLong)
+                        }.filter { (t: (Coll[Byte], Long)) => t._2 > 0L }
+
+                        val paid = payoutTagged && payout.value >= paidERG && payout.tokens == paidTokens
+                        val continued =
+                            next.propositionBytes == SELF.propositionBytes &&
+                            next.creationInfo._1 > HEIGHT - 1000 &&
+                            next.R7[Coll[Byte]].isDefined == false &&
+                            next.value >= SELF.value - paidERG &&
+                            next.tokens == SELF.tokens.slice(0, 1).append(retainedTokens) &&
+                            next.R4[Coll[Byte]].get == bondAsset &&
+                            next.R5[Coll[Long]].get == Coll(supply(0), outstanding - burned, supply(2)) &&
+                            next.R6[Byte].get == SELF.R6[Byte].get
+
+                        sigmaProp(paid && continued)
+                    }
+                }
+            }
+        }
+    }
+}

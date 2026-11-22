@@ -1,0 +1,443 @@
+{
+    // FI_Standard_LendOffer.ergo - the lender's offer (a yield-curve bid) for FI bonds
+    // Author: CannonQ (2026)
+    //
+    // Holds a lender's capital and buys FI_Standard_Bond units that clear a simple-interest yield
+    // the lender sets per maturity: new ones, by filling an FI_Standard_Order, and existing ones,
+    // from any ask that follows the ask convention below (ZC_Standard_SaleOrder, or a later one).
+    // Any batcher matches the offer, for the fee the offer itself sets, and the bond unit is
+    // delivered to the owner script.
+    // It is ZC_Standard_LendOffer read against the FI bond's registers, with the lender's bounds
+    // on the coupon schedule in R7. It buys whole bond units only, never shares, and refuses an
+    // owner equal to this market's share mint. Nothing here touches coupons: the bond pays them
+    // into its own coupon pool.
+    //
+    // CONSTANTS (one offer address per repayment asset, under one shared template)
+    // CONST_REPAYMENT_TOKEN: Coll[Byte] - the asset lent and repaid; EMPTY for ERG
+    // CONST_ORDER_HASH: Coll[Byte] - blake2b256 of the FI_Standard_Order tree for that asset
+    // CONST_BOND_HASH: Coll[Byte] - blake2b256 of the FI_Standard_Bond tree for that asset
+    // CONST_MINT_HASH: Coll[Byte] - blake2b256 of the FI_Standard_FractionalMint tree for that
+    //   asset; the owner hash R4 may not equal it
+    // There is no priced-order hash. No ask script is pinned.
+    // Deploy-time couplings: CONST_ORDER_HASH must name the order compiled with this
+    // CONST_BOND_HASH and CONST_REPAYMENT_TOKEN (only an existing bond is checked against
+    // CONST_BOND_HASH here); CONST_MINT_HASH must come from the mint as finally compiled.
+    //
+    // CAPITAL
+    // ERG offer: the box value, no tokens. Token offer: tokens(0) = (repayment token, amount), and
+    // the box value pays fees and box minimums.
+    //
+    // REGISTERS (R4 to R7, all present; a fill's continuation copies R4, R5, R7, resets R6, has
+    // no R8 or later register and is created at HEIGHT - 999 or later)
+    // R4: Coll[Byte] - blake2b256 of the owner script: may cancel, receives the bond unit
+    // R5: Coll[Long] - terms, at ZC_Standard_LendOffer's indices: 11 for ERG or 15 for a token
+    //   offer, then the yield curve.
+    //   0 minimum yield, basis points of simple interest per 262800 blocks (one year of 2-minute
+    //     blocks), >= 0. The yield required at any maturity is never below it. With no curve
+    //     points it is the offer's one yield at every maturity.
+    //   1 minimum and 2 maximum blocks left to maturity
+    //   3 ERG batcher fee per fill, and expiry refund fee for either market, nanoERG. A fill
+    //     needs at least 100000000 (0.1 ERG); an offer below it never fills, and its owner cancels
+    //     it or anyone refunds it after expiry.
+    //   4 lender fee reserve to put in a NEW bond (bond R9(0)), nanoERG, exact; the FI order
+    //     refuses a bond born with less than 100000000
+    //   5 collateral floor in basis points of the repayment, and 8 maximum oracle age in
+    //     blocks: read only by the collateral policy expression
+    //   6 expiry height; fills require HEIGHT < expiry, and from then on anyone may refund
+    //   7 minimum price of one fill, in raw units of the repayment asset (see LIMITS for small
+    //     loans)
+    //   9 and 10 are not read (in ZC_Standard_LendOffer they bound share purchases)
+    //   Token offers additionally commit (unchanged through every continuation):
+    //   11 original capital, raw token units, positive
+    //   12 original total ERG spending budget, excluding 1000000 plus the expiry refund fee
+    //   13 minimum fill, basis points of ORIGINAL capital, 100..10000 (at least 1%)
+    //   14 original batcher reward budget, positive and below the total spending budget
+    //   A token fill pays floor(R5(14) * price / R5(11)), never rounded up to the fee floor: a
+    //   fee so calculated below 100000000 rejects the fill. Total ERG outflow, including box
+    //   funding and new-bond reserve, is at most floor(R5(12) * price / R5(11)). Splitting cannot
+    //   increase either allowance. The continuation retains 1000000 plus the expiry refund fee.
+    //   Then the yield curve, from index 11 (ERG) or 15 (token): 0 to 20 points, each two values
+    //   (yield bps, blocks left to maturity). Blocks left strictly increase from point to point.
+    // R6: Coll[Byte] - policy hash (32 bytes), optionally followed by the predecessor offer id
+    //   (32 bytes). Every fill's continuation must set that suffix to SELF.id. The policy is an
+    //   expression supplied in context var 1 and run with this offer as SELF; it is the whole
+    //   collateral decision. FI_Standard_ERG_SigUSD_CollateralPolicy is one: it reads R5(5) and
+    //   R5(8), requires the bond's agreed liquidation expression, a covenant ratio R6(12) at or
+    //   above the floor and an oracle age R6(14) at or above R5(8), and collateral worth, now, the
+    //   floor plus a new bond's fee reserve plus (when the cover moves with the price) one Record
+    //   bounty, and at least the bond's own ratio.
+    // R7: Coll[Long] - bounds on the bond's coupon schedule, exactly 5 values:
+    //   0 minimum coupon, raw units of the repayment asset: bond R6(7) >= it
+    //   1 minimum coupon count, >= 1: bond R6(8) >= it. With no coupon there is no checkpoint,
+    //     and the covenant is never tested.
+    //   2 maximum gap in blocks between covenant tests: start to first due height (R6(9)), the
+    //     period R6(10), and the last recordable checkpoint (below) to maturity must each be at
+    //     most this. With no recordable checkpoint the gap is the bond's whole life.
+    //   3 maximum grace: bond R6(11) <= it
+    //   4 maximum cure window: bond R6(13) <= it
+    //   Every bond bought here has the grace no longer than the period, R6(11) <= R6(10): the FI
+    //   order requires it whenever there are coupons, and R7(1) >= 1 means there are. With one
+    //   coupon the period still counts: it must lie between the grace and R7(2).
+    //
+    // RECORDABLE CHECKPOINTS
+    // Checkpoint k is coupon k's due height, start + R6(9) + k * R6(10). The bond accepts Record
+    // breach (opening a breach when its covenant expression finds the collateral below the
+    // ratio) from a checkpoint to checkpoint + grace, only below maturity - 720, and not in its
+    // quiet zone: the last max(2, min(720, grace / 2)) blocks before the next unpaid coupon's
+    // miss height (due + grace). The last recordable checkpoint counted here is the last one
+    // whose window closes by maturity - 721 (due + grace <= maturity - 721). The FI order gives
+    // every covenant bond a grace of at least 30, so no quiet zone covers its due heights, and
+    // puts the first due height at or after the fill, so each such checkpoint can be recorded
+    // at its own due height unless the bond is liquidatable or a breach is already open. The
+    // gaps R7(2) bounds are therefore the gaps between tests.
+    //
+    // THE YIELD CURVE
+    // The yield required for a bond with D blocks left is the curve's yield at D, and never less
+    // than R5(0). Between two neighbouring points it falls on the straight line joining them;
+    // below the first point it is the first point's yield, above the last the last's. R5(1) and
+    // R5(2) still decide which maturities are bought at all. With no points the yield is R5(0).
+    // On a segment from (y1, D1) to (y2, D2) the yield is Y / L, with L = D2 - D1 and
+    // Y = y1 * L + (y2 - y1) * (D - D1), so the test below multiplies through by L: no division,
+    // no rounding. A flat yield has L = 1. A curve with points out of order is refused.
+    //
+    // THE YIELD TEST (for one whole bond unit)
+    // Paying price P now for repayment R at maturity, with D blocks left, must satisfy
+    //   R * 10000 * 262800 * L >= P * (10000 * 262800 * L + Y * D).
+    // R is the bond's R6(0); coupons are not counted. D is the bond's maturity R9(2) less HEIGHT
+    // and must be above 0. P is the principal of a new bond or what the seller's payout holds.
+    // For an ERG offer P includes the batcher fee, so the yield is net of it; a token offer pays
+    // that fee in nanoERG outside the test.
+    //
+    // CONTEXT VARS
+    // 0 Int continuation index, or the refund index after expiry (every path but cancel). A fill
+    // also needs 1 Coll[Byte] the collateral policy expression.
+    // Buying from an ask also needs: 2 Int ask input index; 3 Int data-input index of the bond's
+    // state box; 4 Coll[Byte] the serialized order box that minted the bond asset; 5 Int delivery
+    // output index; 7 Int the seller's payout output index. The absence of var 2 selects a
+    // new-bond fill, which also requires var 3 absent. Var 6 is not read.
+    //
+    // THE ASK CONVENTION (what this offer expects of the box at var 2, whatever its script)
+    // tokens(0) is the token for sale. R4: Coll[Byte] is blake2b256 of the seller script. A fill
+    // pays one payout box at the seller script with R4 = the ask's box id and R5: Long = the raw
+    // units it pays for, holding the payment: its nanoERG for an ERG price, its tokens(0) for a
+    // token price. The ask's own script must enforce that R5; ZC_Standard_SaleOrder does.
+    // The offer's price is whatever that payout holds: it never reads the ask's price. It
+    // requires the payout's R5 to be 1, the unit delivered here, and the payout to be neither
+    // the continuation nor the delivery. Only one unit of a bond asset circulates (the bond
+    // holds the other 2), so the ask cannot have sold more than that unit, and anything above
+    // the ask's own price reaches the seller, not the batcher.
+    //
+    // NEW BOND (var 2 absent)
+    // INPUTS(0) is an FI_Standard_Order (CONST_ORDER_HASH), whose own script validates the bond
+    // at OUTPUTS(1) and pays the borrower at OUTPUTS(2). OUTPUTS(0) is the delivery. Checked
+    // here: the order box was created fewer than 1051200 blocks before HEIGHT (an older box can
+    // be spent under storage rent without its script running), the bond asset is the order's
+    // id, the delivery holds 1 unit of it, the bond's principal is this offer's asset, and the
+    // bond's fee reserve R9(0) equals R5(4). That order only lends in the repayment asset alone
+    // (a token loan carries at most 1000000 nanoERG beside it), so the principal is the price
+    // with no further check: bond R6(1) nanoERG for ERG, the amount of the R7 principal token for
+    // a token.
+    //
+    // EXISTING BOND (var 2 present)
+    // The ask sells one unit of asset X and is paid through its payout.
+    // Origin: var 4 hashes to X, so it is the box whose spending minted X, its script is the
+    //   FI order, and it was created fewer than 1051200 blocks before HEIGHT. Since it was spent
+    //   before HEIGHT, its script ran, which proves X was minted by the order's rules: supply 3,
+    //   2 locked in the bond. So an offer cannot buy a bond whose origin order is 1051200 or more
+    //   blocks old.
+    // State: the data input holds 2 units of X under CONST_BOND_HASH, so it is the live bond and
+    //   its registers are the terms; its principal must be this offer's asset. A settled bond (the
+    //   vault holds the 2 units) is not bought.
+    // Not liquidatable, as the bond counts it: at least as many coupons paid, R9(3), as missed
+    //   (coupon k is missed from its due height plus the grace), and no open breach at or past
+    //   its deadline R9(5). Maturity is excluded by the yield test's D > 0.
+    // No fee reserve leaves the offer on this path.
+    //
+    // DELIVERY
+    // A box at the owner script holding only (X, 1), at least 1000000 nanoERG, R7 = SELF.id,
+    // created at HEIGHT - 999 or later. The owner hash may not be CONST_MINT_HASH.
+    // On a new-bond fill it is OUTPUTS(0), which the FI order also requires to carry the EIP-4
+    // name and description in R4 and R5 and the decimals "0" in R6.
+    //
+    // WHAT MAY LEAVE THE BOX
+    // The price, the batcher fee, the delivery funding, a new bond's fee reserve, and at most
+    // 1000000 nanoERG of box minimum on a token offer. Everything else stays in the continuation.
+    // The delivery and continuation are tagged with SELF.id, so independent offers may fill in
+    // one transaction. Neither output can satisfy another offer. Additional inputs and
+    // independent matches are allowed.
+    //
+    // EXPIRY REFUND (anyone, once HEIGHT >= R5(6))
+    // Var 0 names the refund: at the owner script, R4 = this box's id, no R5, created at
+    // HEIGHT - 999 or later, every token of this box, and at least this value less R5(3). It
+    // reads only R4 and R5 (whose length must still be valid), so it works whatever R6 and R7
+    // hold. Several offers may be refunded in one
+    // transaction, each to its own tagged output.
+    //
+    // CANCEL
+    // Any other input whose script hashes to R4, created fewer than 1051200 blocks before HEIGHT
+    // (an older box can be spent under storage rent without its script running), releases this
+    // box at any height, unchecked.
+    //
+    // OWNER SCRIPTS
+    // The owner script must be one that only its owner can spend in every instance: P2PK,
+    // multisig, or a contract whose keys are compiled-in constants. Anyone can create a box at a
+    // script that reads its authority from its own registers, so naming one lets anyone cancel
+    // this offer and take everything it holds, and take a delivery, whose registers other than
+    // R7 the batcher writes. FI_Standard_FractionalMint and FI_Standard_FractionalVault can be
+    // instantiated by anyone and must never be the owner hash. Builders should refuse any other
+    // kind of owner script.
+    //
+    // LIMITS
+    // - Best execution is not enforced. The offer never does worse than its terms, but a batcher
+    //   chooses which ask it meets.
+    // - The covenant is tested at coupon checkpoints only: R7(2) bounds the gap between tests,
+    //   not how far the collateral can fall within one.
+    // - The bounds apply to the schedule as written: an existing bond is judged on its whole
+    //   coupon count, whatever it has already paid, and its coupons are not counted in the yield.
+    // - Settled bonds and shares are not bought: only whole units of a live bond.
+    // - A fill always leaves a continuation; dust left in it comes back by cancelling or at expiry.
+    // - A purchase is judged at the payout's whole value. One priced below the minimum box value
+    //   in nanoERG is therefore judged at that minimum.
+    // - No bond whose origin order is 1051200 or more blocks old can be bought, new or existing.
+    // - Small loans whose cover moves with the oracle price: one recorded breach takes up to
+    //   0.5 ERG from the collateral, so the lender can be left with less than the repayment when
+    //   (ratio - 100%) x repayment is under 0.5 ERG. The protection is the minimum fill R5(7):
+    //   keep it above 0.5 ERG / (floor - 100%) worth of the repayment asset (about 1.67 ERG at
+    //   a 130% floor, 1 ERG at 150%).
+    //   That bounds the repayment only. To stay whole on the fee reserve R5(4) as well when someone
+    //   else liquidates, use (0.5 ERG + R5(4)) / (floor - 100%), plus the batcher fee on a token
+    //   offer. On a SigUSD offer convert at the highest ERG price expected before the expiry.
+    // - A bond's 0.01 ERG Refresh bounty is paid only from maturity on; on a bond box older than
+    //   525600 blocks it can be taken in the maturity block, outside the policy's allowance.
+    // - The collateral policy values collateral at one oracle pool box; see
+    //   FI_Standard_ERG_SigUSD_CollateralPolicy.
+    // - This box has no refresh path. Left 1051200 blocks it can be spent under storage rent,
+    //   and taken whole if its value does not cover the fee; set the expiry well before that.
+
+    val ownerHash = SELF.R4[Coll[Byte]].get
+    val ownerAuth = INPUTS.exists { (b: Box) =>
+        b.id != SELF.id && blake2b256(b.propositionBytes) == ownerHash &&
+        b.creationInfo._1 > HEIGHT - 1051200
+    }
+
+    if (ownerAuth) {
+        sigmaProp(true)
+    } else {
+        val terms = SELF.R5[Coll[Long]].get
+        val nextIndex = getVar[Int](0).get
+        // Taken from the box so the compiler cannot fold the constant into the template.
+        val lendsERG = CONST_REPAYMENT_TOKEN == SELF.id.slice(0, 0)
+        // Where the yield curve starts: after the fixed terms of this market.
+        val base = if (lendsERG) 11 else 15
+
+        if (terms.size < base || terms.size > base + 40 || (terms.size - base) % 2 != 0 ||
+            nextIndex < 0 || nextIndex >= OUTPUTS.size) {
+            sigmaProp(false)
+        } else if (HEIGHT.toLong >= terms(6)) {
+            // Expiry refund, by anyone: everything goes back to the owner, less the fee R5(3).
+            val refund = OUTPUTS(nextIndex)
+            sigmaProp(
+                blake2b256(refund.propositionBytes) == ownerHash &&
+                refund.R4[Coll[Byte]].get == SELF.id &&
+                refund.creationInfo._1 > HEIGHT - 1000 &&
+                refund.R5[Coll[Byte]].isDefined == false &&
+                refund.tokens == SELF.tokens &&
+                refund.value >= SELF.value - terms(3)
+            )
+        } else {
+            // R6 and R7 are read only here, so a box with either malformed still refunds.
+            val bounds = SELF.R7[Coll[Long]].get
+            val policyRecord = SELF.R6[Coll[Byte]].get
+            val policyHash = policyRecord.slice(0, 32)
+            if ((policyRecord.size != 32 && policyRecord.size != 64) || bounds.size != 5) {
+                sigmaProp(false)
+            } else {
+                val next = OUTPUTS(nextIndex)
+                val saleIndex = getVar[Int](2)
+                val primary = !saleIndex.isDefined
+
+                val bond = if (primary) OUTPUTS(1) else CONTEXT.dataInputs(getVar[Int](3).get)
+                val unit = if (primary) OUTPUTS(0) else OUTPUTS(getVar[Int](5).get)
+                val asset = bond.tokens(0)._1
+                val borrower = bond.R6[Coll[Long]].get
+                val lender = bond.R9[Coll[Long]].get
+                val principalTokens = bond.R7[Coll[(Coll[Byte], Long)]].get
+                // The token delivered and how many raw units of it: exactly 1 bond unit.
+                val traded = unit.tokens(0)._1
+                val units = unit.tokens(0)._2
+
+                // What the offer pays, in raw units of the repayment asset.
+                val price = if (primary) {
+                    if (lendsERG) borrower(1) else principalTokens(0)._2
+                } else {
+                    // Whatever the seller's payout holds. The ask's own price is never read.
+                    val payout = OUTPUTS(getVar[Int](7).get)
+                    if (lendsERG) {
+                        payout.value
+                    } else if (payout.tokens.size > 0 && payout.tokens(0)._1 == CONST_REPAYMENT_TOKEN) {
+                        payout.tokens(0)._2
+                    } else 0L
+                }
+
+                val batcherFee = if (lendsERG) terms(3)
+                    else if (terms(11) > 0L && terms(14) > 0L && price > 0L && price <= terms(11)) {
+                        (terms(14).toBigInt * price.toBigInt / terms(11).toBigInt).toLong
+                    } else 0L
+
+                val sourceValid = if (primary) {
+                    // The order lends in the repayment asset alone, so its principal is the price.
+                    val order = INPUTS(0)
+                    !(getVar[Int](3).isDefined) &&
+                    blake2b256(order.propositionBytes) == CONST_ORDER_HASH &&
+                    HEIGHT.toLong - order.creationInfo._1.toLong < 1051200L &&
+                    asset == order.id && traded == asset && units == 1L &&
+                    (if (lendsERG) principalTokens.size == 0
+                        else principalTokens.size == 1 && principalTokens.forall { (t: (Coll[Byte], Long)) =>
+                            t._1 == CONST_REPAYMENT_TOKEN
+                        }) &&
+                    lender(0) == terms(4)
+                } else {
+                    val sale = INPUTS(saleIndex.get)
+                    val payoutIndex = getVar[Int](7).get
+                    val payout = OUTPUTS(payoutIndex)
+                    val originBytes = getVar[Coll[Byte]](4).get
+                    val origin = Global.deserializeTo[Box](originBytes)
+                    // The ask convention. No ask script is pinned: the payout goes to the seller
+                    // the ask names, is tagged with the ask, and pays for exactly the unit
+                    // delivered. Then the origin order, the live state box, and the bond's own
+                    // liquidatable test.
+                    sale.id != SELF.id &&
+                    sale.tokens.size > 0 && sale.tokens(0)._1 == traded &&
+                    traded == asset && units == 1L &&
+                    blake2b256(payout.propositionBytes) == sale.R4[Coll[Byte]].get &&
+                    payout.R4[Coll[Byte]].get == sale.id &&
+                    payout.R5[Long].get == units &&
+                    payoutIndex != nextIndex && payoutIndex != getVar[Int](5).get &&
+                    blake2b256(originBytes) == asset &&
+                    blake2b256(origin.propositionBytes) == CONST_ORDER_HASH &&
+                    HEIGHT.toLong - origin.creationInfo._1.toLong < 1051200L &&
+                    blake2b256(bond.propositionBytes) == CONST_BOND_HASH &&
+                    (if (lendsERG) principalTokens.size == 0
+                        else principalTokens.size == 1 && principalTokens.forall { (t: (Coll[Byte], Long)) =>
+                            t._1 == CONST_REPAYMENT_TOKEN
+                        }) &&
+                    bond.tokens(0)._2 == 2L &&
+                    // Not liquidatable, as the bond counts it: at least as many coupons paid as
+                    // missed, and no open breach at or past its deadline.
+                    lender(3) >= (if (HEIGHT.toLong < lender(1) + borrower(9) + borrower(11)) 0L
+                        else min(borrower(8), (HEIGHT.toLong - lender(1) - borrower(9) - borrower(11)) / borrower(10) + 1L)) &&
+                    (lender(5) == 0L || HEIGHT.toLong < lender(5))
+                }
+
+                // The schedule, as the bond counts it, inside the lender's bounds. The bond is one
+                // the FI order created, which keeps its terms in the bond's clamps and every
+                // coupon due before maturity, so nothing here overflows or divides by zero.
+                val count = borrower(8)
+                val period = borrower(10)
+                val firstDue = lender(1) + borrower(9)
+                // The last checkpoint whose window (due + grace) closes by maturity - 721 is the
+                // last counted as tested; with the grace no longer than the period (the FI order's
+                // rule) it can be recorded at its due height. With none, the gap runs from start.
+                val recordable = lender(2) - 721L - firstDue - borrower(11)
+                val lastTested = if (recordable < 0L) lender(1)
+                    else firstDue + min(count - 1L, recordable / period) * period
+                val scheduleValid =
+                    bounds(1) >= 1L && count >= bounds(1) && borrower(7) >= bounds(0) &&
+                    borrower(9) <= bounds(2) && period <= bounds(2) && lender(2) - lastTested <= bounds(2) &&
+                    borrower(11) <= bounds(3) && borrower(13) <= bounds(4)
+
+                // Fills run only before the expiry, R5(6); from then on this box can only be
+                // refunded or cancelled.
+                val remaining = lender(2) - HEIGHT.toLong
+                val year = 2628000000L.toBigInt // 10000 basis points * 262800 blocks
+                val cost = if (lendsERG) price + batcherFee else price
+
+                // The yield curve: points of (yield bps, blocks left) after the fixed terms.
+                val curve = terms.slice(base, terms.size)
+                val points = curve.size / 2
+                // Blocks left strictly increase from point to point (odd positions hold them).
+                val ordered = curve.indices.forall { (j: Int) => j % 2 == 0 || j < 3 || curve(j) > curve(j - 2) }
+                // How many points lie at or below the bond's blocks left: the segment it falls on.
+                val below = curve.indices.filter { (j: Int) => j % 2 == 1 && curve(j) <= remaining }.size
+                val flat = points == 0 || below == 0 || below == points
+                // The required yield as rate / span, exactly. Flat ends and an empty curve have
+                // span 1.
+                val span = if (flat) 1L.toBigInt else (curve(2 * below + 1) - curve(2 * below - 1)).toBigInt
+                val rate = if (points == 0) {
+                    terms(0).toBigInt
+                } else if (below == 0) {
+                    curve(0).toBigInt
+                } else if (below == points) {
+                    curve(curve.size - 2).toBigInt
+                } else {
+                    val low = 2 * (below - 1)
+                    curve(low).toBigInt * span +
+                        (curve(low + 2).toBigInt - curve(low).toBigInt) * (remaining - curve(low + 1)).toBigInt
+                }
+                val floorRate = terms(0).toBigInt * span
+                val required = if (rate < floorRate) floorRate else rate
+
+                val termsValid =
+                    terms(0) >= 0L && batcherFee >= 100000000L && ordered &&
+                    remaining > 0L && remaining >= terms(1) && remaining <= terms(2) &&
+                    price > 0L && price >= terms(7) &&
+                    borrower(0).toBigInt * year * span >=
+                        cost.toBigInt * (year * span + required * remaining.toBigInt)
+
+                // The unit goes straight to the owner script, tagged with this offer's id.
+                val delivered =
+                    unit.tokens.size == 1 && unit.value >= 1000000L &&
+                    unit.creationInfo._1 > HEIGHT - 1000 &&
+                    blake2b256(unit.propositionBytes) == ownerHash && ownerHash != CONST_MINT_HASH &&
+                    unit.R7[Coll[Byte]].get == SELF.id
+
+                // nanoERG that may leave: fee, delivery, a new bond's reserve, and either the ERG
+                // price or the box minimum that rides with a token payment.
+                val reserve = if (primary) lender(0) else 0L
+                val ergBesidePrice = if (lendsERG) price else if (primary) borrower(1) else 1000000L
+                val ergOut = batcherFee + 1000000L + reserve + ergBesidePrice
+                val capitalKept = if (lendsERG) {
+                    next.tokens.size == 0 && SELF.tokens.size == 0 &&
+                    next.value >= SELF.value - ergOut
+                } else {
+                    val have = if (SELF.tokens.size == 1 && SELF.tokens(0)._1 == CONST_REPAYMENT_TOKEN) {
+                        SELF.tokens(0)._2
+                    } else 0L
+                    val left = have - price
+                    val original = terms(11)
+                    val budget = terms(12)
+                    val minPercent = terms(13)
+                    original > 0L && have <= original && budget > 0L &&
+                    terms(3) >= 100000000L && terms(14) > 0L && terms(14) < budget &&
+                    minPercent >= 100L && minPercent <= 10000L &&
+                    price.toBigInt * 10000L.toBigInt >= original.toBigInt * minPercent.toBigInt &&
+                    (SELF.value.toBigInt - next.value.toBigInt) * original.toBigInt <= budget.toBigInt * price.toBigInt &&
+                    next.value.toBigInt >= 1000000L.toBigInt + terms(3).toBigInt &&
+                    left >= 0L &&
+                    next.value >= SELF.value - ergOut &&
+                    (if (left == 0L) next.tokens.size == 0
+                     else next.tokens.size == 1 && next.tokens(0)._1 == CONST_REPAYMENT_TOKEN &&
+                          next.tokens(0)._2 == left)
+                }
+
+                val continued =
+                    next.propositionBytes == SELF.propositionBytes &&
+                    next.creationInfo._1 > HEIGHT - 1000 &&
+                    next.R8[Coll[Byte]].isDefined == false &&
+                    next.R4[Coll[Byte]].get == ownerHash &&
+                    next.R5[Coll[Long]].get == terms &&
+                    next.R6[Coll[Byte]].get == policyHash ++ SELF.id &&
+                    next.R7[Coll[Long]].get == bounds
+
+                // The policy in var 1 must hash to R6's first 32 bytes; it runs with this box
+                // as SELF.
+                val policyAgreed = blake2b256(getVar[Coll[Byte]](1).get) == policyHash
+
+                sigmaProp(
+                    sourceValid && scheduleValid && termsValid && delivered && capitalKept &&
+                    continued && policyAgreed
+                ) && executeFromVar[SigmaProp](1)
+            }
+        }
+    }
+}

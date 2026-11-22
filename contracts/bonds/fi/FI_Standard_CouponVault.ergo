@@ -1,0 +1,193 @@
+{
+    // FI_Standard_CouponVault.ergo - the coupon pool of an FI bond, held for the bond's unit holder
+    // Author: CannonQ (2026)
+    //
+    // Holds coupons that FI_Standard_Bond's Pay path has paid for bond asset X. Each Pay creates a
+    // pool box, or spends existing pools and tops them up into one, so one asset may have several
+    // pools at once. The holder of X's one circulating unit collects them; a spend of the box
+    // holding the other 2 units must carry forward every pool it includes. No other path takes a
+    // pool: the borrower has no claim on a coupon once paid. No constants: the bond's Pay path
+    // checks the register.
+    //
+    // VALUE AND TOKENS
+    // ERG bond: the coupons are the box value and the box holds no token. Token bond: the coupons
+    // are its one token, the repayment token, beside a minimum value. Pay creates the box so, and
+    // no path here adds a token id.
+    //
+    // REGISTERS (written by the bond's Pay path, carried unchanged)
+    // R4: Coll[Byte] - bond asset id X. X has supply 3: 1 circulating unit and 2 kept together in
+    //   the bond box or, after settlement, in ZC_Standard_BondVault (the "2-unit box").
+    // No R5 or later register: Pay creates the box with R4 alone, and every successor asked for
+    //   here has R4 alone.
+    //
+    // CONTEXT VARIABLES
+    // 9: Int - successor output index; its presence selects Refresh. No other path reads a var.
+    //
+    // Below, a pool of X is an input at this script with R4 = X, and an output carries a set of
+    // boxes when it holds at least their summed nanoERG and, of each token id in this box, at
+    // least their summed amount. The cut is 1/200 (0.5%), rounded down, of what the inputs at this
+    // script hold together: of their nanoERG, and of each token id in this box. It is reckoned on
+    // the pools alone, never on the home or the 2-unit box, and is 0 below 200 units.
+    //
+    // COLLECT (the unit holder)
+    // The inputs hold 1 or 3 units of X in all; the outputs hold the same number, or none when the
+    // inputs hold 3 (the burn of ZC_Standard_BondVault's claim). In a transaction that spends a
+    // pool the unit cannot be burned alone.
+    // Exactly one input holds exactly 1 unit: the unit's home. The home must have been created
+    // fewer than 1051200 blocks before HEIGHT, so its own script ran: an older box can be spent
+    // under storage rent without it. Then either
+    // - the home is a P2PK box in the canonical 36-byte form (0008cd + 33-byte key), which needs
+    //   its key's signature to spend; the outputs are free. A multisig or any other key encoding
+    //   counts as a contract home. Because the outputs are free, a signature on any transaction
+    //   that spends the unit box releases the pools beside it: whoever builds a transaction the
+    //   key signs can add the bond's pools and take them. Wallets should keep the unit box out of
+    //   automatic coin selection for dApp transactions; or
+    // - the home is a contract: one output at the home's script holds the unit and carries every
+    //   input at the home's script, every input holding X, and every input at this script, of any
+    //   asset, short by at most the cut in nanoERG and in each token. When all 3 units are burned
+    //   that output holds no X and must instead have the home's tokens(0), id and amount, as its
+    //   own tokens(0) (for FI_Standard_FractionalVault, its share reserve), and it may also be
+    //   short by up to the smaller of the home's R5(2) and the home's own value, in nanoERG: R5(2)
+    //   is the pull fee of the ZC and FI fractional vaults and ZC_Standard_DutchAuctionVault, which
+    //   their own pull lets the puller keep. A home whose R5 is not a Coll[Long] of 3 or more
+    //   cannot collect at a burn. So the coupons follow the unit, or its settlement, on top of what
+    //   those held, less the cut, which whoever sends the transaction may keep.
+    // One transaction may collect as many pools as its cost limit allows; each pool's script
+    // reads every input, so the cost grows with the square of the pool count.
+    //
+    // TOP-UP (a spend of the 2-unit box without the unit)
+    // The inputs hold exactly 2 units of X. Some output at this script with R4 = X and no R5,
+    // created at HEIGHT - 999 or later, with no more token entries than this box and only token
+    // ids this box holds, carries every pool of X, with no cut. Every pool asks the same, so
+    // nothing a pool held can leave and the output keeps this box's token ids. Pay adds the
+    // coupon on top by the bond's own rule; any other spend of the bond box or the settlement
+    // vault that includes a pool can only merge or re-create it.
+    //
+    // REFRESH (anyone, once the box is more than 525600 blocks, about two years, old)
+    // Storage rent lets anyone take a four-year-old box whose value does not cover the rent,
+    // tokens included. So anyone may re-create the box to reset its age, keeping up to 10000000
+    // nanoERG (0.01 ERG) as a bounty but never taking the value below 1000000 (a box at or under
+    // that is renewed for nothing). The successor (var 9) has this script, the same tokens and R4
+    // and no R5, and a creation height within 1000 blocks of HEIGHT. This box must be the only
+    // input at this script, so two pools cannot be renewed into one successor.
+    // Pay and a top-up stamp a pool within 1000 blocks of HEIGHT, so no pool reaches the rent age
+    // (1051200 blocks) before about that long after the bond's start. A token pool's nanoERG is
+    // whatever its creator put beside the token, usually the box minimum, below the storage fee:
+    // left that long, it can be taken whole, coupons included.
+    //
+    // ASSUMPTIONS AND LIMITS
+    // - Only a box that a genuine FI bond's Pay created or topped up is a coupon pool; a box made
+    //   by hand here is spendable by whoever holds the named asset's unit.
+    // - Never send the unit of X to this script with R4 = X. The box then counts as its own home
+    //   and as a pool at once, no collect, top-up or burn can be satisfied, only a refresh spends
+    //   it, and so the unit never leaves and the bond's settlement can never be claimed. Builders
+    //   refuse this script as a destination for any unit.
+    // - A contract home whose successor cannot take the coupons cannot collect them: a token coupon
+    //   where it takes no new token (ZC_Standard_FractionalVault), an ERG coupon where it takes no
+    //   extra nanoERG, and any coupon at a 3-unit burn when the home's tokens(0) is X itself or its
+    //   payout does not keep that token first. Such a pool stays at this script: while the unit
+    //   survives, and the other 2 units stay together, it is collected once the unit moves to a
+    //   home that can take it; after a 3-unit burn it has no collector (below).
+    // - At a burn the payout is told apart only by the home's tokens(0). If another box can hold
+    //   that same entry, a box at the home's script owned by someone else can stand as the payout.
+    // - The home's R5(2) is trusted at a burn. At a contract home that lets anyone burn its unit
+    //   beside the 2-unit box and whose R5(2) means something else, the sender may keep up to the
+    //   smaller of that and the home's own value out of the pools' value, as well as the cut.
+    // - A pool left out of the transaction that burns all 3 units has no collector afterwards: no
+    //   one can take it, and only a refresh can spend it, re-creating it unchanged. A transaction
+    //   shows only the boxes it spends, so nothing stops that burn from leaving a pool out.
+    //   Whoever sends the burn keeps the cut on the pools it includes, which is the incentive to
+    //   include them all. Builders must find and include every unspent pool of X whose tokens are
+    //   the repayment token or none (a pool holding another token makes the burn fail), and must
+    //   refresh a share-vault home 1051200 or more blocks old before a pull that carries pools.
+    // - Storage rent after maturity: FI_Standard_Order caps a bond's life at 788400 blocks, so a
+    //   box stamped near the bond's start (the bond, a unit box held since the fill, a share vault
+    //   never absorbed, the earliest pools) reaches the rent age about 262800 blocks after a
+    //   full-life maturity. A box taken whole frees what it holds: a 2-unit box frees the pools;
+    //   a 1-unit box (a unit box, or a share vault before the pull) frees the settlement and the
+    //   pools.
+    // - Through a contract home the payout carries every nanoERG of the home's inputs but, at a
+    //   burn, the smaller of the home's R5(2) and its own value: beside a pool a home pays its
+    //   caller from its own value only that pull fee, and the cut from the pools.
+    // - A refresh relies on someone sending it within the two years before rent is due.
+
+    val asset = SELF.R4[Coll[Byte]].get
+    val held = { (b: Box) =>
+        b.tokens.fold(0L, { (z: Long, t: (Coll[Byte], Long)) => if (t._1 == asset) z + t._2 else z })
+    }
+    val shown = INPUTS.fold(0L, { (a: Long, b: Box) => a + held(b) })
+    val left = OUTPUTS.fold(0L, { (a: Long, b: Box) => a + held(b) })
+    // The unit's home. While the bond or its settlement vault holds the other 2 units together,
+    // only the unit's box holds exactly 1.
+    val homes = INPUTS.filter { (b: Box) => held(b) == 1L }
+    // Every input at this script, whatever its asset.
+    val vaults = INPUTS.filter { (b: Box) => b.propositionBytes == SELF.propositionBytes }
+    // What the cut is reckoned on: the pools at a collect, nothing at a top-up.
+    val cutFrom = vaults.filter { (b: Box) => shown != 2L }
+    // Output x._1 carries the boxes x._2._1, short by at most the cut and, in nanoERG, x._2._2.
+    val carries = { (x: (Box, (Coll[Box], Long))) =>
+        val bs = x._2._1
+        val erg: Long = bs.fold(0L, { (a: Long, b: Box) => a + b.value })
+        val ergCut: Long = cutFrom.fold(0L, { (a: Long, b: Box) => a + b.value })
+        x._1.value >= erg - ergCut / 200L - x._2._2 && SELF.tokens.forall { (t: (Coll[Byte], Long)) =>
+            val amt = { (b: Box) =>
+                b.tokens.fold(0L, { (z: Long, u: (Coll[Byte], Long)) => if (u._1 == t._1) z + u._2 else z })
+            }
+            val need: Long = bs.fold(0L, { (a: Long, b: Box) => a + amt(b) })
+            val pooled: Long = cutFrom.fold(0L, { (a: Long, b: Box) => a + amt(b) })
+            amt(x._1) >= need - pooled / 200L
+        }
+    }
+    val refreshIndex = getVar[Int](9)
+
+    if (refreshIndex.isDefined) {
+        // Refresh: re-create the box unchanged to reset its age, paying the refresher. This box
+        // must be the only input at this script.
+        val index = refreshIndex.get
+        if (index < 0 || index >= OUTPUTS.size || vaults.size != 1) {
+            sigmaProp(false)
+        } else {
+            val next = OUTPUTS(index)
+            val stamped = next.creationInfo._1
+            val kept = if (SELF.value < 1000000L) SELF.value else 1000000L
+            val least = if (SELF.value - 10000000L > kept) SELF.value - 10000000L else kept
+            sigmaProp(
+                SELF.creationInfo._1 < HEIGHT - 525600 &&
+                stamped > HEIGHT - 1000 && stamped <= HEIGHT &&
+                next.propositionBytes == SELF.propositionBytes &&
+                next.value >= least &&
+                next.tokens == SELF.tokens &&
+                next.R4[Coll[Byte]].get == asset &&
+                next.R5[Coll[Byte]].isDefined == false
+            )
+        }
+    } else {
+        val collect = (shown == 1L || shown == 3L) && (left == shown || (shown == 3L && left == 0L)) &&
+            homes.size == 1 && homes.forall { (h: Box) =>
+                val home = h.propositionBytes
+                val isKey = home.size == 36 && home.slice(0, 3) == fromBase16("0008cd")
+                // Every home is younger than the storage-rent age, so its own script ran.
+                // P2PK home: spending it needs its key's signature; the outputs are free.
+                h.creationInfo._1 > HEIGHT - 1051200 && (isKey ||
+                // Contract home: the payout is the output at the home's script holding the unit
+                // or, all 3 burned, holding the home's tokens(0) as its own tokens(0).
+                (!isKey && OUTPUTS.exists { (p: Box) =>
+                    held(p) == min(left, 1L) && p.propositionBytes == home &&
+                    (left > 0L || (p.tokens.size > 0 && p.tokens(0) == h.tokens(0))) &&
+                    carries((p, (INPUTS.filter { (b: Box) => b.propositionBytes == home || held(b) > 0L }.append(vaults),
+                        if (left > 0L) 0L else min(h.R5[Coll[Long]].get(2), h.value))))
+                }))
+            }
+        // Top-up: every pool of this asset carried into one output with R4 alone.
+        val pools = vaults.filter { (b: Box) => b.R4[Coll[Byte]].get == asset }
+        val topUp = shown == 2L && OUTPUTS.exists { (p: Box) =>
+            p.propositionBytes == SELF.propositionBytes && p.creationInfo._1 > HEIGHT - 1000 &&
+            p.R4[Coll[Byte]].get == asset &&
+            p.R5[Coll[Byte]].isDefined == false &&
+            p.tokens.size <= SELF.tokens.size &&
+            p.tokens.forall { (t: (Coll[Byte], Long)) => SELF.tokens.exists { (u: (Coll[Byte], Long)) => u._1 == t._1 } } &&
+            carries((p, (pools, 0L)))
+        }
+        sigmaProp(collect || topUp)
+    }
+}
