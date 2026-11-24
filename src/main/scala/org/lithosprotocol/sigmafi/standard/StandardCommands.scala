@@ -229,6 +229,9 @@ object StandardCommands {
           else s"from height ${b.recollateralizableFrom}"))
       if (!app.originVerified(b)) println("  WARNING: its asset was not minted by a standard order: this box proves nothing")
       else ExchangeCommands.metadataLine(app.bondMetadataIssues(b.asset))
+      if (b.collateral.size > StandardProtocol.MaxCollateralTokens)
+        println(s"  WARNING: carries ${b.collateral.size} distinct collateral tokens (over the ${StandardProtocol.MaxCollateralTokens}-token " +
+          "cap for Dutch/Selective share vaults to pull under Ergo's 4,096-byte box limit)")
       if (app.isOwnHash(b.borrowerHash)) println("  (you are its borrower)")
       if (app.walletAvailable && app.walletHolds(b.asset)) println("  (you hold its bond asset)")
     }

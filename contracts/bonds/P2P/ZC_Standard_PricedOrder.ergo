@@ -29,7 +29,7 @@
     //   Payout R4 = SELF.id, so another input's payment cannot also count as this principal.
     // Price expressions add a minimum payment; they cannot change repayment, maturity rules,
     //   collateral, borrower, liquidation expression, fees or mint supply. Overpayment is allowed
-    //   only when the resolved principal records it. No future accrued value starts from a stale P.
+    //   only when the resolved principal records it, so consumers never read a stale principal P.
     // Yield quotes are conditional on repayment; they neither value collateral nor guarantee return.
     // A borrower chooses the pricing/guard expressions; hashes commit to bytes, not their safety.
     // Refund/cancel paths deliberately do not read pricing/guard registers, including malformed ones.

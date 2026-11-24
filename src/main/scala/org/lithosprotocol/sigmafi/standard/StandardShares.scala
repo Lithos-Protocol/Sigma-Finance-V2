@@ -135,7 +135,16 @@ trait StandardShares extends AppBase { self: StandardApp =>
     if (t.shares < 1L || t.shares > 1000000000L) fail("the share count must be 1 to 1000000000")
     if (t.pullFee < MinBatchingFee || t.mintFee < MinBatchingFee) fail(s"the pull and mint fees must each be at least ${Fmt.erg(MinBatchingFee)}")
     val market = assetMarket(asset).getOrElse(fail(s"$assetId was not minted by a standard order"))
-    t.auction.foreach(checkAuction)
+    t.auction.foreach { a =>
+      checkAuction(a)
+      val holders = decoded(nodeApi.unspentByTokenId(asset.toString)).filter(_.tokens.headOption.contains(Token(asset, 2L)))
+      val collateralCount = holders.flatMap(protocol.asBond).headOption.map(_.collateral.size)
+        .orElse(holders.flatMap(protocol.asSettlement).headOption.map(_.proceeds.size))
+      collateralCount.filter(_ > MaxCollateralTokens).foreach { n =>
+        fail(s"bond $asset carries $n distinct collateral tokens (over the $MaxCollateralTokens-token limit for " +
+          "Dutch/Selective share vaults to pull under Ergo's 4,096-byte box limit)")
+      }
+    }
     val script = if (t.auction.isDefined) protocol.market(market).dutchMint else protocol.contracts.fractionalMint
     // zcs1 names the bond in the shares' metadata when the writer knows it, as here.
     val standard = StandardMetadata.shares(market, t.auction, bondFacts(asset))
@@ -270,7 +279,12 @@ trait StandardShares extends AppBase { self: StandardApp =>
             case _ => "liquidated: the auction's opening is 0, so nothing is auctioned; holders are paid in kind"
           })
       }
-    val next = UTXO(Contract(v.box.input.getErgoTree), value, tokens, regs)
+    val nextBase = UTXO(Contract(v.box.input.getErgoTree), math.max(value, MinBox), tokens, regs)
+    val nextSize = boxSize(nextBase)
+    if (nextSize > MaxBoxSize)
+      fail(s"the pulled share vault would be $nextSize bytes, above Ergo's $MaxBoxSize-byte box limit " +
+        "(reassemble all shares for a final claim to take the bond unit and claim the bond vault directly)")
+    val next = nextBase.setValue(math.max(value, minBoxValue(nextBase)))
     prepare(s"Pull bond ${v.bondAsset} into $vaultId",
       plan(Seq(v.box.withCtxVar(0.toByte, intValue(0)), source.box), Seq(next), burn = Seq(Token(v.bondAsset, 3L))),
       Seq(note, s"you keep the ${Fmt.erg(v.pullFee)} pull fee, less the miner fee"))
@@ -314,7 +328,8 @@ trait StandardShares extends AppBase { self: StandardApp =>
     if (!v.auctionOpen) fail("the vault has no open auction")
     if (v.auction(3) < 1L) fail("the auction has no length")
     val before = currencyHeld(v)
-    // An excess sale must land strictly before the end of the fall, so it is priced at the next block.
+    // An excess sale must land strictly before the end of the fall; both auctions fall with height, so pricing at the
+    // current height stays valid at later heights before the auction ends.
     val after = if (v.excess) {
       val price = excessPrice(v, height.toLong).getOrElse(fail(s"the excess auction's price reached zero at height " +
         s"${v.auctionStart + v.auctionLength}: holders now claim the lot in kind"))
@@ -323,17 +338,22 @@ trait StandardShares extends AppBase { self: StandardApp =>
       addAmount(before, price)
     } else math.max(lotTarget(v, height.toLong), before)
     val m = Market.of(v.currencyToken).getOrElse(fail("the vault's currency is not a market this client knows"))
-    val regs = v.box.registers.updated(2, ErgoValue.of(2.toByte))
+    // Keep only the five protocol registers (R4-R8), stripping any unknown trailing R9.
+    val regs = v.box.registers.take(5).updated(2, ErgoValue.of(2.toByte))
     // A floor auction sells the whole lot. An excess auction sells only the items under the in-kind threshold; the
     // contract keeps the rest in the vault, after the reserve and any token currency, for pro rata claims.
     val kept = v.keptBySale
     val sold = v.currencyToken match {
-      case None => UTXO(Contract(v.box.input.getErgoTree), after, v.box.tokens.head +: kept, regs)
-      case Some(id) => UTXO(Contract(v.box.input.getErgoTree), if (v.saleKeepsErg) v.box.value else MinBox,
-        Seq(v.box.tokens.head, Token(id, after)) ++ kept, regs)
+      case None =>
+        val base = UTXO(Contract(v.box.input.getErgoTree), math.max(after, MinBox), v.box.tokens.head +: kept, regs)
+        base.setValue(math.max(after, minBoxValue(base)))
+      case Some(id) =>
+        val base = UTXO(Contract(v.box.input.getErgoTree), MinBox, Seq(v.box.tokens.head, Token(id, after)) ++ kept, regs)
+        val minErg = minBoxValue(base)
+        base.setValue(if (v.saleKeepsErg) math.max(v.box.value, minErg) else minErg)
     }
     val lot = v.currencyToken.fold(v.assets)(id => v.assets.filterNot(_.id == id)).filterNot(kept.contains)
-    val lotErg = if (v.currencyToken.isEmpty || v.saleKeepsErg) 0L else v.box.value - MinBox
+    val lotErg = if (v.currencyToken.isEmpty || v.saleKeepsErg) 0L else math.max(0L, v.box.value - sold.value)
     prepare(s"Buy the lot of $vaultId", plan(Seq(v.box.withCtxVar(0.toByte, intValue(0))), Seq(sold)),
       Seq(s"pay ${Units.amount(after - before, m)} into the vault (it then holds ${Units.amount(after, m)})",
         s"receive the lot: ${Fmt.contents(lotErg, lot)}") ++
@@ -356,7 +376,8 @@ trait StandardShares extends AppBase { self: StandardApp =>
     if (held == 0L) fail(s"this wallet holds no $shareId")
     val tag = Seq(bytesValue(v.box.id.getBytes))
     if (held >= v.outstanding && amount.forall(_ >= v.outstanding)) {
-      val payout = UTXO(Contract(myTree), math.max(v.box.value, MinBox), v.assets, tag)
+      val payoutBase = UTXO(Contract(myTree), math.max(v.box.value, MinBox), v.assets, tag)
+      val payout = payoutBase.setValue(math.max(v.box.value, minBoxValue(payoutBase)))
       prepare(s"Final claim on $shareId", plan(v.box.withCtxVar(1.toByte, intValue(0)) +: boxes, Seq(payout),
         burn = Seq(Token(id, v.outstanding + v.n + 1L))),
         Seq(s"burns all ${v.outstanding} outstanding shares and the vault's reserve; takes " +
@@ -375,10 +396,15 @@ trait StandardShares extends AppBase { self: StandardApp =>
       val paid = v.assets.flatMap(t => Some(part(t.amount)).filter(_ > 0L).map(Token(t.id, _)))
       val kept = v.assets.flatMap(t => Some(t.amount - part(t.amount)).filter(_ > 0L).map(Token(t.id, _)))
       val state = if (v.auctionOpen) Some(3.toByte) else v.state
-      val regs = v.box.registers.updated(1, longsValue(v.n, v.outstanding - burned, v.pullFee))
-        .patch(2, state.map(s => ErgoValue.of(s)).toSeq, if (v.box.registers.size > 2) 1 else 0)
-      val next = UTXO(Contract(v.box.input.getErgoTree), v.box.value - paidErg, Token(id, v.n + 1L) +: kept, regs)
-      val payout = UTXO(Contract(myTree), math.max(paidErg, MinBox), paid, tag)
+      // Keep only the protocol registers (R4-R8 for Dutch, R4-R6 for plain), stripping unknown trailing registers.
+      val baseRegs = v.box.registers.take(if (v.dutch) 5 else 3)
+      val regs = baseRegs.updated(1, longsValue(v.n, v.outstanding - burned, v.pullFee))
+        .patch(2, state.map(s => ErgoValue.of(s)).toSeq, if (baseRegs.size > 2) 1 else 0)
+      val nextBase = UTXO(Contract(v.box.input.getErgoTree), math.max(v.box.value - paidErg, MinBox),
+        Token(id, v.n + 1L) +: kept, regs)
+      val next = nextBase.setValue(math.max(v.box.value - paidErg, minBoxValue(nextBase)))
+      val payoutBase = UTXO(Contract(myTree), math.max(paidErg, MinBox), paid, tag)
+      val payout = payoutBase.setValue(math.max(paidErg, minBoxValue(payoutBase)))
       // zcs1: warn when a holding rounds to nothing; it stays in the vault for later claimants.
       val rounded = v.assets.filter(t => part(t.amount) == 0L).map { t =>
         s"WARNING: this claim takes none of ${t.id} (${t.amount} held); claim at least " +

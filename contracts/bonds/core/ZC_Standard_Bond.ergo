@@ -80,7 +80,8 @@
     // included. Here that would free the 2-unit reserve, and a hand-made box holding it under this
     // script would pass every state-box check. So anyone may re-create the box unchanged to reset its
     // age, keeping up to 10000000 nanoERG (0.01 ERG) of its value as a bounty, never taking it below
-    // the fee reserve plus 1000000 (a box at or under that is renewed for nothing). The bounty and the
+    // the fee reserve plus 1000000 (at that floor a box is renewed for nothing; boxes strictly under
+    // it are rejected on every path). The bounty and the
     // window match LithosDex's paid refresh, so one refresher rule covers both. The successor has
     // this script, the same tokens and registers, and a creation height between 1000 and 60 blocks
     // before HEIGHT, so the next refresh is about two years away. The bounty comes out of collateral

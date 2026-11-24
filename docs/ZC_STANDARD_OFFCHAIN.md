@@ -5,8 +5,10 @@ client writes into the boxes it creates, how a batcher finds and serves work, an
 shows bonds and shares. This document is that off-chain part of the ZC Standard, versioned as profile
 `zcs1`. [SigmaBonds.MD](../SigmaBonds.MD) describes the contracts.
 
-Status: **draft**. The CLI follows all of it, specced offline in `StandardOffchainSpec`; nothing has
-run against a live node yet. See "CLI status" at the end.
+Status: **draft**. The CLI follows all of it, specced offline in `StandardOffchainSpec`; the core
+and exchange lifecycle ran on mainnet via `sbt livetest` on 2026-11-12, while post-Nov-12 additions
+(`PricedOrder`, window mode, paid refresh, `LotAuction`, wraps, `Extinguish`) are verified offline
+and pending a fresh live run. See "Open items" at the end.
 
 Four principles:
 
@@ -68,7 +70,9 @@ cannot look a script up by its hash, so every box must lead to its scripts in on
 | Bond | R5 | Borrower (copied from the order) |
 | Lend offer | R4 | Owner |
 | Sale order, PricedAsk | R4 | Seller |
+| Lot auction | R4 | Seller |
 | Fractional or Dutch mint request | R7 | Owner |
+| Wrap mint request | R4 | Owner |
 
 **Writers.** A transaction that creates any of these boxes, including a continuation or a request a
 fill delivers into, puts **context variable 64** on the extension of `INPUTS(0)`: a `Coll[Coll[Byte]]`
@@ -108,10 +112,11 @@ back to where the offer was posted.
 
 ## Token metadata (recommended)
 
-Only two kinds of token are issued: **bond units** (3 per fill) and **shares** (2N+1 per mint). Offers
-and asks issue nothing. An offer carries the metadata of shares it will have minted, and an ask only
-sells an existing token. One template covers every path. Fields the writer cannot know yet are
-omitted by rule, so any two clients write the same bytes for the same token.
+Three kinds of token are issued: **bond units** (3 per fill), **shares** (2N+1 per mint), and **wrap
+receipts** (3 per wrap mint). Offers, asks and lots issue nothing. An offer carries the metadata of
+shares it will have minted, and an ask only sells an existing token. One template covers every path.
+Fields the writer cannot know yet are omitted by rule, so any two clients write the same bytes for
+the same token.
 
 ### Where metadata is written
 
@@ -387,7 +392,8 @@ A batcher following this profile:
   reference (it cannot supply the bytes).
 - **Picks a window order's maturity by one rule.** When an offer fills a window order, the candidates are
   the ends of the heights both accept, both curves' breakpoints and the grid heights between: between
-  them both yields are straight lines, so the best is always one of them. Of the ones the offer accepts,
+  them both raw curves are piecewise linear (on ERG offers the fixed batcher fee makes net implied yield
+  mildly concave, so this candidate set is a deterministic heuristic). Of the ones the offer accepts,
   a grid height first, then the widest gap between the yield the offer earns and the one it requires,
   then the shorter. The match command names the maturity (`match-offer ... --maturity <height>`).
 - **Refreshes old boxes.** Bonds, bond vaults, share vaults and wrap vaults more than 525,600 blocks old
@@ -401,17 +407,26 @@ A batcher following this profile:
   earliest grid height in it, else its shortest maturity. Batchers use the rule above.
 - **Refresh.** A bond's successor is stamped 60 blocks back (the contract allows 60 to 999), so the
   borrower may recollateralize at once, and the refresh discloses the borrower's script. A vault's is
-  stamped at the current height. No output may be stamped below any input's creation height (EIP-39),
+  stamped at the current height, keeps only its protocol-defined registers (stripping any unknown
+  trailing registers), and retains at least its consensus `360 nanoERG/byte` minimum. No output may be
+  stamped below any input's creation height (EIP-39),
   so every input of a bond refresh, the wallet's fee box included, must be at least 60 blocks old. A
   bond above its floor pays its own miner fee from the bounty and needs no other input; a refresher
   keeps an aged box for the rest, and packs bond refreshes only with each other. A reader who cannot find a bond's borrower through the box's creating
   transaction looks in the fill that minted the bond asset, which paid the principal to it: a refresh
   is open to anyone, zcs1 client or not, and must never hide a borrower.
+- **Consensus sizing & collateral token cap.** Clients compute dynamic box minimums (`max(0.001 ERG,
+  boxBytes * 360)`) for large continuations/vaults, reject `LendOffer` creations whose post-fill
+  continuation (with the 32-byte `R6` suffix) would exceed Ergo's 4,096-byte box limit, and cap
+  standard bonds at 30 distinct collateral tokens so liquidated proceeds always fit inside
+  `DutchAuctionVault` (~2.2 KB ErgoTree) on `PULL`.
 - **Wraps.** A capability token (one whose presence among inputs grants authority elsewhere, such as a
   LithosDex position's owner NFT) never goes raw into an order, bond, ask or lot: its receipt does.
   Receipts are named `ZCS-Wrap-<id6 of the token>` with decimals 0 and a description
   `{"zcs":1,"type":"wrap receipt","token":"<id>","amount":<n>,"note":"Verify on chain."}`. A new wrap
-  funds its vault with a refresh reserve, 0.03 ERG by default (three refreshes, about six years).
+  funds its vault with a refresh reserve, 0.03 ERG by default (three refreshes, about six years);
+  `WrapMint` pins `vault.value >= SELF.value - mintFee - 1,000,000` so a minter cannot divert that
+  reserve into the receipt output.
   Readers verify a receipt as a share: the request box it is named after was spent under `WrapMint`.
 
 ## Expressions
@@ -440,7 +455,7 @@ when the order's oracle age is at least the offer's. The values are the CLI's cu
 | Token offer batcher reward budget | 0.2 ERG at a 1% minimum fill | Calculated reward per fill must reach 0.002 ERG |
 | Liquidation fee reserve | 0.05 ERG (also the CLI's minimum) | 0 |
 | Share mint fee, pull fee | 0.005 ERG each | 0.002 ERG |
-| Ask refund fee | 0.002 ERG | none |
+| Ask refund / closing fee | 0.002 ERG (0.003 ERG box ERG is not returned separately on full fill) | none |
 | ERG carried by a SigUSD offer for fees | 0.5 ERG | — |
 | Ask minimum fill, offer minimum price | 1 raw unit | — |
 | Fill guard on an oracle order | on, at the order's own liquidation ratio | at least that ratio |

@@ -627,6 +627,12 @@ object StandardProtocol {
   /** Yield-curve points a lend offer may carry. */
   val MaxCurvePoints: Int = 20
 
+  /**
+   * Off-chain cap on distinct collateral tokens in a standard bond, leaving safe headroom below Ergo's
+   * 4,096-byte box-size limit when a liquidated bond's proceeds are pulled into DutchAuctionVault (~2.2 KB tree).
+   */
+  val MaxCollateralTokens: Int = 30
+
   /** Where a lend offer's yield curve starts in R5: after the fixed terms of its market. */
   def offerBase(m: Market): Int = if (m.token.isEmpty) 11 else 15
 

@@ -70,8 +70,8 @@ contract holding `(X, 1)` with a permissionless pull or sweep path (such as `Fra
 `DutchAuctionVault`, or a future Bond Series Pool) must explicitly pin `CONST_VAULT_HASH`.
 
 **One asset per loan.** A standard loan is lent and repaid in the same single asset, the bond's
-repayment asset. Every bond therefore has its principal P and repayment R in one unit, so rate,
-accrued value and NAV are defined for every bond, and readers need no asset filter.
+repayment asset. Every bond therefore has its principal P and repayment R in one unit, so simple
+yield to maturity is defined for every bond, and readers need no asset filter.
 
 **Constants for markets, registers for terms.** The SigmaFi API is the Ergo indexed node, which
 looks boxes up by ErgoTree, template hash and token id but not by register. The repayment asset is
@@ -322,6 +322,19 @@ its expiry with no buyer. A thin item now goes in kind only when nobody pays any
 excess auction, or a floor auction expires unsold; both are unavoidable without a price reference,
 and the floor is the lenders' own reserve, which offers rely on.
 
+Two operational notes on `DutchAuctionVault`:
+- **Token-currency Dutch vaults with pure-currency collateral:** On a token market (e.g. SigUSD)
+  with `--vault dutch` (threshold `Long` max), merging the holding vault (at least `0.001 ERG` above
+  `pullFee`) and `BondVault` (at least `0.001 ERG`) always leaves at least `0.001 ERG` of lot ERG
+  above the box minimum. A liquidation therefore always opens an auction (state 1 or 4) even if 100%
+  of the collateral was already the currency token, delaying partial claims until the auction's
+  length or expiry (final claim remains open; Selective threshold `100` is unaffected because
+  `1,000,000 >= 100`).
+- **Collateral token count vs. 4 KB box limit:** Because `DutchAuctionVault`'s ErgoTree is ~2.2 KB,
+  Ergo's 4,096-byte box-size ceiling caps a pulled vault at ~44–50 distinct collateral tokens. Off-chain
+  clients (`zcs1`) cap standard bonds at 30 distinct collateral tokens so a liquidated settlement always
+  fits cleanly on `PULL`.
+
 The vault's state is R6: 0 repaid, 1 floor auction open, 2 sold or nothing to sell, 3 paid out in
 kind, 4 excess auction open. Registers are dense, so the mint places R6 to carry R7 and R8, and pins
 it to the byte 0: the vault's refresh reads it as a byte before the pull, and a register of another
@@ -337,8 +350,11 @@ ZC check. A wrap keeps such a capability token out of every transaction but its 
 
 - `WrapMint` is a request holding the token, an owner hash (R4), a mint fee (R5) and the receipt's
   EIP-4 (R6). Any batcher mints 3 receipt units, whose id is the request's: 1 to the owner, 2 and the
-  token into a bare `WrapVault`. The request must be the transaction's **only input**, so nothing the
-  token has authority over can be spent beside it; it pays the vault, the receipt and the miner itself.
+  token into a bare `WrapVault`. The vault must receive at least `SELF.value - mintFee - 1,000,000`
+  (and at least `1,000,000`), guaranteeing that the owner's refresh reserve lands in `WrapVault`
+  rather than being diverted to the receipt output. The request must be the transaction's **only input**,
+  so nothing the token has authority over can be spent beside it; it pays the vault, the receipt and
+  the miner itself.
 - `WrapVault` releases the token only when all 3 receipt units burn: the holder's and the vault's
   two. Its refresh, too, must be the only input. Nothing claims or compounds a LithosDex position's
   fees while it is wrapped (that would put the NFT in an input); they keep accruing and are claimed
@@ -365,8 +381,11 @@ refresh, matching LithosDex's T2T provisions so one refresher rule covers both: 
 525,600 blocks (about two years) old, anyone may re-create it unchanged (script, tokens, registers),
 with a creation height within 1,000 blocks of inclusion, keeping up to **0.01 ERG** of its value as a
 bounty. A refresh never takes a box below its own floor: a bond's fee reserve plus 0.001 ERG, a
-vault's 0.001 ERG plus its pull fee while it still holds the bond unit, 0.001 ERG otherwise. At or under
-the floor a box is renewed for nothing. Each extra 0.01 ERG in a box buys about two more years.
+vault's 0.001 ERG plus its pull fee while it still holds the bond unit, 0.001 ERG otherwise (or its
+consensus `360 nanoERG/byte` minimum if larger). At that floor a bond, bond vault or share vault is
+renewed for nothing with an external fee input; a `WrapVault` requires `INPUTS.size == 1`, so its
+bounty must cover the miner fee (without a refresh reserve, it waits for its owner to unwrap). Each
+extra 0.01 ERG in a box buys about two more years.
 
 Boxes need not hold a whole rent payment (1.5 to 2.5 ERG for these 1 to 2 KB boxes): whoever refreshes
 first takes the bounty, so the refresh lands as soon as it opens, two years before rent is due. The
@@ -399,7 +418,10 @@ ask that keeps the convention works with existing offers.
 
 `SaleOrder` sells at a fixed price per raw unit, `ceil(units × numerator / denominator)`, with
 partial fills and a minimum fill. `PricedAsk` does the same with a fixed floor price, plus a pricing
-expression the seller pins in R6; a new pricing method is a new expression, not a new ask.
+expression the seller pins in R6; a new pricing method is a new expression, not a new ask. An ask's
+box ERG (`0.001 ERG` minimum plus its refund fee, `0.003 ERG` by default) survives partial fills and
+is not returned separately on a **full fill**: it serves as a seller-paid closing/expiry fee (keep
+the refund fee small).
 
 `YieldAsk_Pricing` prices a live bond, or u of its N shares, at a buyer's simple block yield to
 maturity that moves in a straight line between two points in time. Ask R5 is `(floor numerator,
@@ -468,8 +490,11 @@ The **collateral policy** is an expression the offer pins and runs. `ERG_SigUSD_
 requires the bond to carry the oracle liquidation rule, that rule to fire at or above the lender's
 floor ratio and accept the lender's oracle age, and the collateral to be worth the floor now.
 
-Only one offer may take part in a fill, so one bond cannot be charged to two offers. Best execution
-is not enforced: a batcher chooses which ask it meets, and an offer never does worse than its terms.
+Each offer tags its delivery (R7) and continuation (R6) with its own input id, so independent
+secondary-market offers can fill in one transaction without sharing outputs (new-bond originations
+still run one per transaction because minting uses `INPUTS(0)`). Best execution is not enforced: a
+batcher chooses which ask it meets, and because no ask script is pinned a batcher can capture spread
+via an intermediary box; an offer still never does worse than its committed yield curve.
 
 ### Fill and sale guards
 
@@ -586,8 +611,9 @@ input. In brief:
   asks and orders at the most they ask over the next 3 blocks.
 - **Window maturity.** A batcher filling a window order from an offer picks, among the maturities both
   accept, a grid height first, then the widest gap between the yield the offer earns and the yield it
-  requires, then the shorter. Between the window's ends, both curves' breakpoints and the grid heights
-  both yields are straight lines, so the best maturity is always one of those. A wallet lender picks
+  requires, then the shorter. Between the window's ends, both curves' breakpoints and the grid heights,
+  both raw curves are piecewise linear (on ERG offers the fixed batcher fee makes net implied yield
+  mildly concave, so this candidate set is a deterministic heuristic). A wallet lender picks
   freely; the client defaults to the earliest grid height in the window.
 - **Refresh.** A bond's successor is stamped 60 blocks back, and the refresh discloses the borrower's
   script. A client that cannot find it there finds it in the fill that minted the bond asset, which
@@ -609,7 +635,9 @@ input. In brief:
   if someone sends it within two years of its opening; a box at its floor is renewed for nothing.
 - A capability token put raw into an order, bond or ask lends its authority to whoever spends that box;
   wrap it first. Clients cannot yet tell a LithosDex owner NFT from any other token by themselves.
-- Nothing has run on a live node yet; the offline harness runs the real interpreter.
+- The core/exchange lifecycle ran on mainnet via `sbt livetest` on 2026-11-12; post-Nov-12 additions
+  (`PricedOrder`, window mode, paid refresh, `LotAuction`, wraps, `Extinguish`, and the `WrapMint`
+  reserve pin) have been verified offline in the real interpreter and remain to be re-run live.
 
 ### Extension and composition rules for Extinguish
 

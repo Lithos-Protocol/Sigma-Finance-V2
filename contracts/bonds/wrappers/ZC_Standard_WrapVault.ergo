@@ -27,10 +27,11 @@
     // Storage rent lets anyone take a four-year-old box whose value does not cover the rent, tokens
     // included, which would hand out the wrapped token and the reserve. So anyone may re-create this
     // box unchanged to reset its age, keeping up to 10000000 nanoERG (0.01 ERG) as a bounty, never
-    // taking it below 1000000 (a box at or under that is renewed for nothing). This box must be the
-    // transaction's ONLY input: the wrapped token is in it, so any other input could be a box the
-    // token has authority over. The bounty therefore pays the transaction fee, or goes to an output
-    // of the refresher's choosing. The successor has this script, the same tokens, no registers, and
+    // taking it below 1000000. This box must be the transaction's ONLY input: the wrapped token is
+    // in it, so any other input could be a box the token has authority over. The bounty therefore
+    // must pay the transaction's miner fee (with any remainder going to the refresher); a vault
+    // whose value above 1000000 does not cover the miner fee cannot be refreshed and waits for its
+    // owner to unwrap. The successor has this script, the same tokens, no registers, and
     // a creation height within 1000 blocks of HEIGHT. The window and bounty match ZC_Standard_Bond's
     // refresh and LithosDex's paid refresh.
     //

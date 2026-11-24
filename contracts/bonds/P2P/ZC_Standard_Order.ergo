@@ -18,8 +18,8 @@
     //   token: principal tokens exactly ((repayment token, P > 0)), and at most 1000000 nanoERG
     //          in both R4(1) and R4(2): box minimums beside the token, never a second asset.
     // So every standard bond has its principal P and repayment R in one unit, and anything that
-    // reads a bond (a lend offer, a pricing expression) can work out its rate, accrued value or
-    // NAV with no further check. Cross-asset loans and loans of several assets are not standard;
+    // reads a bond (a lend offer, a pricing expression) can work out its simple yield to maturity
+    // with no further check. Cross-asset loans and loans of several assets are not standard;
     // they would need their own order and bond pair. Cancel and expiry ignore this rule.
     //
     // ORDER REGISTERS -> BOND REGISTERS (copied exactly; the lender cannot alter them)

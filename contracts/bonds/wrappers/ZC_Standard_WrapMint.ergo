@@ -30,9 +30,10 @@
     // OUTPUTS(0): (receipt, 1) at tokens(0), at the owner script, at least 1000000 nanoERG,
     //   R4, R5, R6 = the three items of R6.
     // OUTPUTS(1): ZC_Standard_WrapVault with tokens exactly ((receipt, 2), the wrapped token and
-    //   amount), at least 1000000 nanoERG, and no registers. The two outputs together receive at
-    //   least SELF.value minus the mint fee. Value above 1000000 in the vault pays its refreshes
-    //   (0.01 ERG each, about every two years), so a long-lived wrap should be funded for them.
+    //   amount), at least 1000000 nanoERG and at least SELF.value - mintFee - 1000000 nanoERG, and
+    //   no registers. Pinning the vault's floor directly guarantees that every nanoERG funded above
+    //   2000000 + mintFee lands in the vault as its refresh reserve (0.01 ERG per refresh, about
+    //   every two years), and a minter cannot divert that reserve into OUTPUTS(0).
     //
     // CANCEL
     // Nothing is minted, and a co-spent box guarded by the owner script releases this box. Only the
@@ -92,7 +93,7 @@
             val vaultValid =
                 blake2b256(vault.propositionBytes) == CONST_WRAP_VAULT_HASH &&
                 vault.value >= 1000000L &&
-                vault.value + receiptOut.value >= SELF.value - mintFee &&
+                vault.value >= SELF.value - mintFee - 1000000L &&
                 vault.tokens == Coll((SELF.id, 2L), wrapped) &&
                 vault.R4[Coll[Byte]].isDefined == false
 

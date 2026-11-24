@@ -103,11 +103,12 @@
     // token price. The ask's own script must enforce that R5.
     // The offer's price is whatever that payout holds: it never reads the ask's price. It requires
     // the payout's R5 to equal the units delivered here. An ask that follows the convention then
-    // cannot have sold more units than the offer received, so the payment covers exactly them, and
-    // anything above the ask's own price reaches the seller, not the batcher.
-    // An ask that does NOT enforce R5 lets a batcher keep units the offer paid for, up to the
-    // offer's yield limit. That is the cost of pinning no ask script: the offer still never does
-    // worse than its terms, but it relies on asks keeping the convention for anything better.
+    // cannot have sold more units than the offer received, so the payment covers those units.
+    // Because no ask script is pinned (and sale.tokens(0)._2 is not checked against units), a
+    // batcher can still capture spread above a resting ask's price by routing through a self-owned
+    // box, or use an ask that does not enforce R5 to keep surplus units up to the offer's yield
+    // limit. That is the cost of pinning no ask script: the offer still never does worse than its
+    // committed yield curve, and relies on competitive batching for price improvement.
     //
     // NEW BOND (var 2 absent)
     // INPUTS(0) is an accepted Order or PricedOrder, whose own script validates the bond at

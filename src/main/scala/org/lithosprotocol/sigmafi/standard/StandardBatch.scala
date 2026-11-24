@@ -130,22 +130,28 @@ trait StandardBatch extends AppBase { self: StandardApp =>
     val created = box.input.getCreationHeight.toLong
     if (!refreshable(created, now))
       fail(s"box ${box.id} was made at height $created; it can be refreshed from height ${created + RefreshAge + 1}")
-    val (floor, stamp, what) = protocol.asBond(box) match {
+    val (floor, stamp, what, regs) = protocol.asBond(box) match {
       case Some(b) =>
         if (now < b.maturity && now + 1L >= b.maturity - RefreshMaturityGap)
           fail(s"bond ${box.id} matures at height ${b.maturity}: it is not refreshed in the $RefreshMaturityGap blocks " +
             "before maturity, where a refresh could void a borrower's repayment; from maturity on it may be")
         bondBorrowerTree(b)
-        (b.feeReserve + MinBox, now - RecollateralizeWait, s"bond ${box.id}")
+        (b.feeReserve + MinBox, now - RecollateralizeWait, s"bond ${box.id}", box.registers.take(6))
       case None =>
-        protocol.asSettlement(box).map(_ => (MinBox, now, s"bond vault ${box.id}"))
-          .orElse(protocol.asShareVault(box).map(v => (if (v.holding) MinBox + v.pullFee else MinBox, now, s"share vault ${box.id}")))
+        protocol.asSettlement(box).map(_ => (MinBox, now, s"bond vault ${box.id}", box.registers.take(2)))
+          .orElse(protocol.asShareVault(box).map(v =>
+            (if (v.holding) MinBox + v.pullFee else MinBox, now, s"share vault ${box.id}",
+              box.registers.take(if (v.dutch) 5 else if (v.holding) 2 else 3))))
           .getOrElse(fail(s"${box.id} is not a bond, bond vault or share vault (a wrap vault is refreshed on its own)"))
     }
-    val value = refreshedValue(box.value, floor)
-    val successor = UTXO(Contract(box.input.getErgoTree), value, box.tokens, box.registers, Some(stamp.toInt))
-    Piece(box.id.toString, i => box.withCtxVar(9.toByte, intValue(i)), Seq(successor), box.value - value,
-      s"refreshes $what, made at height $created, for a ${Fmt.erg(box.value - value)} bounty",
+    val base = UTXO(Contract(box.input.getErgoTree), MinBox, box.tokens, regs, Some(stamp.toInt))
+    val minErg = minBoxValue(base)
+    val effectiveFloor = math.max(floor, minErg)
+    val value = math.max(refreshedValue(box.value, effectiveFloor), minErg)
+    val successor = base.setValue(value)
+    val reward = math.max(0L, box.value - value)
+    Piece(box.id.toString, i => box.withCtxVar(9.toByte, intValue(i)), Seq(successor), reward,
+      s"refreshes $what, made at height $created, for a ${Fmt.erg(reward)} bounty",
       stamp = if (stamp < now) Some(stamp) else None)
   }
 
@@ -259,23 +265,27 @@ trait StandardBatch extends AppBase { self: StandardApp =>
 
     // Paid refreshes: anything more than two years old that pays a bounty. A bond that is also due is liquidated
     // instead, and none is refreshed in the blocks before its maturity.
-    def bounty(box: InputUTXO, floor: Long): Long = box.value - refreshedValue(box.value, floor)
+    def bounty(box: InputUTXO, floor: Long, regCount: Int): Long = {
+      val minErg = minBoxValue(UTXO(Contract(box.input.getErgoTree), MinBox, box.tokens, box.registers.take(regCount)))
+      val kept = math.max(refreshedValue(box.value, math.max(floor, minErg)), minErg)
+      math.max(0L, box.value - kept)
+    }
     def old(box: InputUTXO): Boolean = refreshable(box.input.getCreationHeight.toLong, now)
     val liquidating = work.flatMap(_.packBox).toSet
     liveBonds.filter(b => old(b.box) && !liquidating(b.box.id.toString) &&
-      (now >= b.maturity || next < b.maturity - RefreshMaturityGap) && bounty(b.box, b.feeReserve + MinBox) > 0L).foreach { b =>
+      (now >= b.maturity || next < b.maturity - RefreshMaturityGap) && bounty(b.box, b.feeReserve + MinBox, 6) > 0L).foreach { b =>
       work += packWork(s"refresh bond ${b.box.id}, made at height ${b.box.input.getCreationHeight}", s"refresh ${b.box.id}",
-        bounty(b.box, b.feeReserve + MinBox), b.box.id.toString).copy(agedInputs = true)
+        bounty(b.box, b.feeReserve + MinBox, 6), b.box.id.toString).copy(agedInputs = true)
     }
-    (settlements().map(s => s.box -> MinBox) ++
-      shareVaults().map(v => v.box -> (if (v.holding) MinBox + v.pullFee else MinBox)))
-      .filter { case (box, floor) => old(box) && bounty(box, floor) > 0L }.foreach { case (box, floor) =>
+    (settlements().map(s => (s.box, MinBox, 2)) ++
+      shareVaults().map(v => (v.box, if (v.holding) MinBox + v.pullFee else MinBox, if (v.dutch) 5 else if (v.holding) 2 else 3)))
+      .filter { case (box, floor, regs) => old(box) && bounty(box, floor, regs) > 0L }.foreach { case (box, floor, regs) =>
         work += packWork(s"refresh vault ${box.id}, made at height ${box.input.getCreationHeight}", s"refresh ${box.id}",
-          bounty(box, floor), box.id.toString)
+          bounty(box, floor, regs), box.id.toString)
       }
-    wrapVaults().filter(v => old(v.box) && alone(bounty(v.box, MinBox))).foreach { v =>
+    wrapVaults().filter(v => old(v.box) && alone(bounty(v.box, MinBox, 0))).foreach { v =>
       work += Work(s"refresh wrap vault ${v.box.id} (alone: it holds a wrapped token)", s"refresh ${v.box.id}",
-        bounty(v.box, MinBox), Set(v.box.id.toString))
+        bounty(v.box, MinBox, 0), Set(v.box.id.toString))
     }
     wrapRequests().filter(r => alone(r.mintFee) && served(r.ownerHash, r.box, "wrap request", "owner")).foreach { r =>
       work += Work(s"mint the wrap receipt for ${r.wrapped.amount} of ${r.wrapped.id}", s"mint-wrap ${r.box.id}", r.mintFee,
@@ -411,7 +421,7 @@ trait StandardBatch extends AppBase { self: StandardApp =>
 }
 
 object StandardBatch {
-  /** The most refunds and liquidations one packed transaction takes. */
+  /** The most refunds, liquidations and refreshes one packed transaction takes. */
   val PackLimit = 20
 
   /** How many times `batch --run` scans again for work an earlier round made possible. */

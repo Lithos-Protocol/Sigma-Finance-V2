@@ -67,6 +67,12 @@ class ZcStandardWrapSpec extends AnyPropSpec with ZcStandardSpecBase {
       // The vault must hold the wrapped token: kept back, it would not be wrapped at all.
       rejectsAtSigning(executor(ctx), build(ctx, Seq(w.in), Seq(w.receiptOut, w.vault.setTokens(Token(w.receipt, 2L)),
         UTXO(contractOf(executor(ctx)), minBox, Seq(Token(nft, 1L)))), executor(ctx).getAddress, fee = mintFee - minBox))
+      // The vault must receive the entire refresh reserve: diverting it into receiptOut would leave
+      // the WrapVault unrefreshable under its INPUTS.size == 1 rule.
+      rejectsAtSigning(executor(ctx), mintTx(ctx, w,
+        receipt = w.receiptOut.addValue(3000000L), vault = w.vault.subValue(3000000L)))
+      rejectsAtSigning(executor(ctx), mintTx(ctx, w,
+        receipt = w.receiptOut.addValue(1L), vault = w.vault.subValue(1L)))
       // A mint fee under 0.002 ERG is refused.
       val cheap = wrap(ctx, fee = 1999999L)
       rejectsAtSigning(executor(ctx), build(ctx, Seq(cheap.in), Seq(cheap.receiptOut, cheap.vault), executor(ctx).getAddress,

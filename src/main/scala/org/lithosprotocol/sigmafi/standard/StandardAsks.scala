@@ -140,10 +140,21 @@ trait StandardAsks extends AppBase { self: StandardApp =>
       s"${Units.percent(g.minBps)} of its repayment at an oracle price at most ${g.maxAge} blocks old; below that, " +
       "anyone may liquidate the bond and you claim its collateral with the unit").toSeq
     val ask = UTXO(script, MinBox + refundFee, Seq(Token(token, amount)), regs)
+    val feeWarnings =
+      (if (refundFee > 20000000L)
+        Seq(s"WARNING: refund fee ${Fmt.erg(refundFee)} is large; the ask's box ERG (${Fmt.erg(MinBox + refundFee)}) " +
+          "is a seller-paid closing/expiry fee and is not returned on a full fill")
+      else Seq.empty) ++
+      (price match {
+        case FixedPrice(total) if market.token.isEmpty && total <= MinBox + refundFee =>
+          Seq(s"WARNING: total price ${Units.amount(total, market)} is at or below the ask box's ${Fmt.erg(MinBox + refundFee)}; " +
+            "on a full fill the box's ERG counts toward the payout, so a buyer pays little or no additional ERG")
+        case _ => Seq.empty
+      })
     prepare(s"Sell $amount of $tokenId", plan(Seq.empty, Seq(ask)), Seq(note,
       s"paid in $market; minimum fill $minFill; expires at height $expiry, then anyone may return it for the " +
-        s"${Fmt.erg(refundFee)} refund fee",
-      "Output 0 is the ask. Cancel it with `cancel-ask <its box id>`.") ++ guardNote ++ lotNotes)
+        s"${Fmt.erg(refundFee)} refund fee (on a full fill, the ask box's ${Fmt.erg(MinBox + refundFee)} is not returned separately)",
+      "Output 0 is the ask. Cancel it with `cancel-ask <its box id>`.") ++ guardNote ++ lotNotes ++ feeWarnings)
   }
 
   /**
@@ -227,7 +238,12 @@ trait StandardAsks extends AppBase { self: StandardApp =>
     if (unverifiedShares(ask.token.id))
       fail(s"${ask.token.id} sits in a share vault that names a bond, but no standard share mint minted it: anyone can " +
         "make such a vault, so it claims nothing. This client does not buy it")
-    val coverNotes = liveBondOf(ask.token.id).toSeq.flatMap(b => coverCheck(b, allowLiquidatable, s"bond ${b.box.id} is",
+    val live = liveBondOf(ask.token.id)
+    if (verifiedShareVault(ask.token.id).exists(_.dutch) && live.exists(_.collateral.size > MaxCollateralTokens))
+      fail(s"bond ${live.get.asset} carries ${live.get.collateral.size} distinct collateral tokens (over the " +
+        s"$MaxCollateralTokens-token limit for Dutch/Selective share vaults to pull under Ergo's 4,096-byte box limit); " +
+        "this client does not buy its shares")
+    val coverNotes = live.toSeq.flatMap(b => coverCheck(b, allowLiquidatable, s"bond ${b.box.id} is",
       s"Liquidate it instead (`liquidate ${b.box.id}`): its holder, the seller, then claims all the collateral"))
     val (paid, bond) = askPrice(ask, n)
     // A guarded ask's expression reads the confirmed oracle after the bond; refuse here what it would refuse.

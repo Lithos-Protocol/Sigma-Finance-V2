@@ -238,6 +238,9 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
     if (loan.collateralErg < MinBox) fail("the collateral must hold at least 0.001 ERG")
     if (loan.expiryFee < MinBatchingFee) fail(s"the expiry fee must be at least ${Fmt.erg(MinBatchingFee)}")
     if (loan.collateralTokens.map(_.id).distinct.size != loan.collateralTokens.size) fail("list each collateral token once")
+    if (loan.collateralTokens.size > MaxCollateralTokens)
+      fail(s"at most $MaxCollateralTokens distinct collateral tokens are supported (so a liquidated bond fits " +
+        "inside a Dutch/Selective share vault on pull under Ergo's 4,096-byte box limit)")
     if (loan.expiry <= height.toLong + 1L) fail(s"the order's expiry ${loan.expiry} is not above the current height $height")
     val (maturityTerm, mode) = loan.schedule match {
       case FixedMaturity(h) =>
@@ -320,6 +323,12 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
     val order = UTXO(if (pricing.isDefined) c.pricedOrder else c.order,
       addAmount(loan.collateralErg, loan.expiryFee), loan.collateralTokens, coreRegs ++ extraRegs,
       if (pricing.isDefined) Some(height) else None)
+    val orderSize = boxSize(order)
+    if (orderSize > MaxBoxSize)
+      fail(s"the order box would be $orderSize bytes, above Ergo's $MaxBoxSize-byte box limit")
+    val minOrderValue = minBoxValue(order)
+    if (order.value < minOrderValue)
+      fail(s"the order needs at least ${Fmt.erg(minOrderValue)} to cover its $orderSize-byte box minimum")
 
     val notes = Seq(
       s"${if (loan.price.isDefined) "principal floor" else "borrow"}: ${Units.amount(loan.principal, m)}; repay ${Units.amount(loan.repayment, m)}",
@@ -586,8 +595,9 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
       if (!fromCollateral) ((bond.collateralErg, bond.collateral), 0L, Seq.empty[InputUTXO])
       else {
         val held = bond.heldRepaymentAsset
+        val minReturnErg = minBoxValue(UTXO(Contract(borrower), MinBox, bond.collateral, Seq(bytesValue(bond.box.id.getBytes))))
         val k = m.token match {
-          case None => math.min(bond.repayment, bond.collateralErg - MinBox)
+          case None => math.min(bond.repayment, bond.collateralErg - minReturnErg)
           case Some(_) => math.min(bond.repayment, held)
         }
         if (k <= 0L) fail(s"the bond's collateral holds no ${m} it can repay from")
@@ -598,7 +608,8 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
         }
         (back, k, Seq(walletBoxAt(bond.borrowerHash, "borrower")))
       }
-    val collateral = UTXO(Contract(borrower), returned._1, returned._2, Seq(bytesValue(bond.box.id.getBytes)))
+    val collateralBase = UTXO(Contract(borrower), math.max(returned._1, MinBox), returned._2, Seq(bytesValue(bond.box.id.getBytes)))
+    val collateral = collateralBase.setValue(math.max(returned._1, minBoxValue(collateralBase)))
 
     val notes = Seq(
       s"repay: ${Units.amount(bond.repayment, m)} into the vault, for the holder of ${bond.asset}",

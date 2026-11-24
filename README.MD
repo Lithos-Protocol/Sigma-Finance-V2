@@ -32,7 +32,7 @@ How it works, in brief:
   token id finds it, and one check that the asset's minting box was a standard order proves the
   asset genuine. Pullable vaults (`FractionalVault`, `DutchAuctionVault`, and future Series Pools)
   pin `CONST_VAULT_HASH` explicitly.
-- A loan is lent and repaid in one asset, so every bond's rate and accrued value are defined.
+- A loan is lent and repaid in one asset, so every bond's simple yield to maturity is defined.
 - Each market (ERG, SigUSD, ...) has one address per contract, and all markets share one template
   hash, so the Ergo indexed node lists them directly.
 - Nobody has to come back online: mints, pulls, liquidations and expiry refunds are run by anyone for
@@ -76,13 +76,15 @@ sbt "runMain org.lithosprotocol.sigmafi.app.SigmaFiCli help"
 - Look around: `info`, `orders`, `bonds` (oracle ratios, recollateralize timing, and whether each bond
   asset was really minted by a standard order), `claims`
 - Borrower: `create-order` (ERG or SigUSD market; maturity or oracle-ratio liquidation; a fixed
-  maturity at least 21,600 blocks out snaps to the grid unless `--exact-maturity`; an oracle order
-  accepts optional `--yield <percent> [--end-yield <percent>]` to create a `PricedOrder` that prices
-  principal at a simple yield, moving in a straight line to `--end-yield` by the order's expiry, while
-  keeping repayment fixed (both fixed and on-close maturity); an oracle order
-  carries a fill guard that its contract enforces, at `--ratio` or `--fill-ratio`, unless
-  `--no-fill-guard`; `--window <min>:<max> --yield <cap> [--curve ...]` makes a window order, whose
-  lender picks the maturity and pays the principal the borrower's curve prices there),
+  maturity at least 21,600 blocks out snaps to the grid unless `--exact-maturity`; any order
+  (maturity or oracle liquidation) accepts optional `--yield <percent> [--end-yield <percent>]` to
+  create a `PricedOrder` that prices principal at a simple yield, moving in a straight line to
+  `--end-yield` by the order's expiry, while keeping repayment fixed (both fixed and on-close
+  maturity); an oracle order carries a fill guard that its contract enforces, at `--ratio` or
+  `--fill-ratio`, unless `--no-fill-guard`; `--window <min>:<max> --yield <cap> [--curve ...]`
+  makes a window order, whose lender picks the maturity and pays the principal the borrower's curve
+  prices there; up to 30 distinct collateral tokens off-chain so liquidated settlements fit inside
+  `DutchAuctionVault` under Ergo's 4 KB box limit),
   `cancel-order`, `repay [--from-collateral]`, `recollateralize`, `extinguish` (close a live bond at
   any height by burning all 3 bond units with the circulating unit you hold, unlocking collateral
   and the fee reserve without passing full repayment through the vault)
@@ -126,8 +128,10 @@ renaming it does not change its tree. `PricedOrder` is an additional issuing typ
 scripts. On 2026-11-16 the bond and its vaults gained the paid refresh, `PricedOrder` the window mode,
 and the Dutch vault an excess auction for thin items when the floor is already held, so every pinned
 hash downstream of them changed. On 2026-11-22 `ZC_Standard_Bond` gained the Extinguish path (borrower
-co-spend + all 3 bond units burned, unconstrained outputs) and `FractionalVault` and `DutchAuctionVault`
-pinned `CONST_VAULT_HASH` on `PULL`, regenerating all affected pins and addresses.
+co-spend + all 3 bond units burned, unconstrained outputs) and `FractionalVault` and `DutchAuctionVault` pinned `CONST_VAULT_HASH` on `PULL`, regenerating all
+affected pins and addresses. On 2026-11-24 `ZC_Standard_WrapMint` pinned `vault.value >= SELF.value
+- mintFee - 1000000L` so a minter cannot divert the wrap vault's refresh reserve into the receipt
+output, regenerating `WrapMint`'s pin and address only.
 
 Every transaction follows the zcs1 off-chain rules in
 [docs/ZC_STANDARD_OFFCHAIN.md](./docs/ZC_STANDARD_OFFCHAIN.md). It discloses each script its boxes name
@@ -152,7 +156,7 @@ CLI unlocks the wallet for a command, it locks it again afterwards.
 
 `sbt livetest` walks the CLI through every ZC Standard command on mainnet. Your node wallet is borrower,
 lender, seller, buyer and batcher throughout, so everything except miner fees comes back to it. It
-needs about 4 ERG and no SigUSD: loans are 0.1 ERG, at most about 2.7 ERG sits in contracts at once,
+needs about 4 ERG and no SigUSD: loans are 0.1 ERG, at most about 3.2 ERG sits in contracts at once,
 and the miner fees come to about 0.07 ERG. A run takes about 70 blocks (roughly 2.5 hours), set by the
 bond's 60-block recollateralize wait; `skip B3` saves about an hour.
 

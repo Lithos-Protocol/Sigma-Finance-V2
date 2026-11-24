@@ -81,6 +81,15 @@ trait StandardOffers extends AppBase { self: StandardApp =>
       case None => UTXO(protocol.market(m).offer, s.capital, Seq.empty, regs)
       case Some(id) => UTXO(protocol.market(m).offer, s.fees, Seq(Token(id, s.capital)), regs)
     }
+    // Check the projected post-fill continuation (which appends 32-byte SELF.id to R6) against consensus limits.
+    val projected = offer.withRegNum(6, bytesValue(protocol.market(m).policy.hashedValueBytes ++ Array.fill(32)(0.toByte)))
+    val projectedSize = boxSize(projected)
+    if (projectedSize > MaxBoxSize)
+      fail(s"the offer's continuation would be $projectedSize bytes, above Ergo's $MaxBoxSize-byte box limit: " +
+        "use a shorter share description or fewer curve points")
+    val minOfferValue = minBoxValue(projected)
+    if (offer.value < minOfferValue)
+      fail(s"the offer needs at least ${Fmt.erg(minOfferValue)} to cover its $projectedSize-byte box minimum")
     prepare("Create lend offer", plan(Seq.empty, Seq(offer)), Seq(
       s"lend up to ${Units.amount(s.capital, m)} at a simple yield per 262800 blocks of ${curve.describe}, or better",
       s"bonds maturing ${s.minBlocks} to ${s.maxBlocks} blocks after a fill, with the oracle rule at a ratio of at " +
@@ -161,9 +170,13 @@ trait StandardOffers extends AppBase { self: StandardApp =>
       Some("the fill's fees, box funding and reserve exceed its proportional ERG budget")
     else if (o.market.token.isDefined && BigInt(o.box.value) - ergOut < BigInt(MinBox) + o.batcherFee)
       Some("the fill would spend the token offer's expiry refund reserve")
+    else if ((shares || (o.delivers && !o.mintHash.sameElements(protocol.contracts.fractionalMint.hashedPropBytes))) &&
+      bond.collateral.size > MaxCollateralTokens)
+      Some(s"the bond carries ${bond.collateral.size} distinct collateral tokens (over the $MaxCollateralTokens-token " +
+        "limit for Dutch/Selective share vaults to pull under Ergo's 4,096-byte box limit)")
     else if (!bond.liqHash.sameElements(rule)) Some("the bond's liquidation rule is not the oracle rule the offer's policy requires")
     else if (bond.payload.size < 2 || bond.payload(0) < o.floorBps || bond.payload(1) < o.maxAge || bond.payload(1) > 100000L)
-      Some(s"the bond's own ratio or oracle age is under the offer's ${Units.percent(o.floorBps)} and ${o.maxAge} blocks")
+      Some(s"the bond's own ratio is under ${Units.percent(o.floorBps)} or its oracle age is outside ${o.maxAge} to 100000 blocks")
     else if (oracle.isEmpty) Some("the node's index has no single USD oracle pool box")
     else if (at - oracle.get.created > o.maxAge) Some(s"the oracle price is older than the offer's ${o.maxAge} blocks")
     else if (!cover.exists { case (c, d) => c * 10000 >= d * o.floorBps })
@@ -199,8 +212,9 @@ trait StandardOffers extends AppBase { self: StandardApp =>
 
   /**
    * zcs1's maturity for filling window order `order` from offer `o`, or None when no maturity suits both. The
-   * candidates are the ends of the heights both accept, both curves' breakpoints and the grid heights between: between
-   * those, both yields are straight lines, so the best maturity is always one of them. Of the ones the offer accepts,
+   * candidates are the ends of the heights both accept, both curves' breakpoints and the grid heights between:
+   * both raw curves are piecewise linear between them (on ERG offers the fixed batcher fee makes net implied yield
+   * slightly concave, so this candidate set is a deterministic heuristic). Of the ones the offer accepts,
    * a grid height comes first (bonds then gather on series maturities), then the widest gap between the yield the
    * offer would earn and the yield it requires (the most room for the inclusion height to move), then the shorter.
    * Nothing on chain enforces this: it is how every zcs1 batcher picks the same maturity.
@@ -241,9 +255,16 @@ trait StandardOffers extends AppBase { self: StandardApp =>
       case Some(id) => if (o.capital - price > 0L) Seq(Token(id, o.capital - price)) else Seq.empty
     }
     val value = o.box.value - ergOut
-    if (value < MinBox) fail(s"the offer's ${Fmt.erg(o.box.value)} cannot cover ${Fmt.erg(ergOut)} of fees and box minimums")
-    UTXO(Contract(o.box.input.getErgoTree), value, tokens, o.box.registers)
+    val base = UTXO(Contract(o.box.input.getErgoTree), MinBox, tokens, o.box.registers)
       .withRegNum(6, bytesValue(o.policyHash ++ o.box.id.getBytes))
+    val size = boxSize(base)
+    if (size > MaxBoxSize)
+      fail(s"the offer's continuation would be $size bytes, above Ergo's $MaxBoxSize-byte box limit")
+    val minKeep = minBoxValue(base)
+    if (value < minKeep)
+      fail(s"the offer's ${Fmt.erg(o.box.value)} cannot cover ${Fmt.erg(ergOut)} of fees and box minimums " +
+        s"(its $size-byte continuation needs at least ${Fmt.erg(minKeep)})")
+    base.setValue(value)
   }
 
   /** Where the offer sends a bond unit: to its owner, or into the share mint request it names. */

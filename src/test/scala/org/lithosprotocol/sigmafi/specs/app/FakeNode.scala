@@ -40,7 +40,15 @@ class FakeChain {
       require(unspent.remove(id).isDefined, s"double spend of $id")
       spent(id) = (b, signed.getId)
     }
-    outs.foreach(add)
+    outs.foreach { b =>
+      val size = b.bytes.length
+      require(size <= org.lithosprotocol.sigmafi.app.Protocol.MaxBoxSize,
+        s"output box ${Base16.encode(b.id)} is $size bytes, above Ergo's ${org.lithosprotocol.sigmafi.app.Protocol.MaxBoxSize}-byte limit")
+      val minVal = size.toLong * org.lithosprotocol.sigmafi.app.Protocol.MinValuePerByte
+      require(b.value >= minVal,
+        s"output box ${Base16.encode(b.id)} holds ${b.value} nanoERG, below its $size-byte minimum of $minVal nanoERG")
+      add(b)
+    }
     txs(signed.getId) = FakeTx(ins, outs, proofs)
   }
 

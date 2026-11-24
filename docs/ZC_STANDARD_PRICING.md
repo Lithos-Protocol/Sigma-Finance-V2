@@ -56,7 +56,7 @@ weaken them. Collateral guards execute separately, so pricing cannot turn one of
 | R6 `Coll[Byte]` | Borrower script hash |
 | R7 `Coll[Byte]` | Liquidation expression hash |
 | R8 `Coll[Coll[Byte]]` | Exactly `(pricing hash, optional guard hash)`; pricing is 32 bytes, guard empty or 32 |
-| R9 `Coll[Long]` | Pricing payload; for `YieldOrder_Pricing` exactly `(start height, start yield, end height, end yield)` |
+| R9 `Coll[Long]` | Pricing payload; for `YieldOrder_Pricing` exactly `(start height, start yield, end height, end yield)`; for `CurveOrder_Pricing` `(max duration, max yield, 0..20 (yield, blocks left) points)` |
 
 Input 0 is the issuing order. Output 0 is the circulating unit, output 1 the standard bond, output 2
 the principal and expiry refund. On fills, context var 1 carries the optional fill guard; var 2
@@ -190,7 +190,8 @@ the principal floor to what they need and quotes the most they pay at each term.
 Nothing on chain says; zcs1 does, so every batcher picks the same one. For a window order and an
 offer, the candidates are the ends of the heights both accept (the window, and the offer's minimum and
 maximum blocks left), both curves' breakpoints and the grid heights between them: between those, both
-yields are straight lines, so the best maturity is always one of them. Of the candidates the offer
+raw curves are piecewise linear (on ERG offers the fixed batcher fee makes net implied yield mildly
+concave, so this candidate set is a deterministic heuristic). Of the candidates the offer
 accepts (its yield, price, budget and policy, as for any fill):
 
 1. a grid height (a multiple of 21,600) first, so bonds gather on series maturities;
@@ -219,6 +220,11 @@ minimum 1% fill of original capital. See [the fee-budget rules](./AUDIT_REVIEW_2
 Equal rates may fail to match: short durations or small share fills may earn so little interest
 that the batcher fee exceeds it. On a 60-block loan, leaving room for a 0.005 ERG fee on a 0.12 ERG
 repayment takes a yield in the tens of thousands of percent.
+
+On `SaleOrder` and `PricedAsk`, the ask box's ERG (`0.001 ERG` minimum plus refund fee, `0.003 ERG` by
+default) survives partial fills and is not returned separately on a **full fill**: it serves as a
+seller-paid closing/expiry fee (on ERG asks it counts toward `payout.value`; on token asks the
+buyer/batcher retains it above the payout's box minimum). Keep ask refund fees small.
 
 ## Choosing pricing and maturity
 

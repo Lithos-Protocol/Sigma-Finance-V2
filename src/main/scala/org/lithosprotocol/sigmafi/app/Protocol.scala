@@ -190,6 +190,12 @@ object Protocol {
   /** Every protocol output that holds a token or registers carries at least this: 0.001 ERG. */
   final val MinBox: Long = Parameters.MinChangeValue
 
+  /** Ergo mainnet minimum nanoERG per serialized box byte (360 nanoERG/byte). */
+  final val MinValuePerByte: Long = 360L
+
+  /** Ergo consensus maximum serialized box size in bytes (4,096 bytes). */
+  final val MaxBoxSize: Int = 4096
+
   /**
    * zcs1 script disclosure: the context variable, on INPUTS(0), holding the ErgoTrees of scripts the
    * transaction's outputs name by hash. Variables 64 to 127 are reserved for off-chain data.

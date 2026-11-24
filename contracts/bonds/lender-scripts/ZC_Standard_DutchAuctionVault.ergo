@@ -25,8 +25,8 @@
     // REGISTERS
     // R4: Coll[Byte] - bond asset id
     // R5: Coll[Long] - (N, outstanding shares, pull fee), as in the standard vault
-    // R6: Byte - state, set by the pull. Registers are dense, so the mint already puts some R6 in
-    //   place to carry R7 and R8; no path reads it before the pull. After the pull:
+    // R6: Byte - state, set by the pull. Registers are dense, so the mint already puts R6: Byte = 0
+    //   in place to carry R7 and R8; Refresh reads it as a Byte even before the pull. After the pull:
     //   0 repaid; 1 auction open, currency short of the floor target; 2 lot sold or nothing to
     //   sell; 3 paid out in kind; 4 excess auction open, the floor target already held
     // R7: Coll[Long] - (repayment, opening bps, floor bps, length in blocks, expiry in blocks from the
@@ -124,6 +124,14 @@
     // - For an ERG currency, the vault's own box minimum and any pull fee left in it count as
     //   currency held. A puller may add nanoERG to lift the vault over the floor target and turn a
     //   state 1 auction into an excess auction; that only gives holders more of the currency.
+    // - For a token currency (e.g. SigUSD) with the Dutch threshold (Long max), merging the holding
+    //   vault (at least 1000000 above pullFee) and BondVault (at least 1000000) always leaves at
+    //   least 1000000 nanoERG of lot ERG above the box minimum. A liquidation therefore always opens
+    //   an auction (state 1 or 4) even if 100% of collateral was already the currency token, delaying
+    //   partial claims until auction length/expiry (final claim stays open; Selective threshold 100
+    //   is unaffected because 1000000 >= 100).
+    // - Ergo's 4,096-byte max box size caps how many distinct collateral tokens can be pulled into
+    //   this ~2.2 KB vault (~44-50 tokens). Clients cap collateral token counts off-chain (e.g. 30).
     // - Whoever pulls picks the start height within 8 blocks, so can open the auction up to 8
     //   blocks into its fall.
     // - Everything the standard vault assumes about rounding, lost shares, claimant-funded fees

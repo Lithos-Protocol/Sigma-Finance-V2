@@ -365,5 +365,15 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
   protected def addAmount(a: Long, b: Long): Long =
     Try(Math.addExact(a, b)).getOrElse(fail("the requested amount or height overflows a Long"))
 
+  /** Exact serialized ErgoBox size in bytes of a planned output. */
+  protected def boxSize(u: UTXO): Int =
+    u.setValue(math.max(u.value, MinBox)).toDummyInput(ctx).bytes.length
+
+  /** Minimum nanoERG a planned output needs under Ergo mainnet's 360 nanoERG/byte rule (at least MinBox). */
+  protected def minBoxValue(u: UTXO): Long = {
+    val first = math.max(MinBox, boxSize(u).toLong * MinValuePerByte)
+    math.max(first, boxSize(u.setValue(first)).toLong * MinValuePerByte)
+  }
+
   protected def fail(message: String): Nothing = throw CliError(message)
 }

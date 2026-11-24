@@ -255,6 +255,9 @@ object ExchangeCommands {
       println(s"Share ${v.shareId}  vault ${v.box.id}  ($kind)" +
         (if (app.shareVerified(v)) "" else " (WARNING: not minted by a standard share mint: this vault proves nothing)"))
       println(s"  bond ${v.bondAsset}: ${v.outstanding} of ${v.n} shares outstanding")
+      if (v.dutch && app.liveBondOf(v.shareId).exists(_.collateral.size > StandardProtocol.MaxCollateralTokens))
+        println(s"  WARNING: the underlying bond carries more than ${StandardProtocol.MaxCollateralTokens} collateral tokens " +
+          "(pulling a liquidated settlement into this vault may exceed Ergo's 4,096-byte box limit)")
       metadataLine(app.shareMetadataIssues(v.shareId))
       val status =
         if (v.holding) "holds the bond unit; pull its settlement once the bond is repaid or liquidated"
@@ -390,9 +393,9 @@ object ExchangeCommands {
     println(if (issues.isEmpty) "  metadata: zcs1" else s"  metadata: NONSTANDARD: ${issues.mkString("; ")}")
 
   /**
-   * List the work, and with --run do it in rounds (StandardBatch.runBatch): refunds and liquidations packed into
-   * shared transactions, the rest one by one, and a fresh scan after each round so fills chain through an
-   * offer's continuation.
+   * List the work, and with --run do it in rounds (StandardBatch.runBatch): refunds, liquidations and refreshes
+   * packed into shared transactions, the rest one by one, and a fresh scan after each round so fills chain through
+   * an offer's continuation.
    */
   private def batch(app: StandardApp, a: Args, run: String => Boolean): Unit = {
     val scan = app.batchScan()

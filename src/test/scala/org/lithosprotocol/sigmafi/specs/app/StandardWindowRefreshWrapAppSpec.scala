@@ -254,4 +254,120 @@ class StandardWindowRefreshWrapAppSpec extends AnyPropSpec with StandardSpecSupp
       w.app(l).shareVaults().find(_.shareId == s3).get.state shouldBe Some(3.toByte)
     }
   }
+
+  // ═══ AUDIT HARDENING (FS-1, FS-3, FS-4, FS-5) ═════════════════════════════
+
+  property("FS-1: sell warns on a large refund fee or an ERG fixed ask priced at or under its box ERG") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val l = lender(ctx)
+      w.fund(l, erg("5"), Token(collateralToken, 10L))
+      val bigFee = w.app(l).sell(collateralToken.toString, 1L, Market.Erg, FixedPrice(erg("1")), None, w.h + 500L, erg("0.05"))
+      bigFee.notes.exists(_.contains("WARNING: refund fee")) shouldBe true
+      bigFee.notes.exists(_.contains("not returned separately")) shouldBe true
+      val tinyPrice = w.app(l).sell(collateralToken.toString, 1L, Market.Erg, FixedPrice(erg("0.002")), None, w.h + 500L, erg("0.002"))
+      tinyPrice.notes.exists(_.contains("WARNING: total price")) shouldBe true
+    }
+  }
+
+  property("FS-3: vault refreshes, buyLot and partial claims strip unknown trailing spam registers") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (l, e) = (lender(ctx), executor(ctx))
+      w.fund(e, erg("40"))
+      val spam = bytesValue(Array.fill(200)(0x55.toByte))
+      val asset = ErgoId.create("bb" * 32)
+      val share1 = ErgoId.create("bc" * 32)
+      val share2 = ErgoId.create("bd" * 32)
+      val share3 = ErgoId.create("be" * 32)
+      w.fund(l, erg("2"), Token(share3, 250L))
+
+      // BondVault with spam R6, FractionalVault with spam R7, DutchAuctionVault with spam R9: all refresh cleanly.
+      val bv = w.seed(UTXO(protocol.contracts.vault, erg("0.1"), Seq(Token(asset, 2L)),
+        Seq(bytesValue(asset.getBytes), ErgoValue.of(1.toByte), spam), Some(w.h)))
+      val fv = w.seed(UTXO(protocol.contracts.fractionalVault, erg("0.1"), Seq(Token(share1, 101L), Token(collateralToken, 5L)),
+        Seq(bytesValue(asset.getBytes), longsValue(100L, 100L, erg("0.002")), ErgoValue.of(0.toByte), spam), Some(w.h)))
+      val dv = w.seed(dutchVault(w, share2, 2.toByte, 0L, erg("0.1")).withRegNum(9, spam))
+      val refreshed = w.run(e, later(w, e).refresh(Seq(bv.id.toString, fv.id.toString, dv.id.toString)))
+      refreshed.getOutputsToSpend.asScala.find(_.getErgoTree == protocol.contracts.vault.ergoTree).get.getRegisters.size shouldBe 2
+      refreshed.getOutputsToSpend.asScala.find(_.getErgoTree == protocol.contracts.fractionalVault.ergoTree).get.getRegisters.size shouldBe 3
+      refreshed.getOutputsToSpend.asScala.find(_.getErgoTree == protocol.contracts.dutchVault.ergoTree).get.getRegisters.size shouldBe 5
+
+      // DutchAuctionVault with spam R9 strips R9 on buyLot and on partial claimShares.
+      val openSpam = w.seed(dutchVault(w, share3, 4.toByte, w.h.toLong, erg("10.5")).withRegNum(9, spam))
+      val bought = w.run(e, w.app(e).buyLot(openSpam.id.toString))
+      bought.getOutputsToSpend.get(0).getRegisters.size shouldBe 5
+      val claimed = w.run(l, w.app(l).claimShares(share3.toString, Some(100L)))
+      claimed.getOutputsToSpend.get(1).getRegisters.size shouldBe 5
+    }
+  }
+
+  property("FS-4 & FS-5: dynamic minValuePerByte on large DutchAuctionVault, partial claim floor, 4 KB offer cap, and 30-token cap") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, l, e) = (borrower(ctx), lender(ctx), executor(ctx))
+      val manyTokens = (1 to 31).map(i => Token(ErgoId.create(f"c1$i%062x"), 500L))
+      w.fund(b, erg("40"), manyTokens: _*)
+      w.fund(l, erg("40"), Token(SigUsd, 20000L))
+      w.fund(e, erg("40"), Token(SigUsd, 20000L))
+      w.oracle(500000000L, w.h)
+
+      // createOrder refuses > 30 distinct collateral tokens.
+      refused(w.app(b).createOrder(loan(collateral = manyTokens)(w))) should include("at most 30")
+
+      // createOffer refuses custom share metadata whose post-fill continuation (+32 B R6) exceeds 4,096 bytes.
+      val bigDesc = "x" * 1800
+      val hugeShareTerms = ShareTerms(pullFee = erg("0.005"), mintFee = erg("0.005"), description = Some(bigDesc),
+        auction = Some(AuctionTerms(12000L, 9000L, 720L, 2160L, StandardProtocol.SelectiveThreshold)))
+      refused(w.app(l).createOffer(OfferSpec(Market.SigUsd, 1000L, erg("0.5"), 1000L, 1L, 262800L, erg("0.005"),
+        reserve, 13000L, 30L, w.h + 500L, 1L, 0L, 0L, Some(OfferDelivery(hugeShareTerms))))) should include("4096-byte")
+
+      // A seeded 31-token bond is refused by Dutch fractionalize and Dutch-delivering offers.
+      val bigAsset = ErgoId.create("c2" * 32)
+      val bigOrder = w.seed(UTXO(protocol.market(Market.Erg).order, erg("10") + erg("0.005"), manyTokens,
+        Seq(longsValue(erg("6"), erg("5"), erg("6"), w.h + 1000L, w.h + 500L, erg("0.005"), 0L), tokensValue(Seq.empty),
+          bytesValue(hashOf(Contract.fromAddress(b.getAddress).ergoTree)), bytesValue(protocol.market(Market.Erg).oracleRule.hashedValueBytes))))
+      val bigOrderBox = bigOrder.input.asInstanceOf[org.ergoplatform.appkit.impl.InputBoxImpl].getErgoBox
+      w.chain.unspent.remove(bigOrder.id.toString)
+      w.chain.spent(bigOrder.id.toString) = (bigOrderBox, "d1" * 32)
+      val bigBond = w.bond(Market.Erg, bigOrder.id, erg("10"), manyTokens, erg("6"),
+        protocol.market(Market.Erg).oracleRule, w.h.toLong, w.h + 1000L, w.h, payload = Seq(15000L, 60L))
+      w.fund(l, MinBox, Token(bigOrder.id, 1L))
+      refused(w.app(l).fractionalize(bigOrder.id.toString, ShareTerms(pullFee = erg("0.005"), mintFee = erg("0.005"),
+        auction = Some(AuctionTerms(12000L, 9000L, 720L, 2160L, StandardProtocol.SelectiveThreshold))))) should include("30-token limit")
+      val dutchOffer = OfferSpec(Market.Erg, erg("20"), 0L, 500L, 1L, 262800L, erg("0.005"), reserve, 13000L, 30L,
+        w.h + 500L, 1L, 0L, 0L, Some(OfferDelivery(ShareTerms(pullFee = erg("0.005"), mintFee = erg("0.005"),
+          auction = Some(AuctionTerms(12000L, 9000L, 720L, 2160L, StandardProtocol.SelectiveThreshold))))))
+      w.run(l, w.app(l).createOffer(dutchOffer))
+      val offer = w.app(e).offers().loneElement
+      val liveBig = protocol.asBond(bigBond).get
+      w.app(e).offerRefusal(offer, liveBig, erg("5"), 1L, 1L, Some(w.app(e).oracle().get), primary = true)
+        .getOrElse(fail("expected refusal")) should include("30-token limit")
+
+      // A 15-token SigUSD DutchAuctionVault (> 2,777 B, minValuePerByte > MinBox):
+      // State-4 buyLot (!saleKeepsErg), partial claim (FS-5), and refresh all satisfy FakeChain's 360 nanoERG/byte check.
+      val fatTokens = (1 to 15).map(i => Token(ErgoId.create(f"c1$i%062x"), 5000000L))
+      val thinNft = Token(ErgoId.create("c3" * 32), 1L)
+      val s4 = ErgoId.create("c4" * 32)
+      w.fund(l, erg("2"), Token(s4, 600L))
+      val sigVault = w.seed(UTXO(protocol.contracts.dutchVault, erg("0.002"),
+        Token(s4, 1001L) +: Token(SigUsd, 1000L) +: thinNft +: fatTokens,
+        Seq(bytesValue(bigAsset.getBytes), longsValue(1000L, 1000L, erg("0.002")), ErgoValue.of(4.toByte),
+          longsValue(1000L, 10000L, 8000L, 500L, 2160L, 2000000L, w.h.toLong), bytesValue(SigUsd.getBytes)), Some(w.h)))
+      // State-4 buyLot sells thinNft + lotERG, keeps 15 fat tokens + SigUSD (> 2,777 B), and funds >= 360 nanoERG/byte.
+      val afterSale = w.run(e, w.app(e).buyLot(sigVault.id.toString))
+      afterSale.getOutputsToSpend.get(0).getValue.longValue should be > MinBox
+      afterSale.getOutputsToSpend.get(0).getValue.longValue should be < erg("0.002")
+      // 60% partial claim (FS-5): remaining ERG drops below MinBox and tops up to >= minValuePerByte.
+      val afterClaim = w.run(l, w.app(l).claimShares(s4.toString, Some(600L)))
+      afterClaim.getOutputsToSpend.get(1).getValue.longValue should be > MinBox
+      // Refresh of a 15-token DutchAuctionVault holding 0.005 ERG never drops below its 360 nanoERG/byte floor.
+      val oldBig = w.seed(UTXO(protocol.contracts.dutchVault, erg("0.005"),
+        Token(ErgoId.create("c5" * 32), 1001L) +: Token(SigUsd, 1000L) +: fatTokens,
+        Seq(bytesValue(bigAsset.getBytes), longsValue(1000L, 1000L, erg("0.002")), ErgoValue.of(2.toByte),
+          longsValue(1000L, 10000L, 8000L, 500L, 2160L, 100L, 0L), bytesValue(SigUsd.getBytes)), Some(w.h)))
+      val afterRef = w.run(e, later(w, e).refresh(Seq(oldBig.id.toString)))
+      afterRef.getOutputsToSpend.get(0).getValue.longValue should be > MinBox
+    }
+  }
 }
