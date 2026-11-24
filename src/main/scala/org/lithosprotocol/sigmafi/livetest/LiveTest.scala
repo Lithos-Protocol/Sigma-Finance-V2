@@ -916,6 +916,9 @@ class LiveRunner(session: SigmaFiCli.Session, launch: Args, file: File, chainOpt
       app.orders().filter(o => mine(o.borrowerHash)).map(o => s"cancel-order ${o.box.id}") ++
         app.offers().filter(o => mine(o.ownerHash)).map(o => s"cancel-offer ${o.box.id}") ++
         app.asks().filter(a => mine(a.sellerHash)).map(a => s"cancel-ask ${a.box.id}") ++
+        app.lots().filter(l => mine(l.sellerHash)).map(l => s"cancel-lot ${l.box.id}") ++
+        app.wrapRequests().filter(r => mine(r.ownerHash)).map(r => s"cancel-wrap ${r.box.id}") ++
+        app.wrapVaults().filter(v => app.walletHolds(v.receiptId)).map(v => s"unwrap ${v.receiptId}") ++
         app.shareRequests().filter(r => mine(r.ownerHash)).map(r => s"cancel-share-request ${r.box.id}") ++
         app.shareVaults().filter(v => app.walletHolds(v.shareId)).map(v =>
           if (v.holding && settled.contains(v.bondAsset)) s"pull ${v.box.id}" else s"claim-shares ${v.shareId}") ++

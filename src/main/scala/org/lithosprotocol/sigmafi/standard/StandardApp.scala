@@ -75,6 +75,10 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
   def settlements(): Seq[StdSettlement] =
     decoded(node.unspentByErgoTree(protocol.contracts.vault.ergoTreeHex)).flatMap(protocol.asSettlement)
 
+  /** Settled bond vault boxes holding `asset`'s reserve, via an O(1) indexed token lookup. */
+  def settlementsOf(asset: ErgoId): Seq[StdSettlement] =
+    decoded(node.unspentByTokenId(asset.toString)).flatMap(protocol.asSettlement).filter(_.asset == asset)
+
   /**
    * The USD oracle pool box as confirmed on chain, never one from the mempool, even with --mempool. Oracles
    * race to refresh the pool and the losing refresh's box never exists, so a data input read from the
@@ -475,7 +479,7 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
                 chosenMaturity: Option[Long] = None): Prepared = {
     if (feeReserve < 0L) fail("the fee reserve cannot be negative")
     val original = protocol.asOrder(unspent(orderId)).getOrElse(fail(s"$orderId is not a ZC Standard order"))
-    checkOrder(original)
+    checkOrder(original, chosenMaturity)
     val order = resolveOrder(original, height.toLong, chosenMaturity)
     val m = order.market
     val rule = protocol.ruleOf(order.liqHash)
@@ -529,7 +533,7 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
       start, maturity, StandardMetadata.ruleText(Some(rule), order.payload, order.liqHash))).map(utf8Value)
 
   /** The fill's own checks, so a lender learns why before the node refuses. */
-  private[standard] def checkOrder(o: StdOrder): Unit = {
+  private[standard] def checkOrder(o: StdOrder, chosenMaturity: Option[Long] = None): Unit = {
     if (o.window) {
       if (!o.priced || !protocol.curveOrder(o))
         fail("the window order is not priced by CurveOrder_Pricing, the one expression that prices every maturity in " +
@@ -543,7 +547,7 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
       if (policies.size != 2 || policies.head.length != 32 ||
         (policies(1).nonEmpty && policies(1).length != 32) || o.pricingTerms.size > 64)
         fail("the priced order has malformed policy commitments")
-      orderPrincipal(o, height.toLong + 3L, height.toLong)
+      orderPrincipal(o, height.toLong + QuoteBlocks, height.toLong, chosenMaturity)
     }
     val oneAsset = o.market.token match {
       case None => o.principalTokens.isEmpty && o.principalErg > 0L && o.ergFloor <= o.repayment
@@ -562,7 +566,7 @@ class StandardApp(ctx: BlockchainContext, node: NodeApi, settings: AppSettings, 
   /** Every vault box holding the asset's reserve, claimed at once with the unit; all of the asset is burned. */
   def claim(assetId: String): Prepared = {
     val asset = Try(ErgoId.create(assetId)).getOrElse(fail(s"$assetId is not a token id"))
-    val settled = settlements().filter(_.asset == asset)
+    val settled = settlementsOf(asset)
     if (settled.isEmpty) fail(s"no vault box holds $assetId: its bond has not been repaid or liquidated yet")
     val unit = walletBoxes.find(_.tokens.exists(_.id == asset)).getOrElse(fail(s"this wallet does not hold bond asset $assetId"))
     val burned = settled.map(_.box.tokens.head.amount).sum + unit.tokens.filter(_.id == asset).map(_.amount).sum

@@ -64,8 +64,11 @@ trait StandardAsks extends AppBase { self: StandardApp =>
    * so it is the most over the next few blocks, to survive the mempool; overpaying reaches the seller.
    */
   def askPrice(ask: StdAsk, units: Long): (Long, Option[StdBond]) =
-    if (!ask.priced) (ask.fixedPrice(units).toLong, None)
-    else {
+    if (!ask.priced) {
+      val owed = ask.fixedPrice(units)
+      if (!owed.isValidLong || owed <= 0) fail("the ask price is outside the supported amount range")
+      (owed.toLong, None)
+    } else {
       val bond = pricedBond(ask)
       protocol.pricingOf(ask) // Refuse unknown policies rather than applying an unrelated formula.
       val line = ask.yieldLine.filter(_.valid).getOrElse(fail("invalid yield pricing terms"))
@@ -139,7 +142,7 @@ trait StandardAsks extends AppBase { self: StandardApp =>
     val guardNote = guard.map(g => s"sale guard: it sells only while the bond's collateral is worth at least " +
       s"${Units.percent(g.minBps)} of its repayment at an oracle price at most ${g.maxAge} blocks old; below that, " +
       "anyone may liquidate the bond and you claim its collateral with the unit").toSeq
-    val ask = UTXO(script, MinBox + refundFee, Seq(Token(token, amount)), regs)
+    val ask = UTXO(script, addAmount(MinBox, refundFee), Seq(Token(token, amount)), regs)
     val feeWarnings =
       (if (refundFee > 20000000L)
         Seq(s"WARNING: refund fee ${Fmt.erg(refundFee)} is large; the ask's box ERG (${Fmt.erg(MinBox + refundFee)}) " +
@@ -180,7 +183,8 @@ trait StandardAsks extends AppBase { self: StandardApp =>
    */
   def shareLot(token: ErgoId): Option[Long] =
     bondOf(token).filter(_._2 > 1L).flatMap { case (asset, n) =>
-      bondRecord(asset).filter(_.repayment > 0L).map(b => math.max(1L, (n + b.repayment - 1L) / b.repayment))
+      bondRecord(asset).filter(_.repayment > 0L)
+        .map(b => ((BigInt(n) + b.repayment - 1) / b.repayment).min(BigInt(Long.MaxValue)).toLong.max(1L))
     }
 
   /**
@@ -190,7 +194,7 @@ trait StandardAsks extends AppBase { self: StandardApp =>
   def faceBps(token: ErgoId, price: Long, units: Long): Option[Long] =
     bondOf(token).flatMap { case (asset, whole) =>
       bondRecord(asset).filter(b => b.repayment > 0L && units > 0L)
-        .map(b => (BigInt(price) * whole * 10000 / (BigInt(units) * b.repayment)).toLong)
+        .map(b => (BigInt(price) * whole * 10000 / (BigInt(units) * b.repayment)).min(BigInt(Long.MaxValue)).toLong)
     }
 
   // ═══ BUY, CANCEL, REFUND ══════════════════════════════════════════════════
@@ -303,15 +307,19 @@ trait StandardAsks extends AppBase { self: StandardApp =>
     if (refundFee < 0L) fail("the refund fee cannot be negative")
     // A token-currency lot sells its nanoERG too; an ERG lot keeps its box's nanoERG for the seller. The refund
     // fee sits above the box minimum, so an expiry refund still leaves the seller a valid box.
-    val value = math.max(erg, MinBox) + refundFee
+    val value = addAmount(math.max(erg, MinBox), refundFee)
     val box = UTXO(protocol.market(market).lotAuction, value, tokens,
       Seq(bytesValue(hashOf(myTree)), longsValue(opening, floor, start, end, expiry, refundFee)))
+    val refundNote =
+      if (market.token.isDefined && refundFee > 0L)
+        s" (note: on a $market lot, the box's full ${Fmt.erg(value)}, including the refund fee, goes to the buyer if bought)"
+      else ""
     prepare("Sell a lot", plan(Seq.empty, Seq(box)), Seq(
       s"lot: ${Fmt.contents(if (market.token.isEmpty) 0L else value, tokens)}",
       s"price in $market: ${Units.amount(opening, market)} until height $start, falling in a straight line to " +
         s"${Units.amount(floor, market)} at height $end, then held there until height $expiry",
       s"sold whole to the first buyer; from height $expiry anyone may return it to you for the ${Fmt.erg(refundFee)} " +
-        "refund fee",
+        s"refund fee$refundNote",
       "Output 0 is the lot. Cancel it any time with `cancel-lot <its box id>`."))
   }
 
@@ -322,12 +330,14 @@ trait StandardAsks extends AppBase { self: StandardApp =>
   def takeLot(lotId: String): Prepared = {
     val lot = protocol.asLot(unspent(lotId)).getOrElse(fail(s"$lotId is not a ZC Standard lot auction"))
     if (!lot.valid) fail("the lot's terms are malformed, so only its seller can cancel it")
+    if (lot.market.token.exists(id => lot.lot.exists(_.id == id)))
+      fail(s"the lot holds ${lot.market} itself, so it cannot be bought; only its seller can cancel it")
     if (height.toLong + 1L >= lot.expiry) fail(s"the lot expired at height ${lot.expiry}")
     val price = lot.price(height.toLong)
     val seller = Contract(ownerTree(lot.sellerHash, lot.box, "seller"))
     val tag = Seq(bytesValue(lot.box.id.getBytes))
     val payout = lot.market.token match {
-      case None => UTXO(seller, lot.box.value + price, Seq.empty, tag)
+      case None => UTXO(seller, addAmount(lot.box.value, price), Seq.empty, tag)
       case Some(id) => UTXO(seller, MinBox, Seq(Token(id, price)), tag)
     }
     prepare(s"Take lot $lotId", plan(Seq(lot.box.withCtxVar(0.toByte, intValue(0))), Seq(payout)), Seq(

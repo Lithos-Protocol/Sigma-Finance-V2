@@ -43,6 +43,8 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     if (s.yieldBps < 0L) fail("the yield cannot be negative")
     if (s.minBlocks < 1L || s.maxBlocks < s.minBlocks) fail("the maturity window needs 1 <= min blocks <= max blocks")
     if (s.batcherFee < MinBatchingFee) fail(s"the batcher fee must be at least ${Fmt.erg(MinBatchingFee)}")
+    if (m.token.isEmpty && s.batcherFee >= s.capital - MinBox)
+      fail("on an ERG offer, the batcher fee must leave capital above the 0.001 ERG box minimum")
     if (s.feeReserve < 0L) fail("the fee reserve cannot be negative")
     if (s.floorBps <= 0L) fail("the collateral floor must be positive")
     if (s.maxAge < 1L || s.maxAge > 100000L) fail("the oracle age must be 1 to 100000 blocks")
@@ -90,6 +92,14 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     val minOfferValue = minBoxValue(projected)
     if (offer.value < minOfferValue)
       fail(s"the offer needs at least ${Fmt.erg(minOfferValue)} to cover its $projectedSize-byte box minimum")
+    val offerWarnings =
+      (if (m.token.isEmpty && BigInt(s.batcherFee) * 5 >= BigInt(s.capital))
+        Seq(s"WARNING: batcher fee ${Fmt.erg(s.batcherFee)} is at least 20% of the offer's ${Fmt.erg(s.capital)} capital " +
+          "(and is also paid outright on an expiry refund)")
+      else Seq.empty) ++
+      (if (s.auctionExpiry > 0L && s.auctionFloorBps == 0L)
+        Seq("WARNING: a 0% minimum auction floor admits Selective/Dutch shares with opening = 0%, which never open an auction on liquidation")
+      else Seq.empty)
     prepare("Create lend offer", plan(Seq.empty, Seq(offer)), Seq(
       s"lend up to ${Units.amount(s.capital, m)} at a simple yield per 262800 blocks of ${curve.describe}, or better",
       s"bonds maturing ${s.minBlocks} to ${s.maxBlocks} blocks after a fill, with the oracle rule at a ratio of at " +
@@ -104,7 +114,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
       s.delivery.fold("bond units come to this wallet")(d => s"bond units are delivered into ${d.terms.shares} shares" +
         d.terms.auction.fold(" (plain fractional)")(a => s" (${a.kind})") + s", named '${d.terms.metadata(standard.get).head}'"),
       s"expires at height ${s.expiry}; cancel it any time with `cancel-offer <its box id>`") ++
-      s.delivery.toSeq.flatMap(_.terms.departures(standard.get)))
+      offerWarnings ++ s.delivery.toSeq.flatMap(_.terms.departures(standard.get)))
   }
 
   /** How an offer's share delivery departs from zcs1: its count and its metadata, which omit the bond. */
@@ -133,32 +143,48 @@ trait StandardOffers extends AppBase { self: StandardApp =>
 
   // ═══ THE OFFER'S OWN CHECKS, OFF CHAIN ════════════════════════════════════
 
+  /** Minimum ERG an offer continuation needs under consensus rules (360 nanoERG/byte, at least MinBox). */
+  private[standard] def minContinuationErg(o: StdOffer, price: Long): Long = {
+    val tokens = o.market.token match {
+      case None => Seq.empty[Token]
+      case Some(id) => if (o.capital - price > 0L) Seq(Token(id, o.capital - price)) else Seq.empty
+    }
+    minBoxValue(UTXO(Contract(o.box.input.getErgoTree), MinBox, tokens, o.box.registers)
+      .withRegNum(6, bytesValue(o.policyHash ++ o.box.id.getBytes)))
+  }
+
   /**
    * Why `offer` would refuse paying `price` for `units` of `whole` units of `bond`, or None if it would not:
-   * expiry, the maturity window, the minimum price, the yield test, capital, and the collateral policy at the
-   * oracle's price. A refusal here saves a failed transaction; the contract has the last word.
+   * expiry, the maturity window, the minimum price, the yield test, capital, ERG affordability, and the collateral
+   * policy at the oracle's price. Checks inclusion across [height + 1, min(height + QuoteBlocks, expiry - 1)] so a
+   * match near `minBlocks` or on a downward-sloping curve survives mempool latency.
    */
   def offerRefusal(o: StdOffer, bond: StdBond, price: Long, units: Long, whole: Long,
                    oracle: Option[OracleState], primary: Boolean = false, shares: Boolean = false): Option[String] = {
     val at = height.toLong + 1L
+    val slackAt = math.max(at, math.min(height.toLong + QuoteBlocks, o.expiry - 1L))
     val remaining = bond.maturity - at
+    val remainingLate = bond.maturity - slackAt
     val fee = o.fillFee(price)
     val cost = if (o.market.token.isEmpty) BigInt(price) + fee else BigInt(price)
     val delivery = if (!o.delivers || shares) BigInt(MinBox) else BigInt(2L * MinBox) + o.fractional(1) + o.fractional(2)
-    val ergOut = BigInt(fee) + delivery + (if (primary) o.feeReserve else 0L) +
-      (if (primary) bond.terms(1) else MinBox)
+    val ergBesidePrice = if (o.market.token.isEmpty) BigInt(price) else if (primary) BigInt(bond.terms(1)) else BigInt(MinBox)
+    val ergOut = BigInt(fee) + delivery + (if (primary) o.feeReserve else 0L) + ergBesidePrice
     val rule = protocol.market(o.market).oracleRule.hashedValueBytes
     lazy val cover = oracle.flatMap(p => protocol.cover(bond, p.price))
     if (at >= o.expiry) Some(s"the offer expired at height ${o.expiry}")
     else if (o.market != bond.market) Some(s"the offer lends in ${o.market}, the bond repays in ${bond.market}")
-    else if (remaining <= 0L || remaining < o.terms(1) || remaining > o.terms(2))
+    else if (remaining <= 0L || remainingLate < o.terms(1) || remaining > o.terms(2))
       Some(s"the bond matures in $remaining blocks, outside the offer's ${o.terms(1)} to ${o.terms(2)}")
     else if (price <= 0L || price < o.minPrice) Some(s"the price ${Units.amount(price, o.market)} is under the offer's minimum")
     else if (!o.curve.ordered || o.yieldBps < 0L) Some("the offer's yield curve is malformed")
-    else if (!o.curve.accepts(bond.repayment, units, cost.toLong, whole, remaining))
+    else if (!cost.isValidLong || cost <= 0) Some("the fill cost is outside the supported amount range")
+    else if (!(at to slackAt).forall(h => o.curve.accepts(bond.repayment, units, cost.toLong, whole, bond.maturity - h)))
       Some(s"${Units.amount(price, o.market)} for $units of $whole is under the offer's " +
         s"${Units.percent(o.curve.bpsAt(remaining))} yield at $remaining blocks")
     else if (o.capital < price) Some(s"the offer holds only ${Units.amount(o.capital, o.market)}")
+    else if (o.market.token.isEmpty && BigInt(o.box.value) - ergOut < BigInt(minContinuationErg(o, price)))
+      Some(s"the offer's ${Fmt.erg(o.box.value)} cannot cover ${Fmt.erg(ergOut.min(BigInt(Long.MaxValue)).toLong)} plus its continuation box minimum")
     else if (o.market.token.isDefined && (o.originalCapital <= 0L || o.capital > o.originalCapital ||
       o.spendBudget <= 0L || o.batcherBudget <= 0L || o.batcherBudget >= o.spendBudget ||
       o.minFillBps < 100L || o.minFillBps > 10000L || o.batcherFee < MinBatchingFee))
@@ -168,7 +194,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
     else if (fee < MinBatchingFee) Some("the calculated batcher reward is below 0.002 ERG")
     else if (o.market.token.isDefined && ergOut * o.originalCapital > BigInt(o.spendBudget) * price)
       Some("the fill's fees, box funding and reserve exceed its proportional ERG budget")
-    else if (o.market.token.isDefined && BigInt(o.box.value) - ergOut < BigInt(MinBox) + o.batcherFee)
+    else if (o.market.token.isDefined && BigInt(o.box.value) - ergOut < BigInt(math.max(minContinuationErg(o, price), MinBox + o.batcherFee)))
       Some("the fill would spend the token offer's expiry refund reserve")
     else if ((shares || (o.delivers && !o.mintHash.sameElements(protocol.contracts.fractionalMint.hashedPropBytes))) &&
       bond.collateral.size > MaxCollateralTokens)
@@ -222,24 +248,51 @@ trait StandardOffers extends AppBase { self: StandardApp =>
   def windowMaturity(o: StdOffer, order: StdOrder, oracle: Option[OracleState]): Option[Long] = {
     val start = height.toLong
     val at = start + 1L
+    val slackAt = math.max(at, math.min(start + QuoteBlocks, o.expiry - 1L))
     (protocol.orderWindow(order), protocol.orderBorrowCurve(order)) match {
       case (Some((lo, hi)), Some(borrow)) =>
-        val from = math.max(start + lo, at + o.minBlocks)
+        val from = math.max(start + lo, slackAt + o.minBlocks)
         val to = math.min(start + hi, at + o.maxBlocks)
-        val candidates = (Seq(from, to) ++ borrow.breakpoints.map(start + _) ++ o.curve.points.map(p => at + p._2) ++
-          windowGrid(from, to)).filter(m => m >= from && m <= to).distinct
-        val feasible: Seq[(Long, BigInt)] = candidates.flatMap { m =>
-          Try[Option[(Long, BigInt)]] {
+        if (from > to) None
+        else {
+          def gapAt(m: Long): Option[BigInt] = Try {
             val resolved = resolveOrder(order, start, Some(m))
-            val bond = prospective(resolved, start, m, o.feeReserve)
-            if (offerRefusal(o, bond, resolved.principal, 1L, 1L, oracle, primary = true).isEmpty &&
-              guardRefusal(resolved, bond, oracle).isEmpty) {
-              val (rate, span) = o.curve.at(m - at)
-              Some(m -> (impliedYield(o, resolved.repayment, resolved.principal, 1L, 1L, m) - rate * 1000000 / span))
-            } else None
-          }.toOption.flatten.toSeq
+            val (rate, span) = o.curve.at(m - at)
+            impliedYield(o, resolved.repayment, resolved.principal, 1L, 1L, m) - rate * 1000000 / span
+          }.toOption
+          // On ERG offers, fixed batcherFee makes net implied yield concave inside a piecewise linear segment;
+          // a discrete ternary search locates any interior peak between adjacent breakpoints.
+          def interiorPeak(a: Long, b: Long): Seq[Long] =
+            if (o.market.token.isDefined || b - a < 2L) Seq.empty
+            else {
+              var l = a
+              var r = b
+              while (r - l > 2L) {
+                val m1 = l + (r - l) / 3L
+                val m2 = r - (r - l) / 3L
+                val g1 = gapAt(m1)
+                val g2 = gapAt(m2)
+                if (g1.isDefined && g2.forall(g1.get >= _)) r = m2 else l = m1
+              }
+              ((l to r): Seq[Long]).filter(m => m > a && m < b)
+            }
+          val knots = (Seq(from, to) ++ borrow.breakpoints.map(at + _) ++ o.curve.points.map(p => at + p._2))
+            .filter(m => m >= from && m <= to).distinct.sorted
+          val peaks = knots.sliding(2).flatMap { case Seq(a, b) => interiorPeak(a, b); case _ => Seq.empty }.toSeq
+          val candidates = (knots ++ peaks ++ windowGrid(from, to)).filter(m => m >= from && m <= to).distinct
+          val feasible: Seq[(Long, BigInt)] = candidates.flatMap { m =>
+            Try[Option[(Long, BigInt)]] {
+              val resolved = resolveOrder(order, start, Some(m))
+              val bond = prospective(resolved, start, m, o.feeReserve)
+              if (offerRefusal(o, bond, resolved.principal, 1L, 1L, oracle, primary = true).isEmpty &&
+                guardRefusal(resolved, bond, oracle).isEmpty) {
+                val (rate, span) = o.curve.at(m - at)
+                Some(m -> (impliedYield(o, resolved.repayment, resolved.principal, 1L, 1L, m) - rate * 1000000 / span))
+              } else None
+            }.toOption.flatten.toSeq
+          }
+          feasible.sortBy { case (m, gap) => (if (m % MaturityGrid == 0L) 0 else 1, -gap, m) }.headOption.map(_._1)
         }
-        feasible.sortBy { case (m, gap) => (if (m % MaturityGrid == 0L) 0 else 1, -gap, m) }.headOption.map(_._1)
       case _ => None
     }
   }
@@ -300,7 +353,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
   def matchOrder(offerId: String, orderId: String, chosenMaturity: Option[Long] = None): Prepared = {
     val o = protocol.asOffer(unspent(offerId)).getOrElse(fail(s"$offerId is not a ZC Standard lend offer"))
     val original = protocol.asOrder(unspent(orderId)).getOrElse(fail(s"$orderId is not a ZC Standard order"))
-    checkOrder(original)
+    checkOrder(original, chosenMaturity)
     val oracle = Try(self.oracle()).toOption.flatten
     val start = height.toLong
     // A window order matches at the maturity given, or else the one zcs1's rule picks for this offer.

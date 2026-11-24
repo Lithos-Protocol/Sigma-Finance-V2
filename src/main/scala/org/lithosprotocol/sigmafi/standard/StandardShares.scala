@@ -109,7 +109,7 @@ trait StandardShares extends AppBase { self: StandardApp =>
    * The box holding a bond asset's 2-unit reserve: the live bond, or the vault its settlement paid. A Dutch
    * mint reads the repayment from it; for a settled bond, from the bond box the vault names.
    */
-  private def bondState(asset: ErgoId): (InputUTXO, Long, Option[Array[Byte]]) = {
+  private[standard] def bondState(asset: ErgoId): (InputUTXO, Long, Option[Array[Byte]]) = {
     val holders = decoded(nodeApi.unspentByTokenId(asset.toString)).filter(_.tokens.headOption.contains(Token(asset, 2L)))
     holders.flatMap(protocol.asBond).headOption match {
       case Some(bond) => (bond.box, bond.repayment, None)
@@ -245,10 +245,10 @@ trait StandardShares extends AppBase { self: StandardApp =>
   def pull(vaultId: String): Prepared = {
     val v = protocol.asShareVault(unspent(vaultId)).getOrElse(fail(s"$vaultId is not a share vault"))
     if (!v.holding) fail("the vault has already pulled its bond's settlement")
-    val source = settlements().find(_.asset == v.bondAsset)
+    val source = settlementsOf(v.bondAsset).headOption
       .getOrElse(fail(s"bond ${v.bondAsset} has not been repaid or liquidated yet"))
     if (v.pullFee < 0L || v.pullFee > v.box.value) fail("the vault's pull fee is out of bounds")
-    val value = v.box.value + source.box.value - v.pullFee
+    val value = addAmount(v.box.value, source.box.value) - v.pullFee
     val tokens = Token(v.shareId, v.n + 1L) +: source.proceeds
     val supply = Seq(bytesValue(v.bondAsset.getBytes), longsValue(v.n, v.outstanding, v.pullFee))
     val (regs, note) =
@@ -296,7 +296,9 @@ trait StandardShares extends AppBase { self: StandardApp =>
     val since = math.min(math.max(at - began, 0L), length)
     val num = BigInt(repayment) * (BigInt(opening) * length - BigInt(opening - floor) * since)
     val den = BigInt(10000) * length
-    ((num + den - 1) / den).toLong
+    val target = (num + den - 1) / den
+    if (!target.isValidLong) fail("the auction target exceeds the supported amount range")
+    target.toLong
   }
 
   /** What a Dutch vault holds of its currency now. */
@@ -314,7 +316,9 @@ trait StandardShares extends AppBase { self: StandardApp =>
     else {
       val num = BigInt(repayment) * opening * (length - since)
       val den = BigInt(10000) * length
-      Some(((num + den - 1) / den).toLong)
+      val price = (num + den - 1) / den
+      if (!price.isValidLong) fail("the excess auction price exceeds the supported amount range")
+      Some(price.toLong)
     }
   }
 

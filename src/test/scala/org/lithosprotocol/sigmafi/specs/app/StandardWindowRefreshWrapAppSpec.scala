@@ -370,4 +370,203 @@ class StandardWindowRefreshWrapAppSpec extends AnyPropSpec with StandardSpecSupp
       afterRef.getOutputsToSpend.get(0).getValue.longValue should be > MinBox
     }
   }
+
+  // ═══ AUDIT ROUND 2 HARDENING (I-1..I-10, R-1, R-2, R-4, FS-7) ═════════════
+
+  property("I-1 & I-6: ERG offer affordability (primary & secondary) and QuoteBlocks inclusion slack") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, l, e) = (borrower(ctx), lender(ctx), executor(ctx))
+      w.fund(b, erg("60"), Token(collateralToken, 300L))
+      w.fund(l, erg("60"))
+      w.fund(e, erg("5"))
+      w.oracle(500000000L, w.h)
+      // Offer has 5.01 ERG: enough for 5 ERG principal alone, but NOT 5 + batcherFee + MinBox + reserve + continuation.
+      w.run(l, w.app(l).createOffer(OfferSpec(Market.Erg, erg("5.01"), 0L, 1000L, 100L, 262800L, erg("0.005"),
+        reserve, 13000L, 30L, w.h + 500L, 1L, 0L, 0L, None)))
+      val offer = w.app(e).offers().loneElement
+
+      // Primary order needing 5 ERG principal (refused by I-1) alongside a smaller 3 ERG order (filled by batchScan).
+      w.run(b, w.app(b).createOrder(loan(principal = erg("5"), repayment = erg("6"), rule = OracleChoice(15000L, 30L), maturityIn = 10000)(w)))
+      val bigOrder = w.app(e).orders().loneElement
+      val bigBond = w.bond(Market.Erg, bigOrder.box.id, erg("10"), Seq(Token(collateralToken, 100L)), erg("6"),
+        protocol.market(Market.Erg).oracleRule, w.h.toLong, w.h + 10000L, w.h, payload = Seq(15000L, 30L), principal = erg("5"))
+      w.app(e).offerRefusal(offer, protocol.asBond(bigBond).get, erg("5"), 1L, 1L, w.app(e).oracle(), primary = true)
+        .getOrElse(fail("expected I-1 primary refusal")) should include("cannot cover")
+      // Secondary ERG ask at 5.005 ERG against 5.01 ERG offer must also be refused (not priced with MinBox ergOut).
+      w.app(e).offerRefusal(offer, protocol.asBond(bigBond).get, erg("5.005"), 1L, 1L, w.app(e).oracle(), primary = false)
+        .getOrElse(fail("expected I-1 secondary refusal")) should include("cannot cover")
+      // Now post a 3 ERG order: batchScan skips the unaffordable 5 ERG order and fills the 3 ERG one cleanly.
+      w.run(b, w.app(b).createOrder(loan(principal = erg("3"), repayment = erg("4"), collateral = Seq(Token(collateralToken, 50L)),
+        rule = OracleChoice(15000L, 30L), maturityIn = 10000)(w)))
+      val smallOrder = w.app(e).orders().find(_.principal == erg("3")).get
+      val scanMatch = w.app(e).batchScan().work.find(_.command.startsWith("match-offer")).get
+      scanMatch.command should include(smallOrder.box.id.toString)
+      w.app(e).runBatch(w.runner(e)).count(_._2) should be >= 1
+      w.app(e).bonds().exists(_.asset == smallOrder.box.id) shouldBe true
+
+      // I-6: offer minBlocks = 100 refuses a bond maturing at h + 101 (remainingLate = 98 at h + QuoteBlocks),
+      // while accepting one maturing at h + 103 (remainingLate = 100).
+      val edge = w.bond(Market.Erg, ErgoId.create("e1" * 32), erg("10"), Seq(Token(collateralToken, 100L)), erg("3"),
+        protocol.market(Market.Erg).oracleRule, w.h.toLong, w.h + 101L, w.h, payload = Seq(15000L, 30L), principal = erg("1"))
+      val safe = w.bond(Market.Erg, ErgoId.create("e2" * 32), erg("10"), Seq(Token(collateralToken, 100L)), erg("3"),
+        protocol.market(Market.Erg).oracleRule, w.h.toLong, w.h + 103L, w.h, payload = Seq(15000L, 30L), principal = erg("1"))
+      val updatedOffer = w.app(e).offers().loneElement
+      w.app(e).offerRefusal(updatedOffer, protocol.asBond(edge).get, erg("1"), 1L, 1L, w.app(e).oracle(), primary = false)
+        .getOrElse(fail("expected I-6 slack refusal")) should include("outside the offer's")
+      w.app(e).offerRefusal(updatedOffer, protocol.asBond(safe).get, erg("1"), 1L, 1L, w.app(e).oracle(), primary = false) shouldBe None
+    }
+  }
+
+  property("I-2: aged matured zero-reserve bond is refreshed (not 0-ERG liquidated) by batchScan and pack") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, l, e) = (borrower(ctx), lender(ctx), executor(ctx))
+      w.fund(b, erg("60"), Token(collateralToken, 100L))
+      w.fund(l, erg("60"))
+      w.fund(e, erg("10"))
+      // Create a genuine live bond with feeReserve = 0L, maturing at w.h + 1000.
+      w.run(b, w.app(b).createOrder(loan(maturityIn = 1000)(w)))
+      val order = w.app(l).orders().loneElement
+      w.run(l, w.app(l).fillOrder(order.box.id.toString, feeReserve = 0L))
+      val bond = w.app(e).bonds().loneElement
+      bond.feeReserve shouldBe 0L
+
+      val scan = later(w, e).batchScan().work
+      val item = scan.find(_.packBox.contains(bond.box.id.toString)).getOrElse(fail("expected refresh work"))
+      item.command shouldBe s"refresh ${bond.box.id}"
+      item.reward shouldBe StandardProtocol.RefreshBounty
+
+      val tx = w.run(e, later(w, e).pack(Seq(bond.box.id.toString)))
+      val out = tx.getOutputsToSpend.asScala.find(_.getErgoTree == bond.box.input.getErgoTree)
+        .getOrElse(fail("expected refreshed bond output, not liquidation into BondVault"))
+      out.getValue.longValue shouldBe bond.box.value - StandardProtocol.RefreshBounty
+    }
+  }
+
+  property("R-1, R-2, R-4 & I-4: overflow guards, interior ERG window peak, and ruleCover market check") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, l, e) = (borrower(ctx), lender(ctx), executor(ctx))
+      w.fund(b, erg("60"), Token(collateralToken, 200L))
+      w.fund(l, erg("60"))
+      w.fund(e, erg("5"))
+      w.oracle(500000000L, w.h)
+
+      // R-1: overflowing fixed SaleOrder refused cleanly by askPrice; faceBps clamps to Long.MaxValue.
+      val bigAskUtxo = w.seedFrom(l, UTXO(protocol.market(Market.Erg).saleOrder, erg("0.005"), Seq(Token(collateralToken, 10L)),
+        Seq(bytesValue(hashOf(Contract.fromAddress(l.getAddress).ergoTree)),
+          longsValue(Long.MaxValue / 2L, 1L, 1L, w.h + 500L))))
+      val bigAsk = protocol.asAsk(bigAskUtxo).get
+      refused(w.app(e).askPrice(bigAsk, 4L)) should include("outside the supported amount range")
+
+      // R-1: overflowing lotTarget & excessPrice refused cleanly on extreme repayment * openingBps.
+      val extremeDutch = w.seed(UTXO(protocol.contracts.dutchVault, erg("1"),
+        Seq(Token(ErgoId.create("e3" * 32), 1001L), Token(collateralToken, 10L)),
+        Seq(bytesValue(dutchAsset.getBytes), longsValue(1000L, 1000L, erg("0.002")), ErgoValue.of(4.toByte),
+          longsValue(Long.MaxValue / 2L, 50000L, 10000L, 500L, 2160L, Long.MaxValue, w.h.toLong),
+          bytesValue(Array.emptyByteArray)), Some(w.h)))
+      val extremeV = protocol.asShareVault(extremeDutch).get
+      refused(w.app(e).lotTarget(extremeV, w.h.toLong)) should include("exceeds the supported amount range")
+      refused(w.app(e).excessPrice(extremeV, w.h.toLong)) should include("exceeds the supported amount range")
+
+      // R-4: ERG offer with large fixed batcherFee & rising curve has an interior-only feasible maturity in [1000, 10000].
+      w.run(b, w.app(b).createOrder(loan(principal = erg("5"), repayment = erg("10"), collateralErg = erg("20"),
+        rule = OracleChoice(15000L, 30L))(w)
+        .copy(schedule = MaturityWindow(1000L, 10000L), price = Some(CurveOrderPrice(1000L, Seq(1000L -> 1000L, 1000L -> 10000L))))))
+      w.run(l, w.app(l).createOffer(OfferSpec(Market.Erg, erg("20"), 0L, 200L, 1000L, 10000L, erg("0.01"),
+        reserve, 15000L, 30L, w.h + 500L, 1L, 0L, 0L, None, curve = Seq(200L -> 1000L, 800L -> 10000L))))
+      val winOrder = w.app(e).orders().loneElement
+      val winOffer = w.app(e).offers().loneElement
+      val picked = w.app(e).windowMaturity(winOffer, winOrder, w.app(e).oracle())
+        .getOrElse(fail("expected interior feasible maturity for ERG offer"))
+      picked should (be > w.h + 1000L + 3L and be < w.h + 10000L)
+      w.run(e, w.app(e).matchOrder(winOffer.box.id.toString, winOrder.box.id.toString, Some(picked)))
+      w.app(e).bonds().loneElement.maturity shouldBe picked
+
+      // I-4: ruleCover / ruleRatioBps measure collateral in OracleRatio.market rather than bond.market.
+      val mismatched = protocol.asBond(w.bond(Market.SigUsd, ErgoId.create("e4" * 32), erg("10"), Seq.empty, 1000L,
+        protocol.market(Market.Erg).oracleRule, w.h.toLong, w.h + 10000L, w.h, payload = Seq(15000L, 30L))).get
+      protocol.cover(mismatched, 500000000L) should not be protocol.ruleCover(mismatched, 500000000L)
+      protocol.ruleCover(mismatched, 500000000L) shouldBe
+        StandardProtocol.coverOf(Market.Erg, mismatched.collateralErg, mismatched.collateral, mismatched.repayment, 500000000L)
+    }
+  }
+
+  property("I-5, I-7, I-8, FS-7 & I-10: chosen maturity check, batchScan pre-filters & partial share ask, mempool disclosure, unwrap verification, caps") {
+    withCtx { ctx =>
+      val w = new World(ctx)
+      val (b, l, e, o) = (borrower(ctx), lender(ctx), executor(ctx), other(ctx))
+      w.fund(l, erg("60"))
+      w.fund(e, erg("5"))
+      w.fund(o, erg("60"))
+      w.oracle(500000000L, w.h)
+
+      // I-8: exact-ERG recollateralize with auth input and no change output still discloses borrower's script in var 64.
+      val agedBond = w.bond(Market.Erg, ErgoId.create("e8" * 32), erg("10"), Seq(Token(collateralToken, 100L)),
+        erg("6"), protocol.contracts.maturity, w.h - 100L, w.h + 10000L, w.h - 100)
+      w.fund(b, erg("0.001") + AppSettings().fee)
+      val exactRecollatTx = w.run(b, w.app(b).recollateralize(agedBond.id.toString, erg("0.001"), Seq.empty))
+      exactRecollatTx.getOutputsToSpend.size shouldBe 2 // bond successor + miner fee (no change output)
+      w.disclosed(exactRecollatTx.getId, e) should contain(Contract.fromAddress(b.getAddress).ergoTree.bytes.toSeq)
+
+      // I-5: fillOrder forwards chosenMaturity into checkOrder, rejecting out-of-window / mismatched maturities up front.
+      w.fund(b, erg("20"), Token(collateralToken, 100L))
+      w.run(b, w.app(b).createOrder(loan(principal = erg("4"), repayment = erg("6"))(w)
+        .copy(schedule = MaturityWindow(30L, 10000L), price = Some(CurveOrderPrice(2000L, Seq(1000L -> 30L, 2000L -> 10000L))))))
+      val winOrder = w.app(l).orders().loneElement
+      refused(w.app(l).fillOrder(winOrder.box.id.toString, reserve, chosenMaturity = Some(w.h + 20000L))) should
+        include("outside the order's window")
+      w.run(l, w.app(l).fillOrder(winOrder.box.id.toString, reserve, chosenMaturity = Some(w.h + 5000L)))
+      w.app(l).bonds().find(_.asset == winOrder.box.id).get.maturity shouldBe w.h + 5000L
+
+      // I-7: malformed wrap/share requests are skipped by batchScan; partial share ask is matched when offer holds less than full ask.
+      val badWrap = w.seedFrom(l, UTXO(protocol.contracts.wrapMint, erg("0.005"), Seq(Token(ErgoId.create("f4" * 32), 1L)),
+        Seq(bytesValue(hashOf(Contract.fromAddress(l.getAddress).ergoTree)), longsValue(erg("0.004")),
+          textsValue("bad", "bad", "0"))))
+      val badShare = w.seedFrom(l, UTXO(protocol.contracts.fractionalMint, erg("0.005"), Seq(Token(ErgoId.create("f5" * 32), 1L)),
+        Seq(bytesValue(hashOf(Contract.fromAddress(l.getAddress).ergoTree)), longsValue(0L, erg("0.002"), erg("0.002")),
+          textsValue("bad", "bad", "0"))))
+      val scanBad = w.app(e).batchScan().work.flatMap(_.spends)
+      scanBad should not contain badWrap.id.toString
+      scanBad should not contain badShare.id.toString
+
+      // Partial share-ask fill via batchScan.
+      w.fund(b, erg("25"), Token(collateralToken, 100L))
+      val bondForShares = w.liveBond(loan(principal = erg("5"), repayment = erg("10"), collateralErg = erg("20"),
+        rule = OracleChoice(15000L, 30L), maturityIn = 10000)(w), l)
+      w.run(l, w.app(l).fractionalize(bondForShares.asset.toString,
+        ShareTerms(shares = 100L, pullFee = erg("0.002"), mintFee = erg("0.002"),
+          auction = Some(AuctionTerms(20000L, 9000L, 720L, 2160L, 100L)))))
+      val sreq = w.app(e).shareRequests().find(_.box.id != badShare.id).get
+      w.run(e, w.app(e).mintShares(sreq.box.id.toString))
+      val shareId = sreq.shareId
+      w.run(l, w.app(l).sell(shareId.toString, 100L, Market.Erg, FixedPrice(erg("8")), minFillAsked = Some(20L),
+        expiry = w.h + 500L, refundFee = erg("0.003")))
+      w.run(o, w.app(o).createOffer(OfferSpec(Market.Erg, erg("4"), 0L, 1000L, 1L, 262800L, erg("0.005"),
+        reserve, 15000L, 30L, w.h + 500L, 1L, 8000L, 2160L, None)))
+      val askMatch = w.app(e).batchScan().work.find(_.command.contains("--ask")).getOrElse(fail("expected partial share-ask match"))
+      askMatch.command should include("--amount")
+      w.app(e).runBatch(w.runner(e)).count(_._2) should be >= 1
+      w.tokens(o).getOrElse(shareId, 0L) should (be >= 20L and be < 100L)
+
+      // FS-7: unwrap refuses an unverified forged WrapVault.
+      val fakeReceipt = ErgoId.create("f6" * 32)
+      w.seed(UTXO(protocol.contracts.wrapVault, erg("0.05"), Seq(Token(fakeReceipt, 2L), Token(ErgoId.create("f7" * 32), 1L))))
+      w.fund(l, MinBox, Token(fakeReceipt, 1L))
+      refused(w.app(l).unwrap(fakeReceipt.toString)) should include("not minted by a standard wrap request")
+
+      // I-10: ERG offer batcherFee cap & warnings; takeLot rejects token-market lot holding its own currency.
+      refused(w.app(l).createOffer(OfferSpec(Market.Erg, erg("0.01"), 0L, 1000L, 1L, 262800L, erg("0.009"),
+        reserve, 15000L, 30L, w.h + 500L, 1L, 0L, 0L, None))) should include("leave capital above")
+      val warned = w.app(l).createOffer(OfferSpec(Market.Erg, erg("0.05"), 0L, 1000L, 1L, 262800L, erg("0.01"),
+        reserve, 15000L, 30L, w.h + 500L, 1L, 0L, 1000L, None))
+      warned.notes.exists(_.contains("WARNING: batcher fee")) shouldBe true
+      warned.notes.exists(_.contains("WARNING: a 0% minimum auction floor")) shouldBe true
+      val badLot = w.seedFrom(l, UTXO(protocol.market(Market.SigUsd).lotAuction, erg("0.01"), Seq(Token(SigUsd, 100L)),
+        Seq(bytesValue(hashOf(Contract.fromAddress(l.getAddress).ergoTree)),
+          longsValue(100L, 50L, w.h.toLong, w.h + 100L, w.h + 500L, erg("0.003")))))
+      refused(w.app(e).takeLot(badLot.id.toString)) should include("holds SigUSD itself")
+    }
+  }
 }

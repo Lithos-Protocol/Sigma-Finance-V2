@@ -237,14 +237,17 @@ abstract class AppBase(ctx: BlockchainContext, node: NodeApi, settings: AppSetti
   protected def namedScripts(outputs: Seq[UTXO]): Seq[Array[Byte]] = Seq.empty
 
   /**
-   * zcs1 script disclosure: every script the outputs name by hash, and that no input or output of the
-   * transaction already has as its script, goes into context variable 64 of INPUTS(0) as ErgoTree bytes. A
-   * batcher then finds it in one lookup of the box's creating transaction. A script this app cannot name
-   * stops the build: the transaction would not be standard.
+   * zcs1 script disclosure: every script the outputs name by hash, and that no output of the transaction
+   * (including its change output back to this wallet, if any) already has as its script, goes into context
+   * variable 64 of INPUTS(0) as ErgoTree bytes. Checking outputs rather than inputs ensures unconfirmed
+   * mempool lookups (`/transactions/unconfirmed/byTransactionId`, which omit input ErgoTrees) still resolve
+   * the script on exact-ERG transactions with no change output.
    */
   private def disclose(p: Plan): (Seq[InputUTXO], Int) = {
-    val present = (p.inputs.map(_.input.getErgoTree) ++ p.outputs.map(_.contract.ergoTree))
-      .map(t => Base16.encode(hashOf(t))).toSet
+    val changeErg = p.inputs.map(_.value).sum - p.outputs.map(_.value).sum - p.fee
+    val hasChange = changeErg >= MinBox
+    val outputTrees = p.outputs.map(_.contract.ergoTree) ++ (if (hasChange) Seq(myTree) else Seq.empty)
+    val present = outputTrees.map(t => Base16.encode(hashOf(t))).toSet
     val missing = namedScripts(p.outputs).map(Base16.encode).distinct.filterNot(present.contains)
     if (missing.isEmpty || p.inputs.isEmpty) (p.inputs, 0)
     else {

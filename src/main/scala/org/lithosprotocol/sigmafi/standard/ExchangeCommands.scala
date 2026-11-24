@@ -273,9 +273,14 @@ object ExchangeCommands {
           val m = Market.of(v.currencyToken)
           val fallEnd = v.auctionStart + v.auctionLength
           val target = app.lotTarget(v, app.height.toLong)
-          s"AUCTION OPEN: the lot costs ${m.fold(target.toString)(Units.amount(target - app.currencyHeld(v), _))} now " +
-            s"(`buy-lot ${v.box.id}`), falling to the floor at height $fallEnd; claims wait for its expiry at height " +
-            s"${v.claimableFrom}"
+          val owe = math.max(0L, target - app.currencyHeld(v))
+          val priceText = m.fold(owe.toString)(Units.amount(owe, _))
+          if (app.height.toLong >= v.claimableFrom)
+            s"AUCTION EXPIRED (still buyable at the floor until the first partial claim): the lot costs $priceText " +
+              s"now (`buy-lot ${v.box.id}`), or holders may claim in kind"
+          else
+            s"AUCTION OPEN: the lot costs $priceText now (`buy-lot ${v.box.id}`), falling to the floor at height " +
+              s"$fallEnd; claims wait for its expiry at height ${v.claimableFrom}"
         } else v.state.map {
           case 0 => "repaid"
           case 1 if !v.dutch => "liquidated: paid in kind"

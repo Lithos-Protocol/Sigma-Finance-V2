@@ -39,8 +39,8 @@ case class YieldLine(start: Long, startBps: Long, end: Long, endBps: Long) {
   /** The yield at `height`, exactly `rate / span` bps. */
   def at(height: Long): (BigInt, BigInt) = {
     val h = height.max(start).min(end)
-    val span = BigInt(end - start)
-    (BigInt(startBps) * span + (BigInt(endBps) - startBps) * (h - start), span)
+    val span = BigInt(end) - start
+    (BigInt(startBps) * span + (BigInt(endBps) - startBps) * (BigInt(h) - start), span)
   }
 
   /** The yield at `height` in whole bps, rounded down, for display. */
@@ -76,8 +76,8 @@ case class YieldCurve(minBps: Long, points: Seq[(Long, Long)]) {
       else {
         val (y1, d1) = points(below - 1)
         val (y2, d2) = points(below)
-        val l = BigInt(d2 - d1)
-        (BigInt(y1) * l + (BigInt(y2) - y1) * (blocksLeft - d1), l)
+        val l = BigInt(d2) - d1
+        (BigInt(y1) * l + (BigInt(y2) - y1) * (BigInt(blocksLeft) - d1), l)
       }
     (rate.max(BigInt(minBps) * span), span)
   }
@@ -558,13 +558,23 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
       case _ => None
     }
 
-  /** Collateral value and debt in the oracle rule's common unit; None when the price is unusable. */
+  /** Collateral value and debt in the oracle rule's common unit for `bond.market`; None when the price is unusable. */
   def cover(bond: StdBond, price: Long): Option[(BigInt, BigInt)] =
     coverOf(bond.market, bond.collateralErg, bond.collateral, bond.repayment, price)
 
-  /** The collateral ratio in basis points of the repayment, as the oracle rule measures it. */
+  /** Collateral value and debt as measured by the bond's own oracle liquidation rule (which pins its own market). */
+  def ruleCover(bond: StdBond, price: Long): Option[(BigInt, BigInt)] = ruleOf(bond.liqHash) match {
+    case Some(OracleRatio(rm, _)) => coverOf(rm, bond.collateralErg, bond.collateral, bond.repayment, price)
+    case _ => cover(bond, price)
+  }
+
+  /** The collateral ratio in basis points of the repayment, in `bond.market`. */
   def ratioBps(bond: StdBond, price: Long): Option[Long] =
     cover(bond, price).map { case (c, d) => (c * 10000 / d).min(BigInt(Long.MaxValue)).toLong }
+
+  /** The collateral ratio in basis points of the repayment, as measured by the bond's own oracle liquidation rule. */
+  def ruleRatioBps(bond: StdBond, price: Long): Option[Long] =
+    ruleCover(bond, price).map { case (c, d) => (c * 10000 / d).min(BigInt(Long.MaxValue)).toLong }
 
   /** The bond's own early-liquidation ratio, when its rule is the oracle rule and it carries one. */
   def ownRatio(bond: StdBond): Option[Long] = ruleOf(bond.liqHash) match {
@@ -577,7 +587,7 @@ class StandardProtocol(val contracts: StandardContracts = StandardPins.load) {
    * liquidate it, sending all the collateral to the lender, as soon as an oracle that fresh is read.
    */
   def belowOwnRatio(bond: StdBond, price: Long): Boolean =
-    ownRatio(bond).exists(r => cover(bond, price).exists { case (c, d) => c * 10000 < d * r })
+    ownRatio(bond).exists(r => ruleCover(bond, price).exists { case (c, d) => c * 10000 < d * r })
 }
 
 object StandardProtocol {

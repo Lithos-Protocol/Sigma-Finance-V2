@@ -200,7 +200,7 @@ object StandardCommands {
     val next = now + 1L
     def oracleBelow(b: StdBond): Boolean = (app.protocol.ruleOf(b.liqHash), oracle) match {
       case (Some(OracleRatio(_, _)), Some(o)) if b.payload.size >= 2 =>
-        next - o.created <= b.payload(1) && app.protocol.cover(b, o.price).exists { case (c, d) => c * 10000 < d * b.payload(0) }
+        next - o.created <= b.payload(1) && app.protocol.ruleCover(b, o.price).exists { case (c, d) => c * 10000 < d * b.payload(0) }
       case _ => false
     }
     def canLiquidate(b: StdBond): Boolean = app.protocol.ruleOf(b.liqHash).isDefined && (now >= b.maturity || oracleBelow(b))
@@ -220,7 +220,7 @@ object StandardCommands {
       println(s"  liquidation: ${rule.fold(app.protocol.ruleName(b.liqHash))(app.describeRule(_, b.payload))}")
       (rule, oracle) match {
         case (Some(OracleRatio(_, _)), Some(o)) =>
-          println(s"  ratio now:   ${app.protocol.ratioBps(b, o.price).fold("?")(Units.percent)} at the oracle price from " +
+          println(s"  ratio now:   ${app.protocol.ruleRatioBps(b, o.price).fold("?")(Units.percent)} at the oracle price from " +
             s"height ${o.created}" + (if (oracleBelow(b)) " (BELOW its ratio: liquidatable)" else ""))
         case _ =>
       }

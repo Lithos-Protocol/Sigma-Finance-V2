@@ -105,8 +105,8 @@ trait StandardBatch extends AppBase { self: StandardApp =>
         val (ratio, age) = (b.payload(0), b.payload(1))
         if (height.toLong + 1L - price.created > age)
           fail(s"the oracle price is from height ${price.created}, older than bond ${b.box.id} accepts ($age blocks)")
-        val below = protocol.cover(b, price.price).exists { case (c, d) => c * 10000 < d * ratio }
-        if (!below) fail(s"bond ${b.box.id} is at ${protocol.ratioBps(b, price.price).fold("?")(Units.percent)}, " +
+        val below = protocol.ruleCover(b, price.price).exists { case (c, d) => c * 10000 < d * ratio }
+        if (!below) fail(s"bond ${b.box.id} is at ${protocol.ruleRatioBps(b, price.price).fold("?")(Units.percent)}, " +
           s"not below its ${Units.percent(ratio)}; it can be liquidated at maturity, height ${b.maturity}")
         Some(price)
       case _ => None
@@ -205,7 +205,7 @@ trait StandardBatch extends AppBase { self: StandardApp =>
         .orElse(protocol.asAsk(box).map(askRefund))
         .orElse(protocol.asLot(box).map(lotRefund))
         .orElse(protocol.asBond(box).map(b => if (refreshable(box.input.getCreationHeight.toLong, height.toLong) &&
-          Try(liquidation(b)).isFailure) refreshPiece(box) else liquidation(b)))
+          (Try(liquidation(b)).isFailure || b.feeReserve == 0L)) refreshPiece(box) else liquidation(b)))
         .orElse((protocol.asSettlement(box) orElse protocol.asShareVault(box)).map(_ => refreshPiece(box)))
         .getOrElse(fail(s"$id is not a ZC Standard order, offer, ask, lot, bond or vault"))
     }
@@ -240,13 +240,21 @@ trait StandardBatch extends AppBase { self: StandardApp =>
     def packWork(summary: String, command: String, reward: Long, box: String) =
       Work(summary, command, reward, Set(box), Some(box))
 
-    shareRequests().filter(r => alone(r.mintFee) && served(r.ownerHash, r.box, "share request", "owner")).foreach { r =>
+    shareRequests().filter(r =>
+      alone(r.mintFee) &&
+      r.shares >= 1L && r.shares <= 1000000000L &&
+      r.pullFee >= MinBatchingFee && r.mintFee >= MinBatchingFee &&
+      BigInt(r.box.value) - r.mintFee >= BigInt(2L * MinBox) + r.pullFee &&
+      r.dutch.forall(_ => AuctionTerms.fromLongs(r.auction).exists(a => Try(checkAuction(a)).isSuccess) &&
+        Try(bondState(r.bondAsset)).isSuccess) &&
+      served(r.ownerHash, r.box, "share request", "owner")).foreach { r =>
       work += Work(s"mint ${r.shares} shares of bond ${r.bondAsset}" +
         r.dutch.fold(" (plain fractional)")(_ => AuctionTerms.fromLongs(r.auction).fold(" (Dutch pair)")(a => s" (${a.kind})")),
         s"mint-shares ${r.box.id}", r.mintFee, Set(r.box.id.toString))
     }
     val settled = settlements().map(s => s.asset -> s).toMap
-    shareVaults().filter(v => v.holding && settled.contains(v.bondAsset) && alone(v.pullFee)).foreach { v =>
+    shareVaults().filter(v => v.holding && settled.contains(v.bondAsset) && v.pullFee >= 0L && v.pullFee <= v.box.value &&
+      alone(v.pullFee) && Try(pull(v.box.id.toString)).isSuccess).foreach { v =>
       work += Work(s"pull the settled bond ${v.bondAsset} into its share vault", s"pull ${v.box.id}", v.pullFee,
         Set(v.box.id.toString, settled(v.bondAsset).box.id.toString))
     }
@@ -256,7 +264,7 @@ trait StandardBatch extends AppBase { self: StandardApp =>
       val rule = protocol.ruleOf(b.liqHash)
       val due = rule.isDefined && (now >= b.maturity || ((rule, usableOracle) match {
         case (Some(OracleRatio(_, _)), Some(o)) if b.payload.size >= 2 =>
-          next - o.created <= b.payload(1) && protocol.cover(b, o.price).exists { case (c, d) => c * 10000 < d * b.payload(0) }
+          next - o.created <= b.payload(1) && protocol.ruleCover(b, o.price).exists { case (c, d) => c * 10000 < d * b.payload(0) }
         case _ => false
       }))
       if (due && b.feeReserve > 0L)
@@ -273,7 +281,8 @@ trait StandardBatch extends AppBase { self: StandardApp =>
     def old(box: InputUTXO): Boolean = refreshable(box.input.getCreationHeight.toLong, now)
     val liquidating = work.flatMap(_.packBox).toSet
     liveBonds.filter(b => old(b.box) && !liquidating(b.box.id.toString) &&
-      (now >= b.maturity || next < b.maturity - RefreshMaturityGap) && bounty(b.box, b.feeReserve + MinBox, 6) > 0L).foreach { b =>
+      (now >= b.maturity || next < b.maturity - RefreshMaturityGap) && bounty(b.box, b.feeReserve + MinBox, 6) > 0L &&
+      Try(bondBorrowerTree(b)).isSuccess).foreach { b =>
       work += packWork(s"refresh bond ${b.box.id}, made at height ${b.box.input.getCreationHeight}", s"refresh ${b.box.id}",
         bounty(b.box, b.feeReserve + MinBox, 6), b.box.id.toString).copy(agedInputs = true)
     }
@@ -287,7 +296,8 @@ trait StandardBatch extends AppBase { self: StandardApp =>
       work += Work(s"refresh wrap vault ${v.box.id} (alone: it holds a wrapped token)", s"refresh ${v.box.id}",
         bounty(v.box, MinBox, 0), Set(v.box.id.toString))
     }
-    wrapRequests().filter(r => alone(r.mintFee) && served(r.ownerHash, r.box, "wrap request", "owner")).foreach { r =>
+    wrapRequests().filter(r => alone(r.mintFee) && r.mintFee >= MinBatchingFee && r.mintFee <= r.box.value - 2L * MinBox &&
+      served(r.ownerHash, r.box, "wrap request", "owner")).foreach { r =>
       work += Work(s"mint the wrap receipt for ${r.wrapped.amount} of ${r.wrapped.id}", s"mint-wrap ${r.box.id}", r.mintFee,
         Set(r.box.id.toString))
     }
@@ -340,19 +350,42 @@ trait StandardBatch extends AppBase { self: StandardApp =>
         val fromAsks = askSources.filter(a => a.market == o.market && !taken(a.box.id.toString)).flatMap { a =>
           Try[Option[(BigInt, String, Work)]] {
             val (asset, whole) = bondOf(a.token.id).get
-            val units = if (whole == 1L) 1L else a.token.amount
             val bond = liveBonds.find(_.asset == asset).get
-            val price = if (o.market.token.isEmpty) math.max(askPrice(a, units)._1, MinBox) else askPrice(a, units)._1
             val shares = a.token.id != asset
-            if (units < a.minFill && units != a.token.amount) None
-            // As match-offer: shares only when the offer buys them and their auction is inside its bounds.
-            else if (shares && mintRequest(a.token.id).forall(req => shareRefusal(o, req).nonEmpty)) None
-            else if (!alone(o.fillFee(price)) || offerRefusal(o, bond, price, units, whole, usableOracle, shares = shares).nonEmpty ||
-              saleGuardRefusal(a, bond, usableOracle).nonEmpty) None
-            else Some((impliedYield(o, bond.repayment, price, units, whole, bond.maturity), a.box.id.toString,
-              Work(s"buy $units of ${a.token.id} from ask ${a.box.id} with offer ${o.box.id}",
-                s"match-offer ${o.box.id} --ask ${a.box.id}" + (if (units != a.token.amount) s" --amount $units" else ""),
-                o.fillFee(price), Set(o.box.id.toString, a.box.id.toString))))
+            def affordableUnits(u: Long): Boolean = Try(askPrice(a, u)._1).toOption.exists { p =>
+              if (o.market.token.isEmpty) {
+                val eff = math.max(p, MinBox)
+                val ergOut = BigInt(o.fillFee(eff)) + MinBox + eff
+                BigInt(o.box.value) - ergOut >= minContinuationErg(o, eff)
+              } else {
+                val ergOut = BigInt(o.fillFee(p)) + 2L * MinBox
+                p <= o.capital && BigInt(o.box.value) - ergOut >= BigInt(math.max(minContinuationErg(o, p), MinBox + o.batcherFee))
+              }
+            }
+            val units = if (whole == 1L) 1L
+              else if (affordableUnits(a.token.amount) || a.minFill >= a.token.amount) a.token.amount
+              else {
+                var lo = a.minFill
+                var hi = a.token.amount
+                var best = 0L
+                while (lo <= hi) {
+                  val mid = lo + (hi - lo) / 2L
+                  if (affordableUnits(mid)) { best = mid; lo = mid + 1L } else hi = mid - 1L
+                }
+                best
+              }
+            if (units < 1L || (units < a.minFill && units != a.token.amount)) None
+            else {
+              val price = if (o.market.token.isEmpty) math.max(askPrice(a, units)._1, MinBox) else askPrice(a, units)._1
+              // As match-offer: shares only when the offer buys them and their auction is inside its bounds.
+              if (shares && mintRequest(a.token.id).forall(req => shareRefusal(o, req).nonEmpty)) None
+              else if (!alone(o.fillFee(price)) || offerRefusal(o, bond, price, units, whole, usableOracle, shares = shares).nonEmpty ||
+                saleGuardRefusal(a, bond, usableOracle).nonEmpty) None
+              else Some((impliedYield(o, bond.repayment, price, units, whole, bond.maturity), a.box.id.toString,
+                Work(s"buy $units of ${a.token.id} from ask ${a.box.id} with offer ${o.box.id}",
+                  s"match-offer ${o.box.id} --ask ${a.box.id}" + (if (units != a.token.amount) s" --amount $units" else ""),
+                  o.fillFee(price), Set(o.box.id.toString, a.box.id.toString))))
+            }
           }.toOption.flatten.toSeq
         }
         (fromOrders ++ fromAsks).sortBy { case (y, id, _) => (-y, id) }.headOption.foreach { case (_, id, w) =>

@@ -92,9 +92,11 @@ trait StandardWraps extends AppBase { self: StandardApp =>
   def unwrap(receiptId: String): Prepared = {
     val id = Try(ErgoId.create(receiptId)).getOrElse(fail(s"$receiptId is not a token id"))
     val v = wrapVault(id).getOrElse(fail(s"no wrap vault holds the reserve of $receiptId"))
+    if (!wrapVerified(id)) fail(s"$receiptId was not minted by a standard wrap request: this vault proves nothing")
     val holder = walletBoxes.find(_.tokens.exists(_.id == id)).getOrElse(fail(s"this wallet does not hold receipt $receiptId"))
-    prepare(s"Unwrap $receiptId", sweep(Seq(v.box, holder), burn = Seq(Token(id, 3L))),
-      Seq(s"burns all 3 units of the receipt and takes ${v.wrapped.amount} of ${v.wrapped.id} and the vault's " +
+    val burned = v.box.tokens.head.amount + holder.tokens.filter(_.id == id).map(_.amount).sum
+    prepare(s"Unwrap $receiptId", sweep(Seq(v.box, holder), burn = Seq(Token(id, burned))),
+      Seq(s"burns all $burned units of the receipt and takes ${v.wrapped.amount} of ${v.wrapped.id} and the vault's " +
         Fmt.erg(v.box.value)))
   }
 
