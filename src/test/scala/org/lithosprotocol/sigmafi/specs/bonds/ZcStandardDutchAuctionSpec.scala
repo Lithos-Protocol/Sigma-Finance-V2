@@ -159,6 +159,25 @@ class ZcStandardDutchAuctionSpec extends AnyPropSpec with ZcStandardSpecBase {
     }
   }
 
+  for (kind <- kinds) {
+    property(s"$kind mint: extra refresh-reserve ERG stays pinned to the Dutch vault and cannot divert to shareOut") {
+      withCtx { ctx =>
+        val refreshReserve = 30000000L
+        val a = defaultAuction(kind)
+        val f = flow(ctx, kind)
+        val req = requestBox(ctx, kind, f.asset, a).addValue(refreshReserve)
+        val fill = accepts(f.holder, standardFillTx(f, unit = req))
+        val w = Wrapped(f, a, fill, spendOutput(fill, 0))
+        val v = vaultBox(w)
+        v.value shouldBe minBox + pullFee + refreshReserve
+        accepts(executor(ctx), mintTx(w, shareOut = shareBox(w), vault = v))
+        val diverted = build(ctx, Seq(w.request.withCtxVar(0.toByte, ErgoValue.of(0)), funding(ctx, executor(ctx), 5)),
+          Seq(shareBox(w).addValue(1L), v.subValue(1L)), executor(ctx).getAddress, dataInputs = Seq(w.bond))
+        rejectsAtSigning(executor(ctx), diverted)
+      }
+    }
+  }
+
   property("mint: a refreshed bond is read like any other, live or settled, by the bytes of the box that settled") {
     withCtx { ctx =>
       val w = wrap(ctx)

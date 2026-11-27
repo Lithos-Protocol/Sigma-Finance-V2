@@ -34,7 +34,8 @@
     //   3 ERG batcher fee per fill, and expiry refund fee for either market, nanoERG. A fill needs at least 2000000
     //     (0.002 ERG), the floor every standard batching fee shares; an offer below it never fills,
     //     and its owner cancels it or anyone refunds it after expiry.
-    //   4 lender liquidation fee reserve to put in a NEW bond, nanoERG, exact
+    //   4 lender liquidation fee reserve, nanoERG: exact in a NEW bond, minimum in an EXISTING bond
+    //     (or the bond behind purchased shares) so passive offers cannot be sold unliquidatable bonds
     //   5 collateral floor in basis points of the repayment, and 8 maximum oracle age in blocks: read only
     //     by the collateral policy expression
     //   6 expiry height; fills require HEIGHT < expiry, and from then on anyone may refund
@@ -196,12 +197,16 @@
             sigmaProp(false)
         } else if (HEIGHT.toLong >= terms(6)) {
             // Expiry refund, by anyone: everything goes back to the owner, less the batcher fee.
+            // If terms(3) exceeds SELF.value - 1000000 (e.g. a partially-filled ERG continuation dust
+            // box or misconfigured fee), no fee may be deducted and the full SELF.value must return.
             val refund = OUTPUTS(nextIndex)
             sigmaProp(
+                terms(3) >= 0L &&
                 blake2b256(refund.propositionBytes) == ownerHash &&
                 refund.R4[Coll[Byte]].get == SELF.id &&
                 refund.tokens == SELF.tokens &&
-                refund.value >= SELF.value - terms(3)
+                (if (terms(3) <= SELF.value - 1000000L) refund.value >= SELF.value - terms(3)
+                 else refund.value >= SELF.value)
             )
         } else if ((policyRecord.size != 32 && policyRecord.size != 64) ||
             (fractional.size != 0 && (fractional.size < 3 || fractional.size > 16))) {
@@ -289,7 +294,8 @@
                 (blake2b256(origin.propositionBytes) == CONST_ORDER_HASH ||
                  blake2b256(origin.propositionBytes) == CONST_PRICED_ORDER_HASH) &&
                 blake2b256(bond.propositionBytes) == CONST_BOND_HASH &&
-                bond.tokens(0)._2 == 2L
+                bond.tokens(0)._2 == 2L &&
+                lender(0) >= terms(4)
             }
 
             // Fills run only before the expiry, R5(6): from then on this box can only be refunded.

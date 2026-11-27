@@ -76,7 +76,10 @@
                 payout.R5[Long].isDefined == false
             if (HEIGHT.toLong >= terms(4)) {
                 // Expiry refund, by anyone: the whole lot goes back to the seller, less the fee.
-                sigmaProp(toSeller && payout.tokens == SELF.tokens && payout.value >= SELF.value - terms(5))
+                sigmaProp(
+                    terms(5) >= 0L && terms(5) <= SELF.value - 1000000L &&
+                    toSeller && payout.tokens == SELF.tokens && payout.value >= SELF.value - terms(5)
+                )
             } else {
                 val opening = terms(0)
                 val floor = terms(1)

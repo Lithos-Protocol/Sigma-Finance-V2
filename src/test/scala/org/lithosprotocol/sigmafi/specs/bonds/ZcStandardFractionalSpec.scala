@@ -169,10 +169,20 @@ class ZcStandardFractionalSpec extends AnyPropSpec with ZcStandardSpecBase {
         vault.withRegNum(5, longsValue(w.shares, w.shares, w.fee - 1L)),
         vault.withRegNum(5, longsValue(w.shares, w.shares)))
       bad.foreach(v => rejectsAtSigning(executor(ctx), mintTx(w, vault = v)))
-      // Value may move between the two owner-side boxes, but neither may drop below its floor.
+      // Share outputs may receive external top-ups, but neither box may drop below its floor.
       accepts(executor(ctx), mintTx(w, shares = shareBox(w).addValue(1L), vault = vault, funded = true))
       rejectsAtSigning(executor(ctx), mintTx(w, shares = shareBox(w).subValue(1L), vault = vault.addValue(1L), funded = true))
-      rejectsAtSigning(executor(ctx), mintTx(w, shares = shareBox(w).addValue(1L), vault = vault.subValue(1L), funded = true))
+      // Extra refresh-reserve ERG stays pinned to the vault; a minter cannot divert it into shareOut.
+      val refreshReserve = 30000000L
+      val fExtra = flow(ctx, TokenBond)
+      val reqExtra = requestBox(fExtra, 1000L, pullFee, mintFee, "2").addValue(refreshReserve)
+      val fillExtra = accepts(fExtra.holder, standardFillTx(fExtra, unit = reqExtra))
+      val wExtra = Wrapped(fExtra, 1000L, pullFee, mintFee, "2", fillExtra, spendOutput(fillExtra, 0))
+      val vExtra = freshVault(wExtra)
+      vExtra.value shouldBe minBox + pullFee + refreshReserve
+      accepts(executor(ctx), mintTx(wExtra, shares = shareBox(wExtra), vault = vExtra))
+      rejectsAtSigning(executor(ctx), mintTx(wExtra, shares = shareBox(wExtra).addValue(1L),
+        vault = vExtra.subValue(1L), funded = true))
     }
   }
 

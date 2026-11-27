@@ -121,6 +121,21 @@ class ZcStandardLotAuctionSpec extends AnyPropSpec with ZcStandardSpecBase {
         rejectsAtSigning(executor(ctx), refundTx(back.subValue(1L), t.expiry.toInt))
         rejectsAtSigning(executor(ctx), refundTx(back.setTokens(Token(lotToken, 99L)), t.expiry.toInt))
         rejectsAtSigning(executor(ctx), refundTx(back.setContract(otherTree(ctx)), t.expiry.toInt))
+        // Refund fee must lie in [0, SELF.value - minBox].
+        def lotWithFee(f: Long): UTXO = lotBox(ctx, kind, t, longs = t.longs.updated(5, f))
+        def feeRefundTx(l: UTXO, outVal: Long): UnsignedTransaction = {
+          val i = inputAt(l, ctx, 0)
+          buildAt(ctx, t.expiry.toInt, Seq(i.withCtxVar(0.toByte, ErgoValue.of(0)), funding(ctx, executor(ctx), 9)),
+            Seq(UTXO(lenderTree(ctx), outVal, l.tokens, Seq(bytesValue(i.id.getBytes)))), executor(ctx).getAddress)
+        }
+        val zeroLot = lotWithFee(0L)
+        accepts(executor(ctx), feeRefundTx(zeroLot, zeroLot.value))
+        val maxLot = lotWithFee(lot.value - minBox)
+        accepts(executor(ctx), feeRefundTx(maxLot, minBox))
+        val negLot = lotWithFee(-1L)
+        rejectsAtSigning(executor(ctx), feeRefundTx(negLot, negLot.value + 1L))
+        val overLot = lotWithFee(lot.value - minBox + 1L)
+        rejectsAtSigning(executor(ctx), feeRefundTx(overLot, minBox))
       }
     }
   }

@@ -52,8 +52,11 @@
     // R9: Coll[Coll[Byte]] - the share token's EIP-4 (name, description, decimals), exactly 3 items
     //
     // VALUE
-    // As the standard mint: the vault gets at least 1000000 nanoERG plus the pull fee, the share
-    // output at least 1000000 nanoERG, and together at least SELF.value minus the mint fee.
+    // As the standard mint: the vault gets at least 1000000 nanoERG plus the pull fee and at least
+    // SELF.value minus the mint fee minus 1000000 nanoERG, and the share output gets at least
+    // 1000000 nanoERG. Pinning the vault's floor directly guarantees that every nanoERG funded
+    // above 2000000 + pullFee + mintFee lands in the vault as its refresh reserve, and a minter
+    // cannot divert that reserve into OUTPUTS(0).
     //
     // MINT (anyone)
     // Context var 0: Int data-input index of the box holding (bond asset, 2): the bond's state box.
@@ -167,7 +170,7 @@
                 val vaultValid =
                     blake2b256(vault.propositionBytes) == CONST_DUTCH_VAULT_HASH &&
                     vault.value - pullFee >= 1000000L &&
-                    vault.value + shareOut.value >= SELF.value - mintFee &&
+                    vault.value >= SELF.value - mintFee - 1000000L &&
                     vault.tokens == Coll((SELF.id, shares + 1L), bondUnit) &&
                     vault.R4[Coll[Byte]].get == bondUnit._1 &&
                     vault.R5[Coll[Long]].get == Coll(shares, shares, pullFee) &&

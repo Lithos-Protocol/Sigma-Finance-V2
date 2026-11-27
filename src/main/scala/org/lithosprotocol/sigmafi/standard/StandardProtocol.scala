@@ -304,8 +304,8 @@ case class StdLot(box: InputUTXO, market: Market, sellerHash: Array[Byte], terms
 }
 
 /**
- * A lend offer. R5 terms: 0 minimum yield bps, 1 min and 2 max blocks to maturity, 3 batcher fee, 4 new-bond
- * fee reserve, 5 collateral floor bps, 6 expiry, 7 minimum price, 8 oracle age, 9 min auction floor, 10 max
+ * A lend offer. R5 terms: 0 minimum yield bps, 1 min and 2 max blocks to maturity, 3 batcher fee, 4 liquidation
+ * fee reserve (exact for new bonds, minimum for existing bonds/shares), 5 collateral floor bps, 6 expiry, 7 minimum price, 8 oracle age, 9 min auction floor, 10 max
  * auction expiry. Token offers append 11 original capital, 12 total ERG spend budget, 13 minimum fill
  * bps of original capital, 14 batcher reward budget. Then the yield curve: up to 20 (yield bps, blocks left)
  * points. R7, R8, R9: fractional terms, metadata, mint hash.

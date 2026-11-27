@@ -415,6 +415,11 @@ class StandardWindowRefreshWrapAppSpec extends AnyPropSpec with StandardSpecSupp
       w.app(e).offerRefusal(updatedOffer, protocol.asBond(edge).get, erg("1"), 1L, 1L, w.app(e).oracle(), primary = false)
         .getOrElse(fail("expected I-6 slack refusal")) should include("outside the offer's")
       w.app(e).offerRefusal(updatedOffer, protocol.asBond(safe).get, erg("1"), 1L, 1L, w.app(e).oracle(), primary = false) shouldBe None
+
+      // Secondary buy of a bond whose liquidation reserve is under the offer's R5(4) must be refused off-chain too.
+      val zeroResBond = protocol.asBond(safe).get.copy(feeReserve = 0L)
+      w.app(e).offerRefusal(updatedOffer, zeroResBond, erg("1"), 1L, 1L, w.app(e).oracle(), primary = false)
+        .getOrElse(fail("expected secondary reserve refusal")) should include("liquidation reserve")
     }
   }
 
