@@ -104,6 +104,23 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
       val o2 = w.nano(o)
       w.run(e, w.app(e).pack(Seq(dust2.id.toString)))
       w.nano(o) shouldBe o2 + 3000000L
+
+      // Low-value / post-rent expired lot whose value < MinBox + refundFee refunds full value (zero fee) via refundLot and pack.
+      def lowLot(tokens: Seq[Token]): UTXO =
+        UTXO(protocol.market(Market.Erg).lotAuction, 2500000L, tokens,
+          Seq(bytesValue(hashOf(tree(o).ergoTree)), longsValue(erg("5"), erg("2"), w.h - 20L, w.h - 10L, w.h.toLong, fee)))
+      w.fund(l, erg("1"), Token(collateralToken, 20L))
+      val lot1 = w.seedDisclosing(l, lowLot(Seq(Token(collateralToken, 10L))), tree(o))
+      w.app(e).batchScan().work.map(_.command) should not contain s"refund-lot ${lot1.id}"
+      val o3 = w.nano(o)
+      w.run(e, w.app(e).refundLot(lot1.id.toString))
+      w.nano(o) shouldBe o3 + 2500000L
+      w.tokens(o).get(collateralToken) shouldBe Some(10L)
+      val lot2 = w.seedDisclosing(l, lowLot(Seq(Token(collateralToken, 10L))), tree(o))
+      val o4 = w.nano(o)
+      w.run(e, w.app(e).pack(Seq(lot2.id.toString)))
+      w.nano(o) shouldBe o4 + 2500000L
+      w.tokens(o).get(collateralToken) shouldBe Some(20L)
     }
   }
 
