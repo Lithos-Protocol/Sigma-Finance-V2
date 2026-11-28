@@ -474,13 +474,14 @@ shares. An offer set below it never fills; its owner cancels it, or anyone refun
 
 The offer buys from three sources, chosen by context variables:
 
-1. **A new bond**: it fills an accepted `Order` or `PricedOrder`. The issuing script validates the bond.
+1. **A new bond**: it fills an accepted `Order` or `PricedOrder`, funding the bond's liquidation
+   fee reserve at exactly `R5(4)`. The issuing script validates the bond.
 2. **An existing bond unit** from any ask: it verifies the origin from the order's serialized box
-   and requires the live bond as a data input.
-3. **Shares** from any ask: it also verifies the mint request's serialized box, which must be the
-   Dutch-pair mint (Selective or Dutch; plain fractional shares are not bought), and its auction must
-   clear the lender's bounds: a floor at least R5(9) and an expiry at most R5(10). An R5(10) of 0 buys
-   no shares.
+   and requires the live bond as a data input with liquidation fee reserve at least `R5(4)`.
+3. **Shares** from any ask: it also requires the live bond's liquidation fee reserve to be at least
+   `R5(4)`, verifies the mint request's serialized box (which must be the Dutch-pair mint: Selective
+   or Dutch; plain fractional shares are not bought), and requires its auction to clear the lender's
+   bounds: a floor at least R5(9) and an expiry at most R5(10). An R5(10) of 0 buys no shares.
 
 It delivers the unit to the owner, or into a mint request at the script the lender names (the CLI
 writes Selective or Dutch), so a batcher mints shares for an offline lender. Bought shares go straight
@@ -531,14 +532,14 @@ Every box that waits on someone has a way out.
 | Box | Owner, any time | Anyone |
 |---|---|---|
 | Order, PricedOrder | Borrower cancels | From expiry: refund to the borrower for the expiry fee |
-| Lend offer | Owner cancels | From expiry: refund to the owner for the offer's batcher fee |
+| Lend offer | Owner cancels | From expiry: refund to the owner for the offer's non-negative batcher fee (or full value with zero fee if the fee exceeds `value - 0.001 ERG`) |
 | Sale order, priced ask | Seller cancels | From expiry: refund to the seller for the nanoERG funded above 0.001 ERG |
 | Fractional, Selective or Dutch mint request | Owner cancels | The mint itself, for the mint fee, at any time |
 | Wrap request | Owner cancels | The mint itself, for the mint fee, at any time |
 | Bond | Borrower repays, recollateralizes, or extinguishes with the circulating unit | Liquidation, paid by the lender's reserve; refresh after two years |
 | Bond vault, fractional, Selective and Dutch vaults | Holders claim | Pulls, for the pull fee; auction purchases; refresh after two years |
 | Wrap vault | Receipt holder unwraps | Refresh after two years, as the only input |
-| Lot auction | Seller cancels | Purchase at the current price; from expiry, refund to the seller for the refund fee |
+| Lot auction | Seller cancels | Purchase at the current price; from expiry, refund to the seller for the non-negative refund fee (or full value with zero fee if the fee exceeds `value - 0.001 ERG`) |
 
 Refunds are tagged with the box's id, so an owner that is a contract, which cannot co-sign a cancel,
 can recognise its funds. Nothing sweeps lost shares or a lost circulating unit: their claims stay

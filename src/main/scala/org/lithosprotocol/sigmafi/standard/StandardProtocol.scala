@@ -294,9 +294,9 @@ case class StdLot(box: InputUTXO, market: Market, sellerHash: Array[Byte], terms
   /** The least the lot sells for at `height`: the opening, falling in a straight line to the floor. */
   def price(height: Long): Long = {
     val at = height.max(start).min(end)
-    val span = BigInt(end - start)
+    val span = BigInt(end) - BigInt(start)
     // paid * span >= opening * span - (opening - floor) * (at - start), rounded up.
-    val owed = BigInt(opening) * span - BigInt(opening - floor) * (at - start)
+    val owed = BigInt(opening) * span - (BigInt(opening) - BigInt(floor)) * (BigInt(at) - BigInt(start))
     ((owed + span - 1) / span).toLong
   }
   /** What the buyer takes: every token, and for a token currency the nanoERG too. */

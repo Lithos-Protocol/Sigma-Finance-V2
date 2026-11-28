@@ -42,8 +42,10 @@
     //
     // EXPIRY REFUND (anyone, once HEIGHT >= expiry)
     // Context var 0: Int refund index. The refund is at the seller script with R4 = SELF.id and no R5,
-    // every token of this box, and at least this value less the refund fee R5(5). The tag lets a seller
-    // that is a contract, which cannot co-sign a cancel, recognise its lot.
+    // every token of this box, and at least this value less the refund fee R5(5) (requiring R5(5) >= 0;
+    // if R5(5) exceeds SELF.value - 1000000, e.g. after storage rent or a misconfigured fee, no fee may
+    // be deducted and the full SELF.value must return). The tag lets a seller that is a contract, which
+    // cannot co-sign a cancel, recognise its lot.
     //
     // CANCEL
     // A co-spent box guarded by the seller script releases this box at any height.
@@ -76,9 +78,13 @@
                 payout.R5[Long].isDefined == false
             if (HEIGHT.toLong >= terms(4)) {
                 // Expiry refund, by anyone: the whole lot goes back to the seller, less the fee.
+                // If terms(5) exceeds SELF.value - 1000000 (e.g. post-storage-rent or misconfigured
+                // fee), no fee may be deducted and the full SELF.value must return.
                 sigmaProp(
-                    terms(5) >= 0L && terms(5) <= SELF.value - 1000000L &&
-                    toSeller && payout.tokens == SELF.tokens && payout.value >= SELF.value - terms(5)
+                    terms(5) >= 0L &&
+                    toSeller && payout.tokens == SELF.tokens &&
+                    (if (terms(5) <= SELF.value - 1000000L) payout.value >= SELF.value - terms(5)
+                     else payout.value >= SELF.value)
                 )
             } else {
                 val opening = terms(0)
@@ -98,11 +104,11 @@
                 }
                 val now = HEIGHT.toLong
                 val at = if (now < start) start else if (now > end) end else now
-                val span = (end - start).toBigInt
+                val span = end.toBigInt - start.toBigInt
                 sigmaProp(
                     toSeller && !holdsCurrency &&
                     floor >= 1L && floor <= opening && start < end && end <= terms(4) &&
-                    paid.toBigInt * span >= opening.toBigInt * span - (opening - floor).toBigInt * (at - start).toBigInt
+                    paid.toBigInt * span >= opening.toBigInt * span - (opening.toBigInt - floor.toBigInt) * (at.toBigInt - start.toBigInt)
                 )
             }
         }

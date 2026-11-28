@@ -156,10 +156,12 @@
     //
     // EXPIRY REFUND (anyone, once HEIGHT >= R5(6))
     // Var 0 names the refund: at the owner script, R4 = this box's id, every token of this box, and
-    // at least this value less the batcher fee R5(3). The tag lets an owner that is a contract,
-    // which cannot co-sign a cancel, recognise its own capital. Several offers may be refunded in
-    // one transaction, each to its own tagged output. A fee too small to pay a batcher leaves the
-    // box for the owner to cancel.
+    // at least this value less the batcher fee R5(3) (requiring R5(3) >= 0; if R5(3) exceeds
+    // SELF.value - 1000000, e.g. on a partially-filled ERG dust continuation, no fee may be deducted
+    // and the full SELF.value must return). The tag lets an owner that is a contract, which cannot
+    // co-sign a cancel, recognise its own capital. Several offers may be refunded in one transaction,
+    // each to its own tagged output. A fee too small to pay a batcher leaves the box for the owner
+    // to cancel or self-refund.
     //
     // LIMITS OF THIS DRAFT
     // - Best execution is not enforced. The offer never does worse than its terms, but a batcher

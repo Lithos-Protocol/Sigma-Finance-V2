@@ -93,6 +93,17 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
       val o0 = w.nano(o)
       w.run(e, w.app(e).refundOffer(open.id.toString))
       w.nano(o) shouldBe o0 + erg("3") - fee
+
+      // Dust continuation offer whose value < MinBox + batcherFee refunds full value (zero fee) via refundOffer and pack.
+      val dust = w.seedDisclosing(l, expiredOffer(w, o, 3000000L), tree(o))
+      w.app(e).batchScan().work.map(_.command) should not contain s"refund-offer ${dust.id}"
+      val o1 = w.nano(o)
+      w.run(e, w.app(e).refundOffer(dust.id.toString))
+      w.nano(o) shouldBe o1 + 3000000L
+      val dust2 = w.seedDisclosing(l, expiredOffer(w, o, 3000000L), tree(o))
+      val o2 = w.nano(o)
+      w.run(e, w.app(e).pack(Seq(dust2.id.toString)))
+      w.nano(o) shouldBe o2 + 3000000L
     }
   }
 
