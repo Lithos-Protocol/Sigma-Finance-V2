@@ -474,7 +474,7 @@ when the order's oracle age is at least the offer's. The values are the CLI's cu
 Token offers also enforce a proportional total ERG budget covering rewards, box funding and reserves.
 The original capital and both budgets survive every continuation. A 1% minimum therefore permits at
 most 100 fills, while splitting cannot increase total batcher reward. Fixed box/reserve costs may require
-a larger fill. See [the review's formulas and CLI options](./AUDIT_REVIEW_2026-11-14.md#token-rewards-and-total-erg-protection).
+a larger fill. See `contracts/bonds/P2P/ZC_Standard_LendOffer.ergo` and `SigmaBonds.MD` for the exact formulas and CLI options.
 
 No defaults, ever: principal, repayment, collateral, maturity, liquidation ratio, yield, collateral
 floor, a yield curve, an ask's price, the opening and floor of a Dutch or Selective auction, and the

@@ -107,7 +107,7 @@ trait StandardOffers extends AppBase { self: StandardApp =>
       (if (m.token.isEmpty) s"batcher fee ${Fmt.erg(s.batcherFee)} per fill"
        else s"batcher reward budget ${Fmt.erg(budgetTerms(3))}, proportional to the filled capital; " +
          s"minimum fill ${Units.percent(s.minFillBps)} of original capital; total ERG spend budget ${Fmt.erg(budgetTerms(1))}") +
-        s"; new bonds carry a ${Fmt.erg(s.feeReserve)} fee reserve",
+        s"; bond liquidation fee reserve ${Fmt.erg(s.feeReserve)} (exact for new bonds, minimum for secondary buys)",
       if (s.auctionExpiry == 0L) "buys no shares"
       else s"buys Selective or Dutch shares with an auction floor of at least ${Units.percent(s.auctionFloorBps)} and an " +
         s"expiry of at most ${s.auctionExpiry} blocks",
@@ -200,6 +200,8 @@ trait StandardOffers extends AppBase { self: StandardApp =>
       bond.collateral.size > MaxCollateralTokens)
       Some(s"the bond carries ${bond.collateral.size} distinct collateral tokens (over the $MaxCollateralTokens-token " +
         "limit for Dutch/Selective share vaults to pull under Ergo's 4,096-byte box limit)")
+    else if (!primary && bond.feeReserve < o.feeReserve)
+      Some(s"the bond's liquidation reserve ${Fmt.erg(bond.feeReserve)} is under the offer's ${Fmt.erg(o.feeReserve)}")
     else if (!bond.liqHash.sameElements(rule)) Some("the bond's liquidation rule is not the oracle rule the offer's policy requires")
     else if (bond.payload.size < 2 || bond.payload(0) < o.floorBps || bond.payload(1) < o.maxAge || bond.payload(1) > 100000L)
       Some(s"the bond's own ratio is under ${Units.percent(o.floorBps)} or its oracle age is outside ${o.maxAge} to 100000 blocks")

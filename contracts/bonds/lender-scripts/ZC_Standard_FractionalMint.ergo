@@ -27,9 +27,11 @@
     //   only: every amount on-chain is in raw share units, and no payout granularity is guaranteed.
     //
     // VALUE
-    // This box funds four things: the fractional vault (at least 1000000 nanoERG plus the pull fee),
-    // the share output (at least 1000000 nanoERG), and the mint fee. The vault and the share output
-    // together receive at least SELF.value minus the mint fee.
+    // This box funds the fractional vault (at least 1000000 nanoERG plus the pull fee, and at least
+    // SELF.value minus the mint fee minus 1000000 nanoERG), the share output (at least 1000000
+    // nanoERG), and the mint fee. Pinning the vault's floor directly guarantees that every nanoERG
+    // funded above 2000000 + pullFee + mintFee lands in the vault as its refresh reserve, and a
+    // minter cannot divert that reserve into OUTPUTS(0).
     //
     // MINT (anyone; no context vars)
     // A transaction mints one token id, INPUTS(0).id, and an order fill already uses it for the
@@ -99,7 +101,7 @@
             val vaultValid =
                 blake2b256(vault.propositionBytes) == CONST_FRACTIONAL_VAULT_HASH &&
                 vault.value - pullFee >= 1000000L &&
-                vault.value + shareOut.value >= SELF.value - mintFee &&
+                vault.value >= SELF.value - mintFee - 1000000L &&
                 vault.tokens == Coll((SELF.id, shares + 1L), bondUnit) &&
                 vault.R4[Coll[Byte]].get == bondUnit._1 &&
                 vault.R5[Coll[Long]].get == Coll(shares, shares, pullFee) &&

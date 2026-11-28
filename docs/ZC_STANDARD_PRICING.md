@@ -216,7 +216,7 @@ Lender yield is a lower limit on the return it accepts (a maximum cost). Ignorin
 an ask offering 10% can cross a bid requiring 8%; one offering 6% cannot. For an ERG offer its cost
 includes the batcher fee: `cost = price + batcherFee`. A token offer pays fees separately in ERG,
 with a reward proportional to original capital filled, a proportional total ERG spending cap, and a
-minimum 1% fill of original capital. See [the fee-budget rules](./AUDIT_REVIEW_2026-11-14.md#token-rewards-and-total-erg-protection).
+minimum 1% fill of original capital. See `contracts/bonds/P2P/ZC_Standard_LendOffer.ergo` for the exact fee-budget rules.
 Equal rates may fail to match: short durations or small share fills may earn so little interest
 that the batcher fee exceeds it. On a 60-block loan, leaving room for a 0.005 ERG fee on a 0.12 ERG
 repayment takes a yield in the tens of thousands of percent.

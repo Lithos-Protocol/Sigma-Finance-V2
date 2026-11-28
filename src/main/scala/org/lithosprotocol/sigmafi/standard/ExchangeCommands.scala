@@ -340,7 +340,7 @@ object ExchangeCommands {
       println((if (m.token.isEmpty) s"  batcher fee ${Fmt.erg(o.batcherFee)}"
         else s"  batcher budget ${Fmt.erg(o.batcherBudget)}; total ERG spend budget ${Fmt.erg(o.spendBudget)}; " +
           s"minimum fill ${Units.percent(o.minFillBps)} of original ${Units.amount(o.originalCapital, m)}; " +
-          s"expiry refund fee ${Fmt.erg(o.batcherFee)}") + s"; new-bond fee reserve ${Fmt.erg(o.feeReserve)}" +
+          s"expiry refund fee ${Fmt.erg(o.batcherFee)}") + s"; liquidation fee reserve ${Fmt.erg(o.feeReserve)}" +
         (if (o.terms(10) > 0L) s"; Selective/Dutch shares with an auction floor of at least ${Units.percent(o.terms(9))} " +
           s"and an expiry of at most ${o.terms(10)} blocks" else ""))
       if (o.delivers) {

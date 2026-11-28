@@ -93,6 +93,34 @@ class StandardOffchainSpec extends AnyPropSpec with StandardSpecSupport with Lon
       val o0 = w.nano(o)
       w.run(e, w.app(e).refundOffer(open.id.toString))
       w.nano(o) shouldBe o0 + erg("3") - fee
+
+      // Dust continuation offer whose value < MinBox + batcherFee refunds full value (zero fee) via refundOffer and pack.
+      val dust = w.seedDisclosing(l, expiredOffer(w, o, 3000000L), tree(o))
+      w.app(e).batchScan().work.map(_.command) should not contain s"refund-offer ${dust.id}"
+      val o1 = w.nano(o)
+      w.run(e, w.app(e).refundOffer(dust.id.toString))
+      w.nano(o) shouldBe o1 + 3000000L
+      val dust2 = w.seedDisclosing(l, expiredOffer(w, o, 3000000L), tree(o))
+      val o2 = w.nano(o)
+      w.run(e, w.app(e).pack(Seq(dust2.id.toString)))
+      w.nano(o) shouldBe o2 + 3000000L
+
+      // Low-value / post-rent expired lot whose value < MinBox + refundFee refunds full value (zero fee) via refundLot and pack.
+      def lowLot(tokens: Seq[Token]): UTXO =
+        UTXO(protocol.market(Market.Erg).lotAuction, 2500000L, tokens,
+          Seq(bytesValue(hashOf(tree(o).ergoTree)), longsValue(erg("5"), erg("2"), w.h - 20L, w.h - 10L, w.h.toLong, fee)))
+      w.fund(l, erg("1"), Token(collateralToken, 20L))
+      val lot1 = w.seedDisclosing(l, lowLot(Seq(Token(collateralToken, 10L))), tree(o))
+      w.app(e).batchScan().work.map(_.command) should not contain s"refund-lot ${lot1.id}"
+      val o3 = w.nano(o)
+      w.run(e, w.app(e).refundLot(lot1.id.toString))
+      w.nano(o) shouldBe o3 + 2500000L
+      w.tokens(o).get(collateralToken) shouldBe Some(10L)
+      val lot2 = w.seedDisclosing(l, lowLot(Seq(Token(collateralToken, 10L))), tree(o))
+      val o4 = w.nano(o)
+      w.run(e, w.app(e).pack(Seq(lot2.id.toString)))
+      w.nano(o) shouldBe o4 + 2500000L
+      w.tokens(o).get(collateralToken) shouldBe Some(20L)
     }
   }
 

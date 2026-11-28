@@ -63,12 +63,13 @@ trait StandardBatch extends AppBase { self: StandardApp =>
 
   private[standard] def offerRefund(o: StdOffer): Piece = {
     if (height.toLong < o.expiry) fail(s"the offer expires at height ${o.expiry}; it can be refunded from then on")
-    if (o.batcherFee < 0L || o.batcherFee > o.box.value - MinBox) fail("the offer's fee leaves no box minimum: only its owner can cancel it")
-    val refund = UTXO(Contract(ownerTree(o.ownerHash, o.box, "offer owner")), o.box.value - o.batcherFee, o.box.tokens,
+    if (o.batcherFee < 0L) fail("the offer's fee is negative: only its owner can cancel it")
+    val taken = if (o.batcherFee <= o.box.value - MinBox) o.batcherFee else 0L
+    val refund = UTXO(Contract(ownerTree(o.ownerHash, o.box, "offer owner")), o.box.value - taken, o.box.tokens,
       Seq(bytesValue(o.box.id.getBytes)))
-    Piece(o.box.id.toString, i => o.box.withCtxVar(0.toByte, intValue(i)), Seq(refund), o.batcherFee,
+    Piece(o.box.id.toString, i => o.box.withCtxVar(0.toByte, intValue(i)), Seq(refund), taken,
       s"returns ${Fmt.contents(refund.value, refund.tokens)} to the owner of offer ${o.box.id}, for its " +
-        s"${Fmt.erg(o.batcherFee)} batcher fee")
+        s"${Fmt.erg(taken)} batcher fee")
   }
 
   private[standard] def askRefund(ask: StdAsk): Piece = {
@@ -82,12 +83,12 @@ trait StandardBatch extends AppBase { self: StandardApp =>
 
   private[standard] def lotRefund(lot: StdLot): Piece = {
     if (height.toLong < lot.expiry) fail(s"the lot expires at height ${lot.expiry}; it can be refunded from then on")
-    if (lot.refundFee < 0L || lot.box.value - lot.refundFee < MinBox)
-      fail("the lot's refund fee leaves no box minimum: only its seller can cancel it")
-    val refund = UTXO(Contract(ownerTree(lot.sellerHash, lot.box, "seller")), lot.box.value - lot.refundFee, lot.box.tokens,
+    if (lot.refundFee < 0L) fail("the lot's refund fee is negative: only its seller can cancel it")
+    val taken = if (lot.refundFee <= lot.box.value - MinBox) lot.refundFee else 0L
+    val refund = UTXO(Contract(ownerTree(lot.sellerHash, lot.box, "seller")), lot.box.value - taken, lot.box.tokens,
       Seq(bytesValue(lot.box.id.getBytes)))
-    Piece(lot.box.id.toString, i => lot.box.withCtxVar(0.toByte, intValue(i)), Seq(refund), lot.refundFee,
-      s"returns lot ${lot.box.id} to its seller, for its ${Fmt.erg(lot.refundFee)} refund fee")
+    Piece(lot.box.id.toString, i => lot.box.withCtxVar(0.toByte, intValue(i)), Seq(refund), taken,
+      s"returns lot ${lot.box.id} to its seller, for its ${Fmt.erg(taken)} refund fee")
   }
 
   /**

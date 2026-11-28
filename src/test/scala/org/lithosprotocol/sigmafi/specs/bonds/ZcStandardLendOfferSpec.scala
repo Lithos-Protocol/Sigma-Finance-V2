@@ -394,6 +394,39 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
     }
   }
 
+  for (kind <- kinds) {
+    property(s"$kind existing bond and shares: liquidation reserve must meet the offer's R5(4) floor") {
+      withCtx { ctx =>
+        def liveWithFee(fee: Long, unit: UTXO = null): Live = {
+          val f = flow(ctx, kind, fee = fee)
+          val fill = accepts(f.holder, standardFillTx(f, unit = unit))
+          Live(f, spendOutput(fill, 1), f.height + 300, fill)
+        }
+        val price = unitPrice(kind)
+        // Whole-bond secondary buy: fee == reserve and fee > reserve accept; 0 and reserve - 1 reject.
+        Seq(batchingFee, batchingFee + 1000000L).foreach { fee =>
+          val l = liveWithFee(fee)
+          accepts(executor(ctx), buyTx(l, offerBox(ctx, kind, Terms(reserve = batchingFee)),
+            saleBox(ctx, kind, l.f.asset, 1L, price), 1L, price))
+        }
+        Seq(0L, batchingFee - 1L).foreach { fee =>
+          val l = liveWithFee(fee)
+          val ask = saleBox(ctx, kind, l.f.asset, 1L, price)
+          rejectsAtSigning(executor(ctx), buyTx(l, offerBox(ctx, kind, Terms(reserve = batchingFee)), ask, 1L, price))
+          // Same bond succeeds when the offer itself allows fee == 0, proving rejection is at lender(0) >= terms(4).
+          accepts(executor(ctx), buyTx(l, offerBox(ctx, kind, Terms(reserve = 0L)), ask, 1L, price))
+        }
+        // Secondary Dutch shares backed by a 0-reserve bond are rejected too.
+        val zeroFlow = flow(ctx, kind, fee = 0L)
+        val zeroLive = liveWithFee(0L, unit = requestBox(ctx, shareMint(ctx, kind), zeroFlow.asset, shareLongs(1000L)))
+        val zeroWrapped = Wrapped(zeroLive, spendOutput(zeroLive.fill, 0), 1000L)
+        val paid = if (kind == ErgBond) 195000000L else 20L
+        rejectsAtSigning(executor(ctx), shareBuy(zeroWrapped, offerBox(ctx, kind, Terms(reserve = batchingFee)), 30L, paid))
+        accepts(executor(ctx), shareBuy(zeroWrapped, offerBox(ctx, kind, Terms(reserve = 0L)), 30L, paid))
+      }
+    }
+  }
+
   property("existing bond: the ask convention, with the payout paying for exactly the units delivered") {
     withCtx { ctx =>
       val l = live(ctx, ErgBond)
@@ -692,6 +725,25 @@ class ZcStandardLendOfferSpec extends AnyPropSpec with ZcStandardSpecBase {
       val low = offerBox(ctx, ErgBond, Terms(expiry = expiry, batcherFee = minBox))
       accepts(executor(ctx), refundTx(ctx, Seq(low -> 1),
         Seq(tagged(lenderTree(ctx), low.value - minBox, inputAt(low, ctx, 1).id)), expiry))
+      // Expiry refund fee must lie in [0, SELF.value - minBox].
+      val zeroFee = offerBox(ctx, ErgBond, Terms(expiry = expiry, batcherFee = 0L))
+      accepts(executor(ctx), refundTx(ctx, Seq(zeroFee -> 1),
+        Seq(tagged(lenderTree(ctx), zeroFee.value, inputAt(zeroFee, ctx, 1).id)), expiry))
+      val maxFee = offerBox(ctx, ErgBond, Terms(expiry = expiry, batcherFee = ergCapital - minBox))
+      accepts(executor(ctx), refundTx(ctx, Seq(maxFee -> 1),
+        Seq(tagged(lenderTree(ctx), minBox, inputAt(maxFee, ctx, 1).id)), expiry))
+      val negFee = offerBox(ctx, ErgBond, Terms(expiry = expiry, batcherFee = -1L))
+      rejectsAtSigning(executor(ctx), refundTx(ctx, Seq(negFee -> 1),
+        Seq(tagged(lenderTree(ctx), negFee.value + 1L, inputAt(negFee, ctx, 1).id)), expiry))
+      val hugeFee = offerBox(ctx, ErgBond, Terms(expiry = expiry, batcherFee = ergCapital - minBox + 1L))
+      rejectsAtSigning(executor(ctx), refundTx(ctx, Seq(hugeFee -> 1),
+        Seq(tagged(lenderTree(ctx), minBox, inputAt(hugeFee, ctx, 1).id)), expiry))
+      // A partially-filled ERG continuation below minBox + batcherFee still refunds whole with zero fee deducted.
+      val dustCont = offerBox(ctx, ErgBond, Terms(expiry = expiry, batcherFee = 5000000L)).setValue(3000000L)
+      accepts(executor(ctx), refundTx(ctx, Seq(dustCont -> 1),
+        Seq(tagged(lenderTree(ctx), 3000000L, inputAt(dustCont, ctx, 1).id)), expiry))
+      rejectsAtSigning(executor(ctx), refundTx(ctx, Seq(dustCont -> 1),
+        Seq(tagged(lenderTree(ctx), 2999999L, inputAt(dustCont, ctx, 1).id)), expiry))
       // A fill at expiry is refused: the box can only be refunded.
       val f = flow(ctx, ErgBond)
       rejectsAtSigning(executor(ctx), newBondTx(f, offerBox(ctx, ErgBond, Terms(expiry = f.height)), height = f.height))
